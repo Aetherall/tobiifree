@@ -6,6 +6,10 @@ The Tobii Eye Tracker 5 (ET5) ships with Windows-only drivers and no public prot
 
 > **Status:** experimental. The USB wire protocol was decoded by observing the device's standard USB bulk transfers. Things work, things break, things change.
 
+## Demo: https://aetherall.github.io/tobiifree/
+<img width="2309" height="1219" alt="image" src="https://github.com/user-attachments/assets/8fe16a58-5d75-4104-a6bd-2c038be8d1e6" />
+
+
 ## What's here
 
 - **driver/** — Zig implementation of the TTP/TLV framing protocol. Compiles to both WebAssembly (for the browser SDK) and native (for the Linux applications). Pure byte-level protocol engine — no allocator, no syscalls.
