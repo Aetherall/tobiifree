@@ -1,0 +1,16 @@
+.direnv
+.osgrep
+
+# Build artifacts
+*.o
+
+.zig-cache/
+zig-out/
+
+node_modules/
+dist/
+build/
+
+# Native helpers built from assets/
+/flash_firmware
+/extract_firmware

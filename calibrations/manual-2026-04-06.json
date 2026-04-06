@@ -1,0 +1,18 @@
+{
+  "description": "Manually nudged calibration — works very well",
+  "monitor": "Acer Predator X34P (34\" 3440x1440 curved ultrawide, ~800x335mm active area)",
+  "created_at": "2026-04-06T00:00:00Z",
+  "display_area": {
+    "tl": { "x": -451.8, "y": 413.6, "z": 157.5 },
+    "tr": { "x": 479.8, "y": 413.6, "z": 157.5 },
+    "bl": { "x": -451.8, "y": 68.0, "z": -11.0 }
+  },
+  "screen_rect": {
+    "w": 931.5,
+    "h": 384.4,
+    "cx": 13.8,
+    "cy": 68.0,
+    "cz": -11.0,
+    "tilt": 168.5
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "tobiifree-demo",
+  "version": "0.0.0",
+  "description": "Vite app that opens an ET5 via WebUSB and draws live gaze",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@types/three": "^0.183.1",
+    "three": "^0.183.2",
+    "tobiifree-sdk-ts": "*"
+  },
+  "devDependencies": {
+    "@types/w3c-web-usb": "^1.0.10",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

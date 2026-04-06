@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tobii ET5 — Gaze Demo</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #0b0b0f; color: #d8d8e0; }
+      #stage { position: fixed; inset: 0; pointer-events: none; }
+      #stage3d { position: fixed; inset: 0; width: 100%; height: 100%;
+        display: block; cursor: grab; }
+      #stage3d.panning { cursor: grabbing; }
+      #stage3d.rotating { cursor: ew-resize; }
+      #gaze {
+        position: fixed; width: 24px; height: 24px; margin: -12px 0 0 -12px;
+        border-radius: 50%; pointer-events: none;
+        background: radial-gradient(circle, #7df9a8 0%, rgba(125,249,168,0.35) 45%, transparent 70%);
+        box-shadow: 0 0 24px 6px rgba(125,249,168,0.4);
+        transition: transform 16ms linear, opacity 120ms ease-out;
+        opacity: 0; will-change: transform;
+      }
+      #panel {
+        position: fixed; top: 12px; left: 12px; padding: 12px 14px;
+        background: rgba(20,20,28,0.82); border: 1px solid #2a2a36;
+        border-radius: 8px; max-width: 360px; backdrop-filter: blur(6px);
+      }
+      #panel h1 { margin: 0 0 8px 0; font-size: 13px; font-weight: 600;
+        letter-spacing: 0.02em; color: #e8e8f0; }
+      #panel button {
+        background: #2a6df4; color: white; border: 0; padding: 8px 14px;
+        border-radius: 6px; font: inherit; cursor: pointer;
+        font-weight: 600; letter-spacing: 0.01em;
+      }
+      #panel button:hover { background: #3a7dff; }
+      #panel button:disabled { background: #2a2a36; color: #666;
+        cursor: not-allowed; }
+      #stats { margin-top: 10px; color: #8888a0; white-space: pre;
+        font-size: 11px; line-height: 1.5; }
+      #err { color: #ff7d7d; margin-top: 8px; white-space: pre-wrap;
+        font-size: 11px; }
+      #hint { color: #5a5a70; font-size: 11px; margin-top: 6px; }
+      #da { margin-top: 12px; border-top: 1px solid #2a2a36; padding-top: 10px;
+        display: none; }
+      #da h2 { margin: 0 0 8px 0; font-size: 11px; font-weight: 600;
+        color: #b0b0c0; letter-spacing: 0.04em; text-transform: uppercase; }
+      #da .grid { display: grid; grid-template-columns: 28px 1fr 56px;
+        gap: 4px 8px; align-items: center; }
+      #da label { color: #8888a0; font-size: 11px; }
+      #da input[type=range] { width: 100%; accent-color: #2a6df4; }
+      #da .val { color: #d8d8e0; font-size: 11px; text-align: right;
+        font-variant-numeric: tabular-nums; }
+      #da .group { color: #5a5a70; font-size: 10px; text-transform: uppercase;
+        letter-spacing: 0.05em; margin: 6px 0 2px 0; }
+      #da .btns { display: flex; gap: 6px; margin-top: 8px; }
+      #da .btns button { flex: 1; font-size: 11px; padding: 6px 8px; }
+      #da .btns button.secondary { background: #2a2a36; }
+      #da .btns button.secondary:hover { background: #3a3a48; }
+      #da .lock { display: flex; align-items: center; gap: 6px; color: #b0b0c0;
+        font-size: 11px; margin-bottom: 8px; cursor: pointer; user-select: none; }
+      #da .lock input { accent-color: #2a6df4; }
+      #da input[type=range]:disabled { opacity: 0.35; cursor: not-allowed; }
+      #da .val.locked { color: #5a5a70; }
+      #cal-overlay {
+        position: fixed; inset: 0; background: rgba(8,8,12,0.96);
+        display: none; cursor: pointer; z-index: 1000;
+      }
+      #cal-overlay.active { display: block; }
+      #cal-target {
+        position: absolute; width: 40px; height: 40px; margin: -20px 0 0 -20px;
+      }
+      #cal-target .cal-dot {
+        position: absolute; inset: 16px; border-radius: 50%;
+        background: #7df9a8; box-shadow: 0 0 20px 4px rgba(125,249,168,0.6);
+      }
+      #cal-target .cal-ring {
+        position: absolute; inset: 0; border-radius: 50%;
+        border: 2px solid rgba(125,249,168,0.3);
+        transform: scale(1);
+      }
+      #cal-target.capturing .cal-ring {
+        animation: cal-ring-shrink 2500ms linear forwards;
+        border-color: rgba(125,249,168,0.9);
+      }
+      @keyframes cal-ring-shrink {
+        from { transform: scale(1); opacity: 1; }
+        to   { transform: scale(0.25); opacity: 0.2; }
+      }
+      #cal-overlay.capturing { cursor: none; }
+      #collect-target {
+        position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px;
+        pointer-events: none; display: none;
+      }
+      #collect-target .ct-spin {
+        position: absolute; inset: 0; border-radius: 50%;
+        background: conic-gradient(#ff5e5e, #ffcf5e, #5eff8e, #5ecfff, #b05eff, #ff5e5e);
+        animation: ct-rotate 1.2s linear infinite;
+      }
+      #collect-target .ct-hole {
+        position: absolute; inset: 6px; border-radius: 50%;
+        background: rgba(8,8,12,0.96);
+      }
+      #collect-target .ct-dot {
+        position: absolute; inset: 14px; border-radius: 50%;
+        background: white;
+        box-shadow: 0 0 8px 2px rgba(255,255,255,0.7);
+      }
+      @keyframes ct-rotate {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+      }
+      #cal-status {
+        position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%);
+        color: #8888a0; font-size: 12px; letter-spacing: 0.02em;
+      }
+      #da-cal { background: #2a6df4; }
+      #da-onboard-cal { background: #6b2af4; }
+      #da-onboard-cal:hover { background: #7b3aff; }
+      #onboard-cal-dot {
+        position: absolute; width: 32px; height: 32px; margin: -16px 0 0 -16px;
+        pointer-events: none; display: none;
+      }
+      #onboard-cal-dot .ocd-core {
+        position: absolute; inset: 10px; border-radius: 50%;
+        background: #ff9d3d; box-shadow: 0 0 24px 8px rgba(255,157,61,0.6);
+      }
+      #onboard-cal-dot .ocd-ring {
+        position: absolute; inset: 0; border-radius: 50%;
+        border: 2px solid rgba(255,157,61,0.4);
+      }
+      #onboard-cal-dot.collecting .ocd-ring {
+        animation: ocd-pulse 0.8s ease-in-out infinite;
+        border-color: rgba(255,157,61,0.9);
+      }
+      #onboard-cal-dot.collecting .ocd-core {
+        background: #ffb866;
+        box-shadow: 0 0 32px 12px rgba(255,157,61,0.8);
+      }
+      @keyframes ocd-pulse {
+        0%, 100% { transform: scale(1); opacity: 0.9; }
+        50% { transform: scale(1.5); opacity: 0.3; }
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="stage3d"></canvas>
+    <div id="stage">
+      <div id="gaze"></div>
+    </div>
+    <div id="panel">
+      <h1>Tobii ET5 — Live Gaze</h1>
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+        <select id="transport" style="background:#2a2a36;color:#d8d8e0;border:1px solid #3a3a48;border-radius:4px;padding:6px 8px;font:inherit;font-size:11px">
+          <option value="usb">USB</option>
+          <option value="ws">WebSocket</option>
+        </select>
+        <input id="ws-url" type="text" value="ws://localhost:7081" placeholder="ws://host:port"
+          style="display:none;background:#1a1a24;color:#d8d8e0;border:1px solid #3a3a48;border-radius:4px;padding:6px 8px;font:inherit;font-size:11px;width:160px" />
+        <button id="connect">Connect</button>
+      </div>
+      <div id="hint">Select transport and connect</div>
+      <div id="cam-hint" style="color:#5a5a70;font-size:11px;margin-top:6px">
+        Camera: right-drag rotate · scroll zoom · space+drag pan
+      </div>
+      <pre id="stats"></pre>
+      <div id="err"></div>
+      <div id="da">
+        <h2>Display area (mm)</h2>
+        <label class="lock"><input type="checkbox" id="da-lock" checked /> Lock to plane (rectangular, axis-aligned)</label>
+        <div class="grid" id="rect-grid"></div>
+        <div class="grid" id="tilt-row" style="margin-top:6px">
+          <label for="da-tilt" style="grid-column:1 / 2">tilt</label>
+          <input type="range" id="da-tilt" min="-200" max="200" step="0.5" value="0" style="grid-column:2 / 3" />
+          <div class="val" id="da-tilt-val" style="grid-column:3 / 4">0.0</div>
+        </div>
+        <div class="grid" id="da-grid" style="margin-top:6px"></div>
+        <div class="btns">
+          <button id="da-reload" class="secondary" type="button">Reload from device</button>
+          <button id="da-reset" class="secondary" type="button">Reset 400×300</button>
+        </div>
+        <div class="btns">
+          <button id="da-winperm" class="secondary" type="button">Grant window mgmt</button>
+          <button id="da-fs" class="secondary" type="button">Fullscreen</button>
+          <button id="da-diag" class="secondary" type="button">Run diagnostic</button>
+          <button id="da-cal" type="button">Calibrate</button>
+        </div>
+        <div class="btns">
+          <select id="da-onboard-pts" style="background:#2a2a36;color:#d8d8e0;border:1px solid #3a3a48;border-radius:4px;padding:4px 6px;font:inherit;font-size:11px">
+            <option value="5">5 pt</option>
+            <option value="9" selected>9 pt</option>
+            <option value="16">16 pt</option>
+          </select>
+          <button id="da-onboard-cal" type="button">Onboard cal</button>
+          <button id="da-collect" class="secondary" type="button">Collect samples</button>
+          <button id="da-collect2" class="secondary" type="button">Collect (2-plane)</button>
+          <button id="da-load" class="secondary" type="button">Load &amp; apply</button>
+        </div>
+        <pre id="diag-out" style="margin:8px 0 0 0; color:#b0b0c0; font-size:10px; white-space:pre-wrap; line-height:1.4;"></pre>
+      </div>
+    </div>
+    <div id="cal-overlay">
+      <div id="cal-target"><div class="cal-ring"></div><div class="cal-dot"></div></div>
+      <div id="collect-target"><div class="ct-spin"></div><div class="ct-hole"></div><div class="ct-dot"></div></div>
+      <div id="onboard-cal-dot"><div class="ocd-ring"></div><div class="ocd-core"></div></div>
+      <div id="cal-status">Click to start · Esc to cancel</div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
