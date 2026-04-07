@@ -32,6 +32,9 @@ const OFF_EYE_ORIGIN_L_DISP  = 232; // [3]f64: calibrated left eye pos (display-
 const OFF_EYE_ORIGIN_R_DISP  = 256; // [3]f64: calibrated right eye pos (display-space mm)
 const OFF_TRACKBOX_L_DISP    = 280; // [3]f64: normalized track-box position, left (display-space)
 const OFF_TRACKBOX_R_DISP    = 304; // [3]f64: normalized track-box position, right (display-space)
+const OFF_EYE_ORIGIN_RAW_L  = 328; // [3]f64: pre-calibration left eye pos (tracker-space mm)
+const OFF_EYE_ORIGIN_RAW_R  = 352; // [3]f64: pre-calibration right eye pos (tracker-space mm)
+const OFF_GAZE_2D_UNFILT    = 376; // [2]f64: combined 2D gaze before temporal smoothing
 
 const BIT_TIMESTAMP     = 1 << 0;
 const BIT_FRAME_COUNTER = 1 << 1;
@@ -52,9 +55,12 @@ const BIT_EYE_ORIGIN_L_DISP = 1 << 15;
 const BIT_EYE_ORIGIN_R_DISP = 1 << 16;
 const BIT_TRACKBOX_L_DISP   = 1 << 17;
 const BIT_TRACKBOX_R_DISP   = 1 << 18;
+const BIT_EYE_ORIGIN_RAW_L  = 1 << 19;
+const BIT_EYE_ORIGIN_RAW_R  = 1 << 20;
+const BIT_GAZE_2D_UNFILT    = 1 << 21;
 
 export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
-  const dv = new DataView(buffer, ptr, 328);
+  const dv = new DataView(buffer, ptr, 392);
   const mask = dv.getUint32(OFF_PRESENT, true);
   const s: GazeSample = {};
   if (mask & BIT_TIMESTAMP) {
@@ -87,6 +93,11 @@ export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   if (mask & BIT_EYE_ORIGIN_R_DISP) s.eye_origin_R_display_mm = readV3(dv, OFF_EYE_ORIGIN_R_DISP);
   if (mask & BIT_TRACKBOX_L_DISP)   s.trackbox_eye_pos_L_display = readV3(dv, OFF_TRACKBOX_L_DISP);
   if (mask & BIT_TRACKBOX_R_DISP)   s.trackbox_eye_pos_R_display = readV3(dv, OFF_TRACKBOX_R_DISP);
+  if (mask & BIT_EYE_ORIGIN_RAW_L)  s.eye_origin_raw_L_mm = readV3(dv, OFF_EYE_ORIGIN_RAW_L);
+  if (mask & BIT_EYE_ORIGIN_RAW_R)  s.eye_origin_raw_R_mm = readV3(dv, OFF_EYE_ORIGIN_RAW_R);
+  if (mask & BIT_GAZE_2D_UNFILT) {
+    s.gaze_point_2d_unfiltered = { x: dv.getFloat64(OFF_GAZE_2D_UNFILT, true), y: dv.getFloat64(OFF_GAZE_2D_UNFILT + 8, true) };
+  }
   return s;
 }
 

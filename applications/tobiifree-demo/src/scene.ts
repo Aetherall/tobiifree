@@ -117,7 +117,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     screenGeom,
     new THREE.MeshStandardMaterial({
       color: 0x1e2030, roughness: 0.5, metalness: 0.1,
-      side: THREE.DoubleSide, transparent: true, opacity: 0.7,
+      side: THREE.DoubleSide, transparent: true, opacity: 0.7, depthWrite: false,
     }),
   );
   screenGroup.add(screenMesh);
@@ -139,6 +139,28 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   gazeDot.visible = false;
   screenGroup.add(gazeDot);
 
+  // Unfiltered gaze dot — jittery raw 2D gaze before temporal smoothing
+  const unfiltDot = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 12),
+    new THREE.MeshBasicMaterial({ color: 0xff5555, transparent: true, opacity: 0.6, depthWrite: false }),
+  );
+  unfiltDot.visible = false;
+  screenGroup.add(unfiltDot);
+
+  // Per-eye 3D gaze points — ray–plane intersections in tracker-space
+  const gaze3dDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(4, 12, 12),
+    new THREE.MeshBasicMaterial({ color: 0xff6688, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  const gaze3dDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(4, 12, 12),
+    new THREE.MeshBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  gaze3dDotL.visible = false;
+  gaze3dDotR.visible = false;
+  trackerOffset.add(gaze3dDotL);
+  trackerOffset.add(gaze3dDotR);
+
   // Viewport rectangle — shown as a thinner outline floating slightly
   // in front of the screen, at normalized (x0,y0)..(x1,y1) within the
   // display_area. Updated both when the display_area changes and when
@@ -147,7 +169,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   viewportGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(15), 3));
   const viewportOutline = new THREE.Line(
     viewportGeom,
-    new THREE.LineBasicMaterial({ color: 0x2a6df4, transparent: true, opacity: 0.85 }),
+    new THREE.LineBasicMaterial({ color: 0x2a6df4, transparent: true, opacity: 0.85, depthWrite: false }),
   );
   viewportOutline.visible = false;
   screenGroup.add(viewportOutline);
@@ -177,7 +199,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   // sample tells us otherwise.
   const eyesGroup = new THREE.Group();
   const eyeMat = new THREE.MeshStandardMaterial({
-    color: 0xf4f0e0, roughness: 0.3, metalness: 0.0, transparent: true, opacity: 0.4,
+    color: 0xf4f0e0, roughness: 0.3, metalness: 0.0, transparent: true, opacity: 0.4, depthWrite: false,
   });
   const irisMat = new THREE.MeshBasicMaterial({ color: 0x2a5a8a });
   const pupilMat = new THREE.MeshBasicMaterial({ color: 0x050508 });
@@ -202,8 +224,36 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   eyesGroup.add(eyeR);
   trackerOffset.add(eyesGroup);
 
+  // Raw (pre-calibration) eye origin dots — show calibration offset
+  const rawEyeDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff9944, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  const rawEyeDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff9944, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  rawEyeDotL.visible = false;
+  rawEyeDotR.visible = false;
+  trackerOffset.add(rawEyeDotL);
+  trackerOffset.add(rawEyeDotR);
+
+  // Display-space eye origin dots
+  const dispEyeDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xaa44ff, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  const dispEyeDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xaa44ff, transparent: true, opacity: 0.5, depthWrite: false }),
+  );
+  dispEyeDotL.visible = false;
+  dispEyeDotR.visible = false;
+  trackerOffset.add(dispEyeDotL);
+  trackerOffset.add(dispEyeDotR);
+
   // Gaze ray lines (origin → display gaze point)
-  const rayMat = new THREE.LineBasicMaterial({ color: 0x7df9a8, transparent: true, opacity: 0.5 });
+  const rayMat = new THREE.LineBasicMaterial({ color: 0x7df9a8, transparent: true, opacity: 0.5, depthWrite: false });
   const rayLGeom = new THREE.BufferGeometry();
   rayLGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
   const rayRGeom = new THREE.BufferGeometry();
@@ -228,7 +278,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   const tbBoxGeom = new THREE.BoxGeometry(TB_W, TB_H, TB_D);
   const tbBoxWire = new THREE.LineSegments(
     new THREE.EdgesGeometry(tbBoxGeom),
-    new THREE.LineBasicMaterial({ color: 0x555566, transparent: true, opacity: 0.5 }),
+    new THREE.LineBasicMaterial({ color: 0x555566, transparent: true, opacity: 0.5, depthWrite: false }),
   );
   trackBoxGroup.add(tbBoxWire);
 
@@ -266,18 +316,18 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   const rtbGeom = new THREE.BoxGeometry(RTB_W, RTB_H, RTB_D);
   const rtbWire = new THREE.LineSegments(
     new THREE.EdgesGeometry(rtbGeom),
-    new THREE.LineBasicMaterial({ color: 0x444455, transparent: true, opacity: 0.25 }),
+    new THREE.LineBasicMaterial({ color: 0x444455, transparent: true, opacity: 0.25, depthWrite: false }),
   );
   realTrackBox.add(rtbWire);
 
   // Eye dots in the real track box
   const rtbDotL = new THREE.Mesh(
     new THREE.SphereGeometry(6, 12, 8),
-    new THREE.MeshBasicMaterial({ color: 0xff6688, transparent: true, opacity: 0.5 }),
+    new THREE.MeshBasicMaterial({ color: 0xff6688, transparent: true, opacity: 0.5, depthWrite: false }),
   );
   const rtbDotR = new THREE.Mesh(
     new THREE.SphereGeometry(6, 12, 8),
-    new THREE.MeshBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5 }),
+    new THREE.MeshBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5, depthWrite: false }),
   );
   rtbDotL.visible = false;
   rtbDotR.visible = false;
@@ -287,11 +337,11 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   // Display-space trackbox dots (yellow / cyan)
   const rtbDispDotL = new THREE.Mesh(
     new THREE.SphereGeometry(5, 12, 8),
-    new THREE.MeshBasicMaterial({ color: 0xffcc44, transparent: true, opacity: 0.6 }),
+    new THREE.MeshBasicMaterial({ color: 0xffcc44, transparent: true, opacity: 0.6, depthWrite: false }),
   );
   const rtbDispDotR = new THREE.Mesh(
     new THREE.SphereGeometry(5, 12, 8),
-    new THREE.MeshBasicMaterial({ color: 0x44dddd, transparent: true, opacity: 0.6 }),
+    new THREE.MeshBasicMaterial({ color: 0x44dddd, transparent: true, opacity: 0.6, depthWrite: false }),
   );
   rtbDispDotL.visible = false;
   rtbDispDotR.visible = false;
@@ -302,7 +352,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
 
   // Magenta rays: same gaze endpoint but originating from the emc-recovered
   // eye positions (the red/blue dots in the real track box).
-  const emcRayMat = new THREE.LineBasicMaterial({ color: 0xff44ff, transparent: true, opacity: 0.5 });
+  const emcRayMat = new THREE.LineBasicMaterial({ color: 0xff44ff, transparent: true, opacity: 0.5, depthWrite: false });
   const emcRayLGeom = new THREE.BufferGeometry();
   emcRayLGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
   const emcRayRGeom = new THREE.BufferGeometry();
@@ -447,6 +497,59 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
       eyeR.position.set(s.eye_origin_R_mm.x, s.eye_origin_R_mm.y, s.eye_origin_R_mm.z);
     }
 
+    // Pupil diameter — scale the iris/pupil circles on each eye
+    if (s.pupil_diameter_L_mm && s.pupil_diameter_L_mm > 0) {
+      const sc = s.pupil_diameter_L_mm / 4; // normalize around ~4mm typical
+      eyeL.children[1]?.scale.setScalar(sc); // iris
+      eyeL.children[2]?.scale.setScalar(sc); // pupil
+    }
+    if (s.pupil_diameter_R_mm && s.pupil_diameter_R_mm > 0) {
+      const sc = s.pupil_diameter_R_mm / 4;
+      eyeR.children[1]?.scale.setScalar(sc);
+      eyeR.children[2]?.scale.setScalar(sc);
+    }
+
+    // Raw (pre-calibration) eye origins — orange dots
+    if (s.eye_origin_raw_L_mm) {
+      rawEyeDotL.position.set(s.eye_origin_raw_L_mm.x, s.eye_origin_raw_L_mm.y, s.eye_origin_raw_L_mm.z);
+      rawEyeDotL.visible = true;
+    } else {
+      rawEyeDotL.visible = false;
+    }
+    if (s.eye_origin_raw_R_mm) {
+      rawEyeDotR.position.set(s.eye_origin_raw_R_mm.x, s.eye_origin_raw_R_mm.y, s.eye_origin_raw_R_mm.z);
+      rawEyeDotR.visible = true;
+    } else {
+      rawEyeDotR.visible = false;
+    }
+
+    // Display-space eye origins — purple dots
+    if (s.eye_origin_L_display_mm) {
+      dispEyeDotL.position.set(s.eye_origin_L_display_mm.x, s.eye_origin_L_display_mm.y, s.eye_origin_L_display_mm.z);
+      dispEyeDotL.visible = true;
+    } else {
+      dispEyeDotL.visible = false;
+    }
+    if (s.eye_origin_R_display_mm) {
+      dispEyeDotR.position.set(s.eye_origin_R_display_mm.x, s.eye_origin_R_display_mm.y, s.eye_origin_R_display_mm.z);
+      dispEyeDotR.visible = true;
+    } else {
+      dispEyeDotR.visible = false;
+    }
+
+    // Per-eye 3D gaze points — pink/blue dots at ray–plane intersection
+    if (s.gaze_point_3d_L_mm && s.validity_L === 0) {
+      gaze3dDotL.position.set(s.gaze_point_3d_L_mm.x, s.gaze_point_3d_L_mm.y, s.gaze_point_3d_L_mm.z);
+      gaze3dDotL.visible = true;
+    } else {
+      gaze3dDotL.visible = false;
+    }
+    if (s.gaze_point_3d_R_mm && s.validity_R === 0) {
+      gaze3dDotR.position.set(s.gaze_point_3d_R_mm.x, s.gaze_point_3d_R_mm.y, s.gaze_point_3d_R_mm.z);
+      gaze3dDotR.visible = true;
+    } else {
+      gaze3dDotR.visible = false;
+    }
 
     // Track box indicator: map normalized [0,1]³ → widget box coords.
     // emc encodes: x ≈ 0.5 when centered horizontally, y ≈ 0.5 centered
@@ -546,6 +649,19 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
       gazeDot.visible = false;
       rayL.visible = false;
       rayR.visible = false;
+    }
+
+    // Unfiltered 2D gaze dot — red, jittery, before temporal smoothing
+    const uf = s.gaze_point_2d_unfiltered;
+    if (uf && (uf.x !== 0 || uf.y !== 0)) {
+      const wuf = projectNorm(uf.x, uf.y);
+      if (wuf) {
+        unfiltDot.position.copy(wuf);
+        unfiltDot.position.z += 0.5; // nudge in front of screen
+        unfiltDot.visible = true;
+      }
+    } else {
+      unfiltDot.visible = false;
     }
 
     // Magenta rays: from display-space trackbox positions to per-eye gaze points.

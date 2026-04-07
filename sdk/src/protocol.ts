@@ -79,6 +79,13 @@ export type GazeSample = {
   trackbox_eye_pos_L_display?: Vec3;
   /** Normalized track-box position, right eye, in display-area frame. */
   trackbox_eye_pos_R_display?: Vec3;
+
+  /** Pre-calibration left eye position in tracker-space (mm). */
+  eye_origin_raw_L_mm?: Vec3;
+  /** Pre-calibration right eye position in tracker-space (mm). */
+  eye_origin_raw_R_mm?: Vec3;
+  /** Combined binocular 2D gaze before temporal smoothing, [0,1]². */
+  gaze_point_2d_unfiltered?: Vec2;
 };
 
 export type DisplayArea = {

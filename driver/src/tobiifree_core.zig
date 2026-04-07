@@ -1096,6 +1096,9 @@ pub const GAZE_BIT_EYE_ORIGIN_L_DISP: u32    = 1 << 15;
 pub const GAZE_BIT_EYE_ORIGIN_R_DISP: u32    = 1 << 16;
 pub const GAZE_BIT_TRACKBOX_L_DISP: u32      = 1 << 17;
 pub const GAZE_BIT_TRACKBOX_R_DISP: u32      = 1 << 18;
+pub const GAZE_BIT_EYE_ORIGIN_RAW_L: u32     = 1 << 19;
+pub const GAZE_BIT_EYE_ORIGIN_RAW_R: u32     = 1 << 20;
+pub const GAZE_BIT_GAZE_2D_UNFILTERED: u32   = 1 << 21;
 
 /// Decoded gaze frame — extern layout read directly from JS via gaze_view.ts.
 /// Field offsets MUST be kept in sync with the TS reader.
@@ -1128,6 +1131,9 @@ pub const GazeSample = extern struct {
     eye_origin_R_display_mm: [3]f64, // calibrated right eye position (display-space)
     trackbox_eye_pos_L_display: [3]f64, // normalized track-box position (display-space)
     trackbox_eye_pos_R_display: [3]f64, // normalized track-box position (display-space)
+    eye_origin_raw_L_mm: [3]f64,       // pre-calibration left eye position (tracker-space)
+    eye_origin_raw_R_mm: [3]f64,       // pre-calibration right eye position (tracker-space)
+    gaze_point_2d_unfiltered: [2]f64,  // combined 2D gaze before temporal smoothing
 };
 
 var gaze_sample: GazeSample = undefined;
@@ -1253,6 +1259,21 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
                 const v = r.readPoint3d() catch return true;
                 gaze_sample.trackbox_eye_pos_R_display = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_R_DISP;
+            },
+            0x17 => { // eye_origin_raw_L — pre-calibration left eye position (tracker-space)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.eye_origin_raw_L_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_L;
+            },
+            0x18 => { // eye_origin_raw_R — pre-calibration right eye position (tracker-space)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.eye_origin_raw_R_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_R;
+            },
+            0x20 => { // gaze_point_2d_unfiltered — combined 2D gaze before temporal smoothing
+                const v = r.readPoint2d() catch return true;
+                gaze_sample.gaze_point_2d_unfiltered = .{ v[0], v[1] };
+                gaze_sample.present_mask |= GAZE_BIT_GAZE_2D_UNFILTERED;
             },
             0x1c => { // gaze_point_2d — combined binocular 2D, temporally filtered (final)
                 const v = r.readPoint2d() catch return true;
