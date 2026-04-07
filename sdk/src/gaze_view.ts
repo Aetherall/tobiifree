@@ -3,9 +3,10 @@
 // Layout MUST match tobiifree_core.zig : GazeSample (see @offsetOf probe).
 // Present-mask bits mirror GAZE_BIT_* constants.
 //
-// All eye origins and gaze directions here are post-calibration,
-// in tracker-space (mm). The raw/uncalibrated origins (cols 0x17/0x18)
-// and display-space variants (cols 0x22-0x28) are only available via
+// All eye origins and trackbox positions here are post-calibration.
+// Tracker-space fields use mm with origin at the IR sensor array.
+// Display-space fields are shifted into the display_area frame.
+// Raw/uncalibrated origins (cols 0x17/0x18) are only available via
 // the raw column API (subscribeToRawGaze).
 
 import type { GazeSample } from './protocol';
@@ -23,10 +24,14 @@ const OFF_GAZE_2D_L          = 56;  // [2]f64: left per-eye 2D projection
 const OFF_GAZE_2D_R          = 72;  // [2]f64: right per-eye 2D projection
 const OFF_EYE_ORIGIN_L       = 88;  // [3]f64: calibrated left eye pos (tracker-space mm)
 const OFF_EYE_ORIGIN_R       = 112; // [3]f64: calibrated right eye pos (tracker-space mm)
-const OFF_GAZE_DIR_L         = 136; // [3]f64: left "gaze direction" — ≈ normalize(-eye_origin), not gaze
-const OFF_GAZE_DIR_R         = 160; // [3]f64: right "gaze direction" — same caveat
+const OFF_GAZE_DIR_L         = 136; // [3]f64: normalized track-box position, left eye
+const OFF_GAZE_DIR_R         = 160; // [3]f64: normalized track-box position, right eye
 const OFF_GAZE_3D_L          = 184; // [3]f64: left ray–plane intersection (tracker-space mm)
 const OFF_GAZE_3D_R          = 208; // [3]f64: right ray–plane intersection (tracker-space mm)
+const OFF_EYE_ORIGIN_L_DISP  = 232; // [3]f64: calibrated left eye pos (display-space mm)
+const OFF_EYE_ORIGIN_R_DISP  = 256; // [3]f64: calibrated right eye pos (display-space mm)
+const OFF_TRACKBOX_L_DISP    = 280; // [3]f64: normalized track-box position, left (display-space)
+const OFF_TRACKBOX_R_DISP    = 304; // [3]f64: normalized track-box position, right (display-space)
 
 const BIT_TIMESTAMP     = 1 << 0;
 const BIT_FRAME_COUNTER = 1 << 1;
@@ -43,9 +48,13 @@ const BIT_GAZE_DIR_L    = 1 << 11;
 const BIT_GAZE_DIR_R    = 1 << 12;
 const BIT_GAZE_3D_L     = 1 << 13;
 const BIT_GAZE_3D_R     = 1 << 14;
+const BIT_EYE_ORIGIN_L_DISP = 1 << 15;
+const BIT_EYE_ORIGIN_R_DISP = 1 << 16;
+const BIT_TRACKBOX_L_DISP   = 1 << 17;
+const BIT_TRACKBOX_R_DISP   = 1 << 18;
 
 export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
-  const dv = new DataView(buffer, ptr, 232);
+  const dv = new DataView(buffer, ptr, 328);
   const mask = dv.getUint32(OFF_PRESENT, true);
   const s: GazeSample = {};
   if (mask & BIT_TIMESTAMP) {
@@ -74,6 +83,10 @@ export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   if (mask & BIT_GAZE_DIR_R)   s.trackbox_eye_pos_R = readV3(dv, OFF_GAZE_DIR_R);
   if (mask & BIT_GAZE_3D_L)    s.gaze_point_3d_L_mm = readV3(dv, OFF_GAZE_3D_L);
   if (mask & BIT_GAZE_3D_R)    s.gaze_point_3d_R_mm = readV3(dv, OFF_GAZE_3D_R);
+  if (mask & BIT_EYE_ORIGIN_L_DISP) s.eye_origin_L_display_mm = readV3(dv, OFF_EYE_ORIGIN_L_DISP);
+  if (mask & BIT_EYE_ORIGIN_R_DISP) s.eye_origin_R_display_mm = readV3(dv, OFF_EYE_ORIGIN_R_DISP);
+  if (mask & BIT_TRACKBOX_L_DISP)   s.trackbox_eye_pos_L_display = readV3(dv, OFF_TRACKBOX_L_DISP);
+  if (mask & BIT_TRACKBOX_R_DISP)   s.trackbox_eye_pos_R_display = readV3(dv, OFF_TRACKBOX_R_DISP);
   return s;
 }
 

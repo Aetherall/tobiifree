@@ -284,6 +284,20 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   realTrackBox.add(rtbDotL);
   realTrackBox.add(rtbDotR);
 
+  // Display-space trackbox dots (yellow / cyan)
+  const rtbDispDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffcc44, transparent: true, opacity: 0.6 }),
+  );
+  const rtbDispDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(5, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0x44dddd, transparent: true, opacity: 0.6 }),
+  );
+  rtbDispDotL.visible = false;
+  rtbDispDotR.visible = false;
+  realTrackBox.add(rtbDispDotL);
+  realTrackBox.add(rtbDispDotR);
+
   trackerOffset.add(realTrackBox);
 
   // Magenta rays: same gaze endpoint but originating from the emc-recovered
@@ -469,6 +483,34 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
       rtbDotR.visible = false;
     }
 
+    // Display-space trackbox dots — same recovery but using display-space coefficients.
+    // These use the same linear model with different intercepts due to the
+    // display-area coordinate transform (tilt rotation).
+    const ddL = s.trackbox_eye_pos_L_display;
+    const ddR = s.trackbox_eye_pos_R_display;
+    // Use own validity: column 0x25/0x27 can lag behind validity_L/R by a frame.
+    // When invalid the values are all zeros, so check that too.
+    if (ddL && (ddL.x !== 0 || ddL.y !== 0 || ddL.z !== 0)) {
+      rtbDispDotL.position.set(
+        (ddL.x - 0.4989) / -0.002291 - RTB_CX,
+        (ddL.y - 0.4936) / -0.002201 - RTB_CY,
+        (ddL.z - (-0.7681)) / 0.001970 - RTB_CZ,
+      );
+      rtbDispDotL.visible = true;
+    } else {
+      rtbDispDotL.visible = false;
+    }
+    if (ddR && (ddR.x !== 0 || ddR.y !== 0 || ddR.z !== 0)) {
+      rtbDispDotR.position.set(
+        (ddR.x - 0.5002) / -0.002297 - RTB_CX,
+        (ddR.y - 0.4934) / -0.002187 - RTB_CY,
+        (ddR.z - (-0.7759)) / 0.001976 - RTB_CZ,
+      );
+      rtbDispDotR.visible = true;
+    } else {
+      rtbDispDotR.visible = false;
+    }
+
     const p2 = s.gaze_point_2d_norm;
     const valid = s.validity_L === 0 || s.validity_R === 0;
 
@@ -499,40 +541,44 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
         rayL.visible = true;
         rayR.visible = true;
 
-        // Magenta rays: from emc-recovered eye positions to per-eye gaze points.
-        const elp = new THREE.Vector3();
-        const erp = new THREE.Vector3();
-        rtbDotL.getWorldPosition(elp);
-        rtbDotR.getWorldPosition(erp);
-        const gazeL2d = s.gaze_point_2d_L_norm;
-        const gazeR2d = s.gaze_point_2d_R_norm;
-        const worldL = gazeL2d ? projectNorm(gazeL2d.x, gazeL2d.y) : null;
-        const worldR = gazeR2d ? projectNorm(gazeR2d.x, gazeR2d.y) : null;
-        if (worldL && rtbDotL.visible) {
-          const elArr = emcRayLGeom.getAttribute('position') as THREE.BufferAttribute;
-          elArr.setXYZ(0, elp.x, elp.y, elp.z);
-          elArr.setXYZ(1, worldL.x, worldL.y, worldL.z);
-          elArr.needsUpdate = true;
-          emcRayL.visible = true;
-        } else {
-          emcRayL.visible = false;
-        }
-        if (worldR && rtbDotR.visible) {
-          const erArr = emcRayRGeom.getAttribute('position') as THREE.BufferAttribute;
-          erArr.setXYZ(0, erp.x, erp.y, erp.z);
-          erArr.setXYZ(1, worldR.x, worldR.y, worldR.z);
-          erArr.needsUpdate = true;
-          emcRayR.visible = true;
-        } else {
-          emcRayR.visible = false;
-        }
       }
     } else {
       gazeDot.visible = false;
       rayL.visible = false;
       rayR.visible = false;
-      emcRayL.visible = false;
-      emcRayR.visible = false;
+    }
+
+    // Magenta rays: from display-space trackbox positions to per-eye gaze points.
+    // Independent of validity_L/R — display-space trackbox can have data when
+    // the main validity flag is already invalid (trails by a few frames).
+    {
+      trackerFramePivot.updateMatrixWorld();
+      const gazeL2d = s.gaze_point_2d_L_norm;
+      const gazeR2d = s.gaze_point_2d_R_norm;
+      const worldL = gazeL2d && (gazeL2d.x !== 0 || gazeL2d.y !== 0) ? projectNorm(gazeL2d.x, gazeL2d.y) : null;
+      const worldR = gazeR2d && (gazeR2d.x !== 0 || gazeR2d.y !== 0) ? projectNorm(gazeR2d.x, gazeR2d.y) : null;
+      if (worldL && rtbDispDotL.visible) {
+        const elp = new THREE.Vector3();
+        rtbDispDotL.getWorldPosition(elp);
+        const elArr = emcRayLGeom.getAttribute('position') as THREE.BufferAttribute;
+        elArr.setXYZ(0, elp.x, elp.y, elp.z);
+        elArr.setXYZ(1, worldL.x, worldL.y, worldL.z);
+        elArr.needsUpdate = true;
+        emcRayL.visible = true;
+      } else {
+        emcRayL.visible = false;
+      }
+      if (worldR && rtbDispDotR.visible) {
+        const erp = new THREE.Vector3();
+        rtbDispDotR.getWorldPosition(erp);
+        const erArr = emcRayRGeom.getAttribute('position') as THREE.BufferAttribute;
+        erArr.setXYZ(0, erp.x, erp.y, erp.z);
+        erArr.setXYZ(1, worldR.x, worldR.y, worldR.z);
+        erArr.needsUpdate = true;
+        emcRayR.visible = true;
+      } else {
+        emcRayR.visible = false;
+      }
     }
 
   }

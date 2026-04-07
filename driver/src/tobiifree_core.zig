@@ -1092,6 +1092,10 @@ pub const GAZE_BIT_GAZE_DIR_L: u32           = 1 << 11;
 pub const GAZE_BIT_GAZE_DIR_R: u32           = 1 << 12;
 pub const GAZE_BIT_GAZE_3D_L: u32            = 1 << 13;
 pub const GAZE_BIT_GAZE_3D_R: u32            = 1 << 14;
+pub const GAZE_BIT_EYE_ORIGIN_L_DISP: u32    = 1 << 15;
+pub const GAZE_BIT_EYE_ORIGIN_R_DISP: u32    = 1 << 16;
+pub const GAZE_BIT_TRACKBOX_L_DISP: u32      = 1 << 17;
+pub const GAZE_BIT_TRACKBOX_R_DISP: u32      = 1 << 18;
 
 /// Decoded gaze frame — extern layout read directly from JS via gaze_view.ts.
 /// Field offsets MUST be kept in sync with the TS reader.
@@ -1120,6 +1124,10 @@ pub const GazeSample = extern struct {
     trackbox_eye_pos_R: [3]f64, // right "gaze direction" — same (per-eye scaling)
     gaze_point_3d_L_mm: [3]f64,    // left ray–plane intersection (tracker-space)
     gaze_point_3d_R_mm: [3]f64,    // right ray–plane intersection (tracker-space)
+    eye_origin_L_display_mm: [3]f64, // calibrated left eye position (display-space)
+    eye_origin_R_display_mm: [3]f64, // calibrated right eye position (display-space)
+    trackbox_eye_pos_L_display: [3]f64, // normalized track-box position (display-space)
+    trackbox_eye_pos_R_display: [3]f64, // normalized track-box position (display-space)
 };
 
 var gaze_sample: GazeSample = undefined;
@@ -1225,6 +1233,26 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
             0x14 => { // frame_counter — monotonic frame index
                 gaze_sample.frame_counter = r.readU32() catch return true;
                 gaze_sample.present_mask |= GAZE_BIT_FRAME_COUNTER;
+            },
+            0x22 => { // eye_origin_L_display — calibrated left eye (display-space mm)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.eye_origin_L_display_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_L_DISP;
+            },
+            0x24 => { // eye_origin_R_display — calibrated right eye (display-space mm)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.eye_origin_R_display_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_R_DISP;
+            },
+            0x25 => { // trackbox_eye_pos_L_display — normalized track-box position (display-space)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.trackbox_eye_pos_L_display = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_L_DISP;
+            },
+            0x27 => { // trackbox_eye_pos_R_display — normalized track-box position (display-space)
+                const v = r.readPoint3d() catch return true;
+                gaze_sample.trackbox_eye_pos_R_display = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_R_DISP;
             },
             0x1c => { // gaze_point_2d — combined binocular 2D, temporally filtered (final)
                 const v = r.readPoint2d() catch return true;

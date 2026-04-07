@@ -70,6 +70,15 @@ export type GazeSample = {
   gaze_point_3d_L_mm?: Vec3;
   /** Right ray–plane intersection in tracker-space (mm). */
   gaze_point_3d_R_mm?: Vec3;
+
+  /** Calibrated left eye position in display-area frame (mm). */
+  eye_origin_L_display_mm?: Vec3;
+  /** Calibrated right eye position in display-area frame (mm). */
+  eye_origin_R_display_mm?: Vec3;
+  /** Normalized track-box position, left eye, in display-area frame. */
+  trackbox_eye_pos_L_display?: Vec3;
+  /** Normalized track-box position, right eye, in display-area frame. */
+  trackbox_eye_pos_R_display?: Vec3;
 };
 
 export type DisplayArea = {
@@ -177,10 +186,10 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
   0x22: 'eye_origin_L_display_mm',    // [point3d] calibrated left eye in display_area frame
   0x23: 'eye_origin_L_display_valid', // [u32]     1=valid, 0=invalid
   0x24: 'eye_origin_R_display_mm',    // [point3d] calibrated right eye in display_area frame
-  0x25: 'gaze_direction_L_display',   // [point3d] left gaze direction in display_area frame
-  0x26: 'gaze_dir_L_display_valid',   // [u32]     1=valid, 0=invalid
-  0x27: 'gaze_direction_R_display',   // [point3d] right gaze direction in display_area frame
-  0x28: 'gaze_dir_R_display_valid',   // [u32]     1=valid, 0=invalid
+  0x25: 'trackbox_eye_pos_L_display', // [point3d] normalized track-box position, left (display-space)
+  0x26: 'trackbox_L_display_valid',   // [u32]     1=valid, 0=invalid
+  0x27: 'trackbox_eye_pos_R_display', // [point3d] normalized track-box position, right (display-space)
+  0x28: 'trackbox_R_display_valid',   // [u32]     1=valid, 0=invalid
 
   // ── Unknown scalars (always -1 / 0) ────────────────────────────────
   0x29: 'scalar_unused_29',           // [fix16]   always -1 — reserved/unused
