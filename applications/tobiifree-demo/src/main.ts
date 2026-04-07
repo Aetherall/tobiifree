@@ -688,8 +688,8 @@ async function runDiagnostic() {
         if (s.validity_L !== 0 && s.validity_R !== 0) return;
         if (s.eye_origin_L_mm) dst.eyeL.push(s.eye_origin_L_mm);
         if (s.eye_origin_R_mm) dst.eyeR.push(s.eye_origin_R_mm);
-        if (s.gaze_direction_L_unit) dst.dirL.push(s.gaze_direction_L_unit);
-        if (s.gaze_direction_R_unit) dst.dirR.push(s.gaze_direction_R_unit);
+        if (s.gaze_direction_L_emc) dst.dirL.push(s.gaze_direction_L_emc);
+        if (s.gaze_direction_R_emc) dst.dirR.push(s.gaze_direction_R_emc);
         if (s.gaze_point_3d_L_mm) dst.gp3L.push(s.gaze_point_3d_L_mm);
         if (s.gaze_point_3d_R_mm) dst.gp3R.push(s.gaze_point_3d_R_mm);
         if (s.gaze_point_2d_norm) dst.gp2.push({ x: s.gaze_point_2d_norm.x, y: s.gaze_point_2d_norm.y, z: 0 });
@@ -730,8 +730,8 @@ async function runDiagnostic() {
     lines.push('');
     report('eye_origin_L_mm (tracker frame?)', bA.eyeL, bB.eyeL);
     report('eye_origin_R_mm (tracker frame?)', bA.eyeR, bB.eyeR);
-    report('gaze_direction_L_unit', bA.dirL, bB.dirL);
-    report('gaze_direction_R_unit', bA.dirR, bB.dirR);
+    report('gaze_direction_L_emc', bA.dirL, bB.dirL);
+    report('gaze_direction_R_emc', bA.dirR, bB.dirR);
     report('gaze_point_3d_L_mm', bA.gp3L, bB.gp3L);
     report('gaze_point_3d_R_mm', bA.gp3R, bB.gp3R);
     report('gaze_point_2d_norm (CONTROL)', bA.gp2, bB.gp2);
@@ -993,8 +993,8 @@ type CollectedRecord = {
     validity_L?: number; validity_R?: number;
     eye_origin_L_mm?: { x: number; y: number; z: number };
     eye_origin_R_mm?: { x: number; y: number; z: number };
-    gaze_direction_L_unit?: { x: number; y: number; z: number };
-    gaze_direction_R_unit?: { x: number; y: number; z: number };
+    gaze_direction_L_emc?: { x: number; y: number; z: number };
+    gaze_direction_R_emc?: { x: number; y: number; z: number };
     gaze_point_3d_L_mm?: { x: number; y: number; z: number };
     gaze_point_3d_R_mm?: { x: number; y: number; z: number };
     gaze_point_2d_norm?: { x: number; y: number };
@@ -1088,8 +1088,8 @@ async function runSampleCollection() {
         validity_R: s.validity_R,
         eye_origin_L_mm: s.eye_origin_L_mm && { ...s.eye_origin_L_mm },
         eye_origin_R_mm: s.eye_origin_R_mm && { ...s.eye_origin_R_mm },
-        gaze_direction_L_unit: s.gaze_direction_L_unit && { ...s.gaze_direction_L_unit },
-        gaze_direction_R_unit: s.gaze_direction_R_unit && { ...s.gaze_direction_R_unit },
+        gaze_direction_L_emc: s.gaze_direction_L_emc && { ...s.gaze_direction_L_emc },
+        gaze_direction_R_emc: s.gaze_direction_R_emc && { ...s.gaze_direction_R_emc },
         gaze_point_3d_L_mm: s.gaze_point_3d_L_mm && { ...s.gaze_point_3d_L_mm },
         gaze_point_3d_R_mm: s.gaze_point_3d_R_mm && { ...s.gaze_point_3d_R_mm },
         gaze_point_2d_norm: s.gaze_point_2d_norm && { ...s.gaze_point_2d_norm },
@@ -1390,8 +1390,8 @@ async function runSampleCollection2Plane() {
         validity_R: s.validity_R,
         eye_origin_L_mm: s.eye_origin_L_mm && { ...s.eye_origin_L_mm },
         eye_origin_R_mm: s.eye_origin_R_mm && { ...s.eye_origin_R_mm },
-        gaze_direction_L_unit: s.gaze_direction_L_unit && { ...s.gaze_direction_L_unit },
-        gaze_direction_R_unit: s.gaze_direction_R_unit && { ...s.gaze_direction_R_unit },
+        gaze_direction_L_emc: s.gaze_direction_L_emc && { ...s.gaze_direction_L_emc },
+        gaze_direction_R_emc: s.gaze_direction_R_emc && { ...s.gaze_direction_R_emc },
         gaze_point_3d_L_mm: s.gaze_point_3d_L_mm && { ...s.gaze_point_3d_L_mm },
         gaze_point_3d_R_mm: s.gaze_point_3d_R_mm && { ...s.gaze_point_3d_R_mm },
         gaze_point_2d_norm: s.gaze_point_2d_norm && { ...s.gaze_point_2d_norm },

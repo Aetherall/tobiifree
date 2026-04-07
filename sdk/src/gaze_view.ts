@@ -23,8 +23,8 @@ const OFF_GAZE_2D_L          = 56;  // [2]f64: left per-eye 2D projection
 const OFF_GAZE_2D_R          = 72;  // [2]f64: right per-eye 2D projection
 const OFF_EYE_ORIGIN_L       = 88;  // [3]f64: calibrated left eye pos (tracker-space mm)
 const OFF_EYE_ORIGIN_R       = 112; // [3]f64: calibrated right eye pos (tracker-space mm)
-const OFF_GAZE_DIR_L         = 136; // [3]f64: left gaze direction unit vec (tracker-space)
-const OFF_GAZE_DIR_R         = 160; // [3]f64: right gaze direction unit vec (tracker-space)
+const OFF_GAZE_DIR_L         = 136; // [3]f64: left "gaze direction" — ≈ normalize(-eye_origin), not gaze
+const OFF_GAZE_DIR_R         = 160; // [3]f64: right "gaze direction" — same caveat
 const OFF_GAZE_3D_L          = 184; // [3]f64: left ray–plane intersection (tracker-space mm)
 const OFF_GAZE_3D_R          = 208; // [3]f64: right ray–plane intersection (tracker-space mm)
 
@@ -70,8 +70,8 @@ export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   }
   if (mask & BIT_EYE_ORIGIN_L) s.eye_origin_L_mm = readV3(dv, OFF_EYE_ORIGIN_L);
   if (mask & BIT_EYE_ORIGIN_R) s.eye_origin_R_mm = readV3(dv, OFF_EYE_ORIGIN_R);
-  if (mask & BIT_GAZE_DIR_L)   s.gaze_direction_L_unit = readV3(dv, OFF_GAZE_DIR_L);
-  if (mask & BIT_GAZE_DIR_R)   s.gaze_direction_R_unit = readV3(dv, OFF_GAZE_DIR_R);
+  if (mask & BIT_GAZE_DIR_L)   s.gaze_direction_L_emc = readV3(dv, OFF_GAZE_DIR_L);
+  if (mask & BIT_GAZE_DIR_R)   s.gaze_direction_R_emc = readV3(dv, OFF_GAZE_DIR_R);
   if (mask & BIT_GAZE_3D_L)    s.gaze_point_3d_L_mm = readV3(dv, OFF_GAZE_3D_L);
   if (mask & BIT_GAZE_3D_R)    s.gaze_point_3d_R_mm = readV3(dv, OFF_GAZE_3D_R);
   return s;

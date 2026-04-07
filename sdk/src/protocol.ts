@@ -52,10 +52,20 @@ export type GazeSample = {
   eye_origin_L_mm?: Vec3;
   /** Calibrated right eye position in tracker-space (mm). */
   eye_origin_R_mm?: Vec3;
-  /** Left gaze direction unit vector in tracker-space. */
-  gaze_direction_L_unit?: Vec3;
-  /** Right gaze direction unit vector in tracker-space. */
-  gaze_direction_R_unit?: Vec3;
+  /**
+   * Left "gaze direction" — **NOT a direction vector at all**. Despite the
+   * column name, this encodes the eye's normalized position in the track box:
+   *   d.x ≈ 0.5 − eye.x/457,  d.y ≈ 0.5 − eye.y/463,  d.z ≈ eye.z/503 − 0.78
+   * Reconstruction error vs eye_origin is ~4mm. This is a redundant copy
+   * of eye position in a per-eye-model scale. Not useful for gaze —
+   * use gaze_point_3d_L_mm or gaze_point_2d_L_norm instead.
+   */
+  gaze_direction_L_emc?: Vec3;
+  /**
+   * Right "gaze direction" — same as left: normalized track-box position,
+   * not a direction. Coefficients differ per eye.
+   */
+  gaze_direction_R_emc?: Vec3;
   /** Left ray–plane intersection in tracker-space (mm). */
   gaze_point_3d_L_mm?: Vec3;
   /** Right ray–plane intersection in tracker-space (mm). */
@@ -106,10 +116,12 @@ export type RawGazeColumn = {
  *    (systematic offset of ~1–5mm from raw).
  *  - **display-relative** (0x22/0x24): calibrated origin shifted into display_area frame.
  *
- * Gaze directions come in two variants:
- *  - **tracker-space** (0x03/0x09): unit vector in tracker coords.
- *  - **display-space** (0x25/0x27): same ray rotated into display_area frame
- *    (identical for axis-aligned planes, small delta for tilted ones).
+ * "Gaze directions" — **misleading column name**: these are NOT direction
+ * vectors. They encode the eye's normalized position in the track box
+ * (d ≈ linear_transform(eye_origin), reconstruction error ~4mm).
+ *  - **eye-model coords** (0x03/0x09): normalized track-box position, per eye.
+ *  - **display-space** (0x25/0x27): same in display_area frame
+ *    (observed as zeros/invalid on tested firmware; may be unused).
  *
  * 2D gaze points:
  *  - **per-eye** (0x05/0x0b): ray→plane intersection per eye.
@@ -126,7 +138,7 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
 
   // ── Left eye (calibrated, tracker-space) ───────────────────────────
   0x02: 'eye_origin_L_mm',            // [point3d] calibrated eye position (mm, tracker-space)
-  0x03: 'gaze_direction_L_unit',      // [point3d] gaze direction unit vector (tracker-space)
+  0x03: 'gaze_direction_L_emc',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
   0x04: 'gaze_point_3d_L_mm',         // [point3d] ray–plane intersection (mm, tracker-space)
   0x05: 'gaze_point_2d_L_norm',       // [point2d] per-eye 2D projection on display_area [0,1]²
   0x06: 'pupil_diameter_L_mm',        // [fix16]   pupil diameter; -1 when invalid
@@ -134,7 +146,7 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
 
   // ── Right eye (calibrated, tracker-space) ──────────────────────────
   0x08: 'eye_origin_R_mm',            // [point3d] calibrated eye position (mm, tracker-space)
-  0x09: 'gaze_direction_R_unit',      // [point3d] gaze direction unit vector (tracker-space)
+  0x09: 'gaze_direction_R_emc',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
   0x0a: 'gaze_point_3d_R_mm',        // [point3d] ray–plane intersection (mm, tracker-space)
   0x0b: 'gaze_point_2d_R_norm',      // [point2d] per-eye 2D projection on display_area [0,1]²
   0x0c: 'pupil_diameter_R_mm',       // [fix16]   pupil diameter; -1 when invalid

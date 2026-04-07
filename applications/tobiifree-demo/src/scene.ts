@@ -213,33 +213,81 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   rayL.visible = false;
   rayR.visible = false;
 
-  // gaze_direction_*_unit "rays" — the direction vectors the device
-  // reports. Analysis on collected datasets shows these are NOT
-  // eye-to-target gaze rays (see scripts/analyze_samples.mjs):
-  //   – O + k·d ≠ gaze_point_3d (xy residual ~1500mm, k ≈ −1400mm)
-  //   – correlations dir.x↔eye.x are ≈ −0.99: dir points FROM eye
-  //     TOWARD a fixed tracker-frame point ~at the eye cluster
-  //   – they barely respond to gaze; they respond to head pose
-  // Rendered as a long magenta line through the eye in both
-  // directions so the user can see the line the vector defines.
-  const stubLen = 600;
-  const dirMat = new THREE.LineBasicMaterial({ color: 0xff5ce0, transparent: true, opacity: 0.9 });
-  const dirLGeom = new THREE.BufferGeometry();
-  dirLGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-  const dirRGeom = new THREE.BufferGeometry();
-  dirRGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-  const dirL = new THREE.Line(dirLGeom, dirMat);
-  const dirR = new THREE.Line(dirRGeom, dirMat);
-  dirL.visible = false;
-  dirR.visible = false;
-  // Rays live at scene root so their endpoints are written in world
+  // ---------- track box indicator ----------
+  // A small wireframe box near the tracker showing where each eye sits
+  // in the normalized [0,1]³ detection volume. Centered = good tracking,
+  // edges = about to lose tracking. Data comes from gaze_direction_*_emc
+  // which encode normalized track-box position (not direction vectors).
+  const TB_W = 80, TB_H = 50, TB_D = 40; // widget size in mm
+  const TB_OFFSET_Y = -40; // below the tracker bar
+
+  const trackBoxGroup = new THREE.Group();
+  trackBoxGroup.position.set(0, TB_OFFSET_Y, 0);
+
+  // Wireframe edges of the box
+  const tbBoxGeom = new THREE.BoxGeometry(TB_W, TB_H, TB_D);
+  const tbBoxWire = new THREE.LineSegments(
+    new THREE.EdgesGeometry(tbBoxGeom),
+    new THREE.LineBasicMaterial({ color: 0x555566, transparent: true, opacity: 0.5 }),
+  );
+  trackBoxGroup.add(tbBoxWire);
+
+  // Eye position dots inside the box
+  const tbDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(3, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff6688 }),
+  );
+  const tbDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(3, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0x66aaff }),
+  );
+  tbDotL.visible = false;
+  tbDotR.visible = false;
+  trackBoxGroup.add(tbDotL);
+  trackBoxGroup.add(tbDotR);
+
+  trackerOffset.add(trackBoxGroup);
+
+  // ---------- real-size track box (surrounds the eyes) ----------
+  // From the linear model: x_range ≈ 457mm, y_range ≈ 463mm, z_range ≈ 503mm.
+  // The z centre is at ~0.78×503 ≈ 393mm offset from the tracker origin,
+  // so the box spans roughly z = 393 − 251 .. 393 + 251 = 142..644 mm.
+  // x is centred at 0 (symmetric), y centred at ~0.5×463 ≈ 231mm.
+  const RTB_W = 457, RTB_H = 463, RTB_D = 503;
+  const RTB_CX = 0, RTB_CY = 0.5 * RTB_H, RTB_CZ = 0.78 * RTB_D;
+
+  const realTrackBox = new THREE.Group();
+  realTrackBox.position.set(RTB_CX, RTB_CY, RTB_CZ);
+
+  const rtbGeom = new THREE.BoxGeometry(RTB_W, RTB_H, RTB_D);
+  const rtbWire = new THREE.LineSegments(
+    new THREE.EdgesGeometry(rtbGeom),
+    new THREE.LineBasicMaterial({ color: 0x444455, transparent: true, opacity: 0.25 }),
+  );
+  realTrackBox.add(rtbWire);
+
+  // Eye dots in the real track box
+  const rtbDotL = new THREE.Mesh(
+    new THREE.SphereGeometry(6, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff6688, transparent: true, opacity: 0.5 }),
+  );
+  const rtbDotR = new THREE.Mesh(
+    new THREE.SphereGeometry(6, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5 }),
+  );
+  rtbDotL.visible = false;
+  rtbDotR.visible = false;
+  realTrackBox.add(rtbDotL);
+  realTrackBox.add(rtbDotR);
+
+  trackerOffset.add(realTrackBox);
+
+  // Gaze rays live at scene root so their endpoints are written in world
   // (screen-frame) coords directly — eye endpoints come from
   // getWorldPosition of the framed eye groups; gaze endpoints are the
   // already-screen-frame projection.
   scene.add(rayL);
   scene.add(rayR);
-  scene.add(dirL);
-  scene.add(dirR);
 
 
   // ---------- update helpers ----------
@@ -368,6 +416,31 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     }
 
 
+    // Track box indicator: map normalized [0,1]³ → widget box coords.
+    // emc encodes: x ≈ 0.5 when centered horizontally, y ≈ 0.5 centered
+    // vertically, z ≈ depth. We map (0,0,0)→(-W/2,-H/2,-D/2) and
+    // (1,1,1)→(+W/2,+H/2,+D/2). Note x is inverted (0.5−eye/scale).
+    const dL = s.gaze_direction_L_emc;
+    const dR = s.gaze_direction_R_emc;
+    if (dL && s.validity_L === 0) {
+      tbDotL.position.set(-(dL.x - 0.5) * TB_W, -(dL.y - 0.5) * TB_H, dL.z * TB_D);
+      tbDotL.visible = true;
+      rtbDotL.position.set((0.5 - dL.x) * RTB_W, (0.5 - dL.y) * RTB_H, (dL.z - 0.5) * RTB_D);
+      rtbDotL.visible = true;
+    } else {
+      tbDotL.visible = false;
+      rtbDotL.visible = false;
+    }
+    if (dR && s.validity_R === 0) {
+      tbDotR.position.set(-(dR.x - 0.5) * TB_W, -(dR.y - 0.5) * TB_H, dR.z * TB_D);
+      tbDotR.visible = true;
+      rtbDotR.position.set((0.5 - dR.x) * RTB_W, (0.5 - dR.y) * RTB_H, (dR.z - 0.5) * RTB_D);
+      rtbDotR.visible = true;
+    } else {
+      tbDotR.visible = false;
+      rtbDotR.visible = false;
+    }
+
     const p2 = s.gaze_point_2d_norm;
     const valid = s.validity_L === 0 || s.validity_R === 0;
 
@@ -404,37 +477,6 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
       rayR.visible = false;
     }
 
-    // Direction lines: full line through the eye along ±dir, expressed
-    // in tracker frame then transformed to world via trackerOffset's
-    // world matrix (so they follow the tilt).
-    const drawStub = (
-      origin: { x: number; y: number; z: number } | undefined,
-      dir: { x: number; y: number; z: number } | undefined,
-      geom: THREE.BufferGeometry,
-      line: THREE.Line,
-    ) => {
-      if (!origin || !dir) { line.visible = false; return; }
-      trackerOffset.updateMatrixWorld();
-      const p0Local = new THREE.Vector3(
-        origin.x - dir.x * stubLen,
-        origin.y - dir.y * stubLen,
-        origin.z - dir.z * stubLen,
-      );
-      const p1Local = new THREE.Vector3(
-        origin.x + dir.x * stubLen,
-        origin.y + dir.y * stubLen,
-        origin.z + dir.z * stubLen,
-      );
-      const p0 = p0Local.applyMatrix4(trackerOffset.matrixWorld);
-      const p1 = p1Local.applyMatrix4(trackerOffset.matrixWorld);
-      const arr = geom.getAttribute('position') as THREE.BufferAttribute;
-      arr.setXYZ(0, p0.x, p0.y, p0.z);
-      arr.setXYZ(1, p1.x, p1.y, p1.z);
-      arr.needsUpdate = true;
-      line.visible = true;
-    };
-    drawStub(s.eye_origin_L_mm, s.gaze_direction_L_unit, dirLGeom, dirL);
-    drawStub(s.eye_origin_R_mm, s.gaze_direction_R_unit, dirRGeom, dirR);
   }
 
   // ---------- camera controls ----------

@@ -893,9 +893,11 @@ const KIND_FIXED16X16: u32 = 4;
 ///   0x02/0x08  calibrated eye position (post onboard model, ~1-5mm correction)
 ///   0x22/0x24  calibrated eye position in display_area frame
 ///
-/// Gaze directions:
-///   0x03/0x09  unit vector in tracker-space
-///   0x25/0x27  unit vector in display-space (rotated for tilted planes)
+/// "Gaze directions" — misleading column name: NOT direction vectors.
+///   These encode the eye's normalized position in the track box
+///   (d ≈ linear_transform(eye_origin), reconstruction error ~4mm):
+///   0x03/0x09  normalized track-box eye position (per-eye scaling)
+///   0x25/0x27  same in display-space (observed as zeros on tested firmware)
 ///
 /// 3D intersection:
 ///   0x04/0x0a  ray–plane hit in tracker-space (mm)
@@ -923,8 +925,8 @@ const KIND_FIXED16X16: u32 = 4;
 fn columnKind(col: u32) ?u32 {
     return switch (col) {
         0x01 => KIND_S64, // timestamp_us
-        0x02, 0x03, 0x04, // L: calibrated origin, gaze dir, 3D hit (tracker-space)
-        0x08, 0x09, 0x0a, // R: calibrated origin, gaze dir, 3D hit (tracker-space)
+        0x02, 0x03, 0x04, // L: calibrated origin, gaze dir (eye-model coords), 3D hit
+        0x08, 0x09, 0x0a, // R: calibrated origin, gaze dir (eye-model coords), 3D hit
         0x17, 0x18,       // L/R: raw (pre-calibration) eye origin
         0x22, 0x24,       // L/R: calibrated eye origin (display-space)
         0x25, 0x27,       // L/R: gaze direction (display-space)
@@ -1114,8 +1116,8 @@ pub const GazeSample = extern struct {
     gaze_point_2d_R_norm: [2]f64,  // right per-eye 2D projection [0,1]²
     eye_origin_L_mm: [3]f64,       // calibrated left eye position (tracker-space)
     eye_origin_R_mm: [3]f64,       // calibrated right eye position (tracker-space)
-    gaze_direction_L_unit: [3]f64, // left gaze direction unit vector (tracker-space)
-    gaze_direction_R_unit: [3]f64, // right gaze direction unit vector (tracker-space)
+    gaze_direction_L_emc: [3]f64, // left "gaze direction" — actually normalized track-box position
+    gaze_direction_R_emc: [3]f64, // right "gaze direction" — same (per-eye scaling)
     gaze_point_3d_L_mm: [3]f64,    // left ray–plane intersection (tracker-space)
     gaze_point_3d_R_mm: [3]f64,    // right ray–plane intersection (tracker-space)
 };
@@ -1169,9 +1171,9 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
                 gaze_sample.eye_origin_L_mm = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_L;
             },
-            0x03 => { // gaze_direction_L — left gaze direction unit vector (tracker-space)
+            0x03 => { // gaze_direction_L — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.gaze_direction_L_unit = .{ v[0], v[1], v[2] };
+                gaze_sample.gaze_direction_L_emc = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_L;
             },
             0x04 => { // gaze_point_3d_L — left ray–plane intersection (mm, tracker-space)
@@ -1197,9 +1199,9 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
                 gaze_sample.eye_origin_R_mm = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_R;
             },
-            0x09 => { // gaze_direction_R — right gaze direction unit vector (tracker-space)
+            0x09 => { // gaze_direction_R — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.gaze_direction_R_unit = .{ v[0], v[1], v[2] };
+                gaze_sample.gaze_direction_R_emc = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_R;
             },
             0x0a => { // gaze_point_3d_R — right ray–plane intersection (mm, tracker-space)

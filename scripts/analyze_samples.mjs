@@ -30,13 +30,13 @@ console.log(`valid samples: ${S.length}`);
   let rssL = 0, rssR = 0, n = 0;
   let kL_min=Infinity, kL_max=-Infinity;
   for (const r of S) {
-    const O = r.sample.eye_origin_L_mm, d = r.sample.gaze_direction_L_unit, W = r.sample.gaze_point_3d_L_mm;
+    const O = r.sample.eye_origin_L_mm, d = r.sample.gaze_direction_L_emc, W = r.sample.gaze_point_3d_L_mm;
     if (Math.abs(d.z) < 1e-6) continue;
     const k = (W.z - O.z) / d.z;
     kL_min=Math.min(kL_min,k); kL_max=Math.max(kL_max,k);
     const px = O.x + k*d.x - W.x, py = O.y + k*d.y - W.y;
     rssL += px*px + py*py;
-    const O2 = r.sample.eye_origin_R_mm, d2 = r.sample.gaze_direction_R_unit, W2 = r.sample.gaze_point_3d_R_mm;
+    const O2 = r.sample.eye_origin_R_mm, d2 = r.sample.gaze_direction_R_emc, W2 = r.sample.gaze_point_3d_R_mm;
     const k2 = (W2.z - O2.z) / d2.z;
     const p2x = O2.x + k2*d2.x - W2.x, p2y = O2.y + k2*d2.y - W2.y;
     rssR += p2x*p2x + p2y*p2y;
@@ -49,7 +49,7 @@ console.log(`valid samples: ${S.length}`);
 
 // --- Q3: gaze_direction z-sign — is it pointing toward screen (−z convention) or away? ---
 {
-  const zs = S.map(r => r.sample.gaze_direction_L_unit.z);
+  const zs = S.map(r => r.sample.gaze_direction_L_emc.z);
   const mean = zs.reduce((a,b)=>a+b,0)/zs.length;
   console.log(`\nQ3: mean gaze_direction_L.z = ${mean.toFixed(3)} (eye.z≈${S[0].sample.eye_origin_L_mm.z.toFixed(0)}, plane.z=${data.display_area_used.tl.z})`);
   console.log(`    positive means ray goes TOWARD larger z (away from plane if plane is at z<eye.z).`);
