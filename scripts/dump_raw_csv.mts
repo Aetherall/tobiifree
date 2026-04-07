@@ -12,15 +12,10 @@ import { Tobii } from '../sdk/src/index.ts';
 import type { UsbSource } from '../sdk/src/usb_source.ts';
 import { GAZE_COLUMN_LABELS } from '../sdk/src/protocol.ts';
 import type { RawGazeColumn } from '../sdk/src/protocol.ts';
-import { createWriteStream, readFileSync, type WriteStream } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createWriteStream, type WriteStream } from 'node:fs';
 
 const seconds = Number(process.argv[2]) || 10;
 const outPath = process.argv[3]; // undefined → stdout
-
-const here = dirname(fileURLToPath(import.meta.url));
-const calibPath = resolve(here, '..', 'calibrations', 'manual-2026-04-06.json');
 
 // ─── Column layout ───────────────────────────────────────────────────
 // Each raw column has a colId and up to 3 values (v0, v1, v2).
@@ -42,20 +37,7 @@ console.error('Connecting to ET5...');
 const src = await Tobii.fromUsb({ requestTimeoutMs: 5000 }) as UsbSource;
 console.error('Connected. Display area:', JSON.stringify(src.displayArea));
 
-// Ensure a sensible display area is configured — the tracker won't produce
-// valid gaze data with a degenerate plane. Use a typical 600×340mm monitor
-// centered above the tracker, 50mm in front.
-const da = src.displayArea;
-const degenerate = da && Math.hypot(da.tr.x - da.tl.x, da.tr.y - da.tl.y, da.tr.z - da.tl.z) < 10;
-// Load calibration and apply display area.
-const calib = JSON.parse(readFileSync(calibPath, 'utf8'));
-const area = calib.display_area as { tl: {x:number,y:number,z:number}, tr: {x:number,y:number,z:number}, bl: {x:number,y:number,z:number} };
-console.error('Applying display area from', calibPath);
-await src.setDisplayAreaCorners(area);
-// Small delay for the device to process, then verify.
-await new Promise(r => setTimeout(r, 200));
-const readBack = await src.getDisplayArea();
-console.error('Display area readback:', JSON.stringify(readBack));
+console.error('Display area:', JSON.stringify(src.displayArea));
 
 // ─── Collect ─────────────────────────────────────────────────────────
 // First pass: collect a few frames to discover which columns are present

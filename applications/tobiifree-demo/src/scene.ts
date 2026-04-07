@@ -177,7 +177,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   // sample tells us otherwise.
   const eyesGroup = new THREE.Group();
   const eyeMat = new THREE.MeshStandardMaterial({
-    color: 0xf4f0e0, roughness: 0.3, metalness: 0.0,
+    color: 0xf4f0e0, roughness: 0.3, metalness: 0.0, transparent: true, opacity: 0.4,
   });
   const irisMat = new THREE.MeshBasicMaterial({ color: 0x2a5a8a });
   const pupilMat = new THREE.MeshBasicMaterial({ color: 0x050508 });
@@ -253,8 +253,11 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   // The z centre is at ~0.78×503 ≈ 393mm offset from the tracker origin,
   // so the box spans roughly z = 393 − 251 .. 393 + 251 = 142..644 mm.
   // x is centred at 0 (symmetric), y centred at ~0.5×463 ≈ 231mm.
-  const RTB_W = 457, RTB_H = 463, RTB_D = 503;
-  const RTB_CX = 0, RTB_CY = 0.5 * RTB_H, RTB_CZ = 0.78 * RTB_D;
+  // Fitted from live data: d = slope * eye_mm + intercept.
+  // Track box spans ~436mm wide, ~456mm tall, ~507mm deep.
+  // Centre (d=0.5) is at (0, -3, 644) in tracker-space mm.
+  const RTB_W = 436, RTB_H = 456, RTB_D = 507;
+  const RTB_CX = 0, RTB_CY = -3, RTB_CZ = 644;
 
   const realTrackBox = new THREE.Group();
   realTrackBox.position.set(RTB_CX, RTB_CY, RTB_CZ);
@@ -425,7 +428,14 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     if (dL && s.validity_L === 0) {
       tbDotL.position.set(-(dL.x - 0.5) * TB_W, -(dL.y - 0.5) * TB_H, dL.z * TB_D);
       tbDotL.visible = true;
-      rtbDotL.position.set((0.5 - dL.x) * RTB_W, (0.5 - dL.y) * RTB_H, (dL.z - 0.5) * RTB_D);
+      // Recover tracker-space mm from emc using fitted per-eye coefficients:
+      //   eye = (d - intercept) / slope
+      // Then subtract box center for box-local coords.
+      rtbDotL.position.set(
+        (dL.x - 0.4989) / -0.002291 - RTB_CX,
+        (dL.y - 0.4936) / -0.002201 - RTB_CY,
+        (dL.z - (-0.7681)) / 0.001970 - RTB_CZ,
+      );
       rtbDotL.visible = true;
     } else {
       tbDotL.visible = false;
@@ -434,7 +444,11 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     if (dR && s.validity_R === 0) {
       tbDotR.position.set(-(dR.x - 0.5) * TB_W, -(dR.y - 0.5) * TB_H, dR.z * TB_D);
       tbDotR.visible = true;
-      rtbDotR.position.set((0.5 - dR.x) * RTB_W, (0.5 - dR.y) * RTB_H, (dR.z - 0.5) * RTB_D);
+      rtbDotR.position.set(
+        (dR.x - 0.5002) / -0.002297 - RTB_CX,
+        (dR.y - 0.4934) / -0.002187 - RTB_CY,
+        (dR.z - (-0.7759)) / 0.001976 - RTB_CZ,
+      );
       rtbDotR.visible = true;
     } else {
       tbDotR.visible = false;
