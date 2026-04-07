@@ -14,3 +14,5 @@ build/
 # Native helpers built from assets/
 /flash_firmware
 /extract_firmware
+
+/result

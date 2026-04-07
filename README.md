@@ -1,4 +1,4 @@
-# tobii
+# tobiifree - ET5 on Linux & Web
 
 An ongoing experiment to make Tobii eye trackers work on Linux.
 
