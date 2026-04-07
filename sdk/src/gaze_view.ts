@@ -70,8 +70,8 @@ export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   }
   if (mask & BIT_EYE_ORIGIN_L) s.eye_origin_L_mm = readV3(dv, OFF_EYE_ORIGIN_L);
   if (mask & BIT_EYE_ORIGIN_R) s.eye_origin_R_mm = readV3(dv, OFF_EYE_ORIGIN_R);
-  if (mask & BIT_GAZE_DIR_L)   s.gaze_direction_L_emc = readV3(dv, OFF_GAZE_DIR_L);
-  if (mask & BIT_GAZE_DIR_R)   s.gaze_direction_R_emc = readV3(dv, OFF_GAZE_DIR_R);
+  if (mask & BIT_GAZE_DIR_L)   s.trackbox_eye_pos_L = readV3(dv, OFF_GAZE_DIR_L);
+  if (mask & BIT_GAZE_DIR_R)   s.trackbox_eye_pos_R = readV3(dv, OFF_GAZE_DIR_R);
   if (mask & BIT_GAZE_3D_L)    s.gaze_point_3d_L_mm = readV3(dv, OFF_GAZE_3D_L);
   if (mask & BIT_GAZE_3D_R)    s.gaze_point_3d_R_mm = readV3(dv, OFF_GAZE_3D_R);
   return s;

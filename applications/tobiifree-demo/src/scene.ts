@@ -438,8 +438,8 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     // emc encodes: x ≈ 0.5 when centered horizontally, y ≈ 0.5 centered
     // vertically, z ≈ depth. We map (0,0,0)→(-W/2,-H/2,-D/2) and
     // (1,1,1)→(+W/2,+H/2,+D/2). Note x is inverted (0.5−eye/scale).
-    const dL = s.gaze_direction_L_emc;
-    const dR = s.gaze_direction_R_emc;
+    const dL = s.trackbox_eye_pos_L;
+    const dR = s.trackbox_eye_pos_R;
     if (dL && s.validity_L === 0) {
       // Small widget: d in [0,1], 0.5 = center (x,y inverted)
       tbDotL.position.set(-(dL.x - 0.5) * TB_W, -(dL.y - 0.5) * TB_H, (dL.z - 0.5) * TB_D);

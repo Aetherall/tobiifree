@@ -1116,8 +1116,8 @@ pub const GazeSample = extern struct {
     gaze_point_2d_R_norm: [2]f64,  // right per-eye 2D projection [0,1]²
     eye_origin_L_mm: [3]f64,       // calibrated left eye position (tracker-space)
     eye_origin_R_mm: [3]f64,       // calibrated right eye position (tracker-space)
-    gaze_direction_L_emc: [3]f64, // left "gaze direction" — actually normalized track-box position
-    gaze_direction_R_emc: [3]f64, // right "gaze direction" — same (per-eye scaling)
+    trackbox_eye_pos_L: [3]f64, // left "gaze direction" — actually normalized track-box position
+    trackbox_eye_pos_R: [3]f64, // right "gaze direction" — same (per-eye scaling)
     gaze_point_3d_L_mm: [3]f64,    // left ray–plane intersection (tracker-space)
     gaze_point_3d_R_mm: [3]f64,    // right ray–plane intersection (tracker-space)
 };
@@ -1173,7 +1173,7 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
             },
             0x03 => { // gaze_direction_L — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.gaze_direction_L_emc = .{ v[0], v[1], v[2] };
+                gaze_sample.trackbox_eye_pos_L = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_L;
             },
             0x04 => { // gaze_point_3d_L — left ray–plane intersection (mm, tracker-space)
@@ -1201,7 +1201,7 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
             },
             0x09 => { // gaze_direction_R — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.gaze_direction_R_emc = .{ v[0], v[1], v[2] };
+                gaze_sample.trackbox_eye_pos_R = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_R;
             },
             0x0a => { // gaze_point_3d_R — right ray–plane intersection (mm, tracker-space)

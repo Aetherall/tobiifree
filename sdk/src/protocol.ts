@@ -60,12 +60,12 @@ export type GazeSample = {
    * of eye position in a per-eye-model scale. Not useful for gaze —
    * use gaze_point_3d_L_mm or gaze_point_2d_L_norm instead.
    */
-  gaze_direction_L_emc?: Vec3;
+  trackbox_eye_pos_L?: Vec3;
   /**
    * Right "gaze direction" — same as left: normalized track-box position,
    * not a direction. Coefficients differ per eye.
    */
-  gaze_direction_R_emc?: Vec3;
+  trackbox_eye_pos_R?: Vec3;
   /** Left ray–plane intersection in tracker-space (mm). */
   gaze_point_3d_L_mm?: Vec3;
   /** Right ray–plane intersection in tracker-space (mm). */
@@ -138,7 +138,7 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
 
   // ── Left eye (calibrated, tracker-space) ───────────────────────────
   0x02: 'eye_origin_L_mm',            // [point3d] calibrated eye position (mm, tracker-space)
-  0x03: 'gaze_direction_L_emc',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
+  0x03: 'trackbox_eye_pos_L',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
   0x04: 'gaze_point_3d_L_mm',         // [point3d] ray–plane intersection (mm, tracker-space)
   0x05: 'gaze_point_2d_L_norm',       // [point2d] per-eye 2D projection on display_area [0,1]²
   0x06: 'pupil_diameter_L_mm',        // [fix16]   pupil diameter; -1 when invalid
@@ -146,7 +146,7 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
 
   // ── Right eye (calibrated, tracker-space) ──────────────────────────
   0x08: 'eye_origin_R_mm',            // [point3d] calibrated eye position (mm, tracker-space)
-  0x09: 'gaze_direction_R_emc',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
+  0x09: 'trackbox_eye_pos_R',       // [point3d] gaze direction in eye-model coords (NOT tracker-space)
   0x0a: 'gaze_point_3d_R_mm',        // [point3d] ray–plane intersection (mm, tracker-space)
   0x0b: 'gaze_point_2d_R_norm',      // [point2d] per-eye 2D projection on display_area [0,1]²
   0x0c: 'pupil_diameter_R_mm',       // [fix16]   pupil diameter; -1 when invalid
