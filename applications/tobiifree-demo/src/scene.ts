@@ -254,9 +254,10 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   // so the box spans roughly z = 393 − 251 .. 393 + 251 = 142..644 mm.
   // x is centred at 0 (symmetric), y centred at ~0.5×463 ≈ 231mm.
   // Fitted from live data: d = slope * eye_mm + intercept.
-  // Track box spans ~436mm wide, ~456mm tall, ~507mm deep.
-  // Centre (d=0.5) is at (0, -3, 644) in tracker-space mm.
-  const RTB_W = 436, RTB_H = 456, RTB_D = 507;
+  // x,y span [0,1] with 0.5 = centred on tracker. z has offset ~-0.77.
+  // Centre (d=0.5) at (0, -3, 644) in tracker-space mm.
+  // Full extent d=[0,1]: ~436×454×507 mm.
+  const RTB_W = 436, RTB_H = 454, RTB_D = 507;
   const RTB_CX = 0, RTB_CY = -3, RTB_CZ = 644;
 
   const realTrackBox = new THREE.Group();
@@ -285,12 +286,26 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
 
   trackerOffset.add(realTrackBox);
 
+  // Magenta rays: same gaze endpoint but originating from the emc-recovered
+  // eye positions (the red/blue dots in the real track box).
+  const emcRayMat = new THREE.LineBasicMaterial({ color: 0xff44ff, transparent: true, opacity: 0.5 });
+  const emcRayLGeom = new THREE.BufferGeometry();
+  emcRayLGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const emcRayRGeom = new THREE.BufferGeometry();
+  emcRayRGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+  const emcRayL = new THREE.Line(emcRayLGeom, emcRayMat);
+  const emcRayR = new THREE.Line(emcRayRGeom, emcRayMat);
+  emcRayL.visible = false;
+  emcRayR.visible = false;
+
   // Gaze rays live at scene root so their endpoints are written in world
   // (screen-frame) coords directly — eye endpoints come from
   // getWorldPosition of the framed eye groups; gaze endpoints are the
   // already-screen-frame projection.
   scene.add(rayL);
   scene.add(rayR);
+  scene.add(emcRayL);
+  scene.add(emcRayR);
 
 
   // ---------- update helpers ----------
@@ -426,11 +441,10 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     const dL = s.gaze_direction_L_emc;
     const dR = s.gaze_direction_R_emc;
     if (dL && s.validity_L === 0) {
-      tbDotL.position.set(-(dL.x - 0.5) * TB_W, -(dL.y - 0.5) * TB_H, dL.z * TB_D);
+      // Small widget: d in [0,1], 0.5 = center (x,y inverted)
+      tbDotL.position.set(-(dL.x - 0.5) * TB_W, -(dL.y - 0.5) * TB_H, (dL.z - 0.5) * TB_D);
       tbDotL.visible = true;
-      // Recover tracker-space mm from emc using fitted per-eye coefficients:
-      //   eye = (d - intercept) / slope
-      // Then subtract box center for box-local coords.
+      // Real track box: recover tracker-space mm from emc, then box-local.
       rtbDotL.position.set(
         (dL.x - 0.4989) / -0.002291 - RTB_CX,
         (dL.y - 0.4936) / -0.002201 - RTB_CY,
@@ -442,7 +456,7 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
       rtbDotL.visible = false;
     }
     if (dR && s.validity_R === 0) {
-      tbDotR.position.set(-(dR.x - 0.5) * TB_W, -(dR.y - 0.5) * TB_H, dR.z * TB_D);
+      tbDotR.position.set(-(dR.x - 0.5) * TB_W, -(dR.y - 0.5) * TB_H, (dR.z - 0.5) * TB_D);
       tbDotR.visible = true;
       rtbDotR.position.set(
         (dR.x - 0.5002) / -0.002297 - RTB_CX,
@@ -484,11 +498,41 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
         rArr.needsUpdate = true;
         rayL.visible = true;
         rayR.visible = true;
+
+        // Magenta rays: from emc-recovered eye positions to per-eye gaze points.
+        const elp = new THREE.Vector3();
+        const erp = new THREE.Vector3();
+        rtbDotL.getWorldPosition(elp);
+        rtbDotR.getWorldPosition(erp);
+        const gazeL2d = s.gaze_point_2d_L_norm;
+        const gazeR2d = s.gaze_point_2d_R_norm;
+        const worldL = gazeL2d ? projectNorm(gazeL2d.x, gazeL2d.y) : null;
+        const worldR = gazeR2d ? projectNorm(gazeR2d.x, gazeR2d.y) : null;
+        if (worldL && rtbDotL.visible) {
+          const elArr = emcRayLGeom.getAttribute('position') as THREE.BufferAttribute;
+          elArr.setXYZ(0, elp.x, elp.y, elp.z);
+          elArr.setXYZ(1, worldL.x, worldL.y, worldL.z);
+          elArr.needsUpdate = true;
+          emcRayL.visible = true;
+        } else {
+          emcRayL.visible = false;
+        }
+        if (worldR && rtbDotR.visible) {
+          const erArr = emcRayRGeom.getAttribute('position') as THREE.BufferAttribute;
+          erArr.setXYZ(0, erp.x, erp.y, erp.z);
+          erArr.setXYZ(1, worldR.x, worldR.y, worldR.z);
+          erArr.needsUpdate = true;
+          emcRayR.visible = true;
+        } else {
+          emcRayR.visible = false;
+        }
       }
     } else {
       gazeDot.visible = false;
       rayL.visible = false;
       rayR.visible = false;
+      emcRayL.visible = false;
+      emcRayR.visible = false;
     }
 
   }
