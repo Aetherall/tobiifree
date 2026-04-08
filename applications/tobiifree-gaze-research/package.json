@@ -1,0 +1,13 @@
+{
+  "name": "tobiifree-gaze-research",
+  "version": "0.0.0",
+  "description": "CLI tool for training gaze prediction models from collected datasets",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "train": "node --experimental-strip-types src/cli.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

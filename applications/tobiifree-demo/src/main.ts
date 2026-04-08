@@ -38,6 +38,9 @@ const daCal = $<HTMLButtonElement>('da-cal');
 const daCollect = $<HTMLButtonElement>('da-collect');
 const daCollect2 = $<HTMLButtonElement>('da-collect2');
 const daLoad = $<HTMLButtonElement>('da-load');
+const daLoadModel = $<HTMLButtonElement>('da-load-model');
+const daBigPlane = $<HTMLButtonElement>('da-big-plane');
+const gazeCorrectedEl = $<HTMLDivElement>('gaze-corrected');
 const daWinPerm = $<HTMLButtonElement>('da-winperm');
 const daFs = $<HTMLButtonElement>('da-fs');
 const daOnboardCal = $<HTMLButtonElement>('da-onboard-cal');
@@ -105,6 +108,124 @@ void (async () => {
   } catch { /* ignore */ }
 })();
 
+// ── Gaze correction model ───────────────────────────────────────────
+
+type GazeModel = {
+  featureNames: string[];
+  polyDegree: number;
+  weights: number[][];
+  inputMean: number[];
+  inputStd: number[];
+  // The display area active during training. If present, predictions are
+  // reprojected from training-plane coords onto the current live plane.
+  trainingDisplayArea?: DisplayArea;
+};
+
+let gazeModel: GazeModel | null = null;
+
+function modelExtractFeatures(s: GazeSample, names: string[]): number[] {
+  const v = (o: { x: number; y: number; z: number } | undefined, c: 'x' | 'y' | 'z') => o ? o[c] : 0;
+  const lookup: Record<string, () => number> = {
+    'gaze_2d.x': () => s.gaze_point_2d_norm?.x ?? 0,
+    'gaze_2d.y': () => s.gaze_point_2d_norm?.y ?? 0,
+    'gaze_2d_L.x': () => s.gaze_point_2d_L_norm?.x ?? 0,
+    'gaze_2d_L.y': () => s.gaze_point_2d_L_norm?.y ?? 0,
+    'gaze_2d_R.x': () => s.gaze_point_2d_R_norm?.x ?? 0,
+    'gaze_2d_R.y': () => s.gaze_point_2d_R_norm?.y ?? 0,
+    'gaze_2d_unfilt.x': () => s.gaze_point_2d_unfiltered?.x ?? 0,
+    'gaze_2d_unfilt.y': () => s.gaze_point_2d_unfiltered?.y ?? 0,
+    'eo_L.x': () => v(s.eye_origin_L_mm, 'x'),
+    'eo_L.y': () => v(s.eye_origin_L_mm, 'y'),
+    'eo_L.z': () => v(s.eye_origin_L_mm, 'z'),
+    'eo_R.x': () => v(s.eye_origin_R_mm, 'x'),
+    'eo_R.y': () => v(s.eye_origin_R_mm, 'y'),
+    'eo_R.z': () => v(s.eye_origin_R_mm, 'z'),
+    'er_L.x': () => v(s.eye_origin_raw_L_mm, 'x'),
+    'er_L.y': () => v(s.eye_origin_raw_L_mm, 'y'),
+    'er_L.z': () => v(s.eye_origin_raw_L_mm, 'z'),
+    'er_R.x': () => v(s.eye_origin_raw_R_mm, 'x'),
+    'er_R.y': () => v(s.eye_origin_raw_R_mm, 'y'),
+    'er_R.z': () => v(s.eye_origin_raw_R_mm, 'z'),
+    'tb_L.x': () => v(s.trackbox_eye_pos_L, 'x'),
+    'tb_L.y': () => v(s.trackbox_eye_pos_L, 'y'),
+    'tb_L.z': () => v(s.trackbox_eye_pos_L, 'z'),
+    'tb_R.x': () => v(s.trackbox_eye_pos_R, 'x'),
+    'tb_R.y': () => v(s.trackbox_eye_pos_R, 'y'),
+    'tb_R.z': () => v(s.trackbox_eye_pos_R, 'z'),
+    'pupil_L': () => s.pupil_diameter_L_mm ?? -1,
+    'pupil_R': () => s.pupil_diameter_R_mm ?? -1,
+  };
+  return names.map(n => (lookup[n] ?? (() => 0))());
+}
+
+function modelPolyExpand(x: number[], degree: number): number[] {
+  if (degree === 1) return [...x, 1];
+  const out = [...x];
+  if (degree >= 2) {
+    for (let i = 0; i < x.length; i++)
+      for (let j = i; j < x.length; j++)
+        out.push(x[i]! * x[j]!);
+  }
+  if (degree >= 3) {
+    for (let i = 0; i < x.length; i++)
+      for (let j = i; j < x.length; j++)
+        for (let k = j; k < x.length; k++)
+          out.push(x[i]! * x[j]! * x[k]!);
+  }
+  out.push(1);
+  return out;
+}
+
+// Convert normalized [0,1]² on a DisplayArea to a 3D point.
+// norm (0,0)=TL, (1,0)=TR, (0,1)=BL.
+function normToWorld(da: DisplayArea, nx: number, ny: number): V3 {
+  // u = TR - TL, v = BL - TL
+  return {
+    x: da.tl.x + (da.tr.x - da.tl.x) * nx + (da.bl.x - da.tl.x) * ny,
+    y: da.tl.y + (da.tr.y - da.tl.y) * nx + (da.bl.y - da.tl.y) * ny,
+    z: da.tl.z + (da.tr.z - da.tl.z) * nx + (da.bl.z - da.tl.z) * ny,
+  };
+}
+
+// Project a 3D point onto a DisplayArea, returning [0,1]² coords.
+// Uses least-squares projection: solve p = tl + u*s + v*t for (s,t).
+function worldToNorm(da: DisplayArea, p: V3): { x: number; y: number } {
+  const ux = da.tr.x - da.tl.x, uy = da.tr.y - da.tl.y, uz = da.tr.z - da.tl.z;
+  const vx = da.bl.x - da.tl.x, vy = da.bl.y - da.tl.y, vz = da.bl.z - da.tl.z;
+  const dx = p.x - da.tl.x, dy = p.y - da.tl.y, dz = p.z - da.tl.z;
+  // [u·u  u·v] [s]   [u·d]
+  // [u·v  v·v] [t] = [v·d]
+  const uu = ux * ux + uy * uy + uz * uz;
+  const uv = ux * vx + uy * vy + uz * vz;
+  const vv = vx * vx + vy * vy + vz * vz;
+  const ud = ux * dx + uy * dy + uz * dz;
+  const vd = vx * dx + vy * dy + vz * dz;
+  const det = uu * vv - uv * uv;
+  if (Math.abs(det) < 1e-12) return { x: 0.5, y: 0.5 };
+  return { x: (vv * ud - uv * vd) / det, y: (uu * vd - uv * ud) / det };
+}
+
+function modelPredict(m: GazeModel, s: GazeSample, liveArea: DisplayArea): { x: number; y: number } | null {
+  if ((s.validity_L !== 0) && (s.validity_R !== 0)) return null;
+  const raw = modelExtractFeatures(s, m.featureNames);
+  const norm = raw.map((v, i) => (v - m.inputMean[i]!) / m.inputStd[i]!);
+  const expanded = modelPolyExpand(norm, m.polyDegree);
+  let px = 0, py = 0;
+  for (let j = 0; j < m.weights.length; j++) {
+    px += expanded[j]! * m.weights[j]![0]!;
+    py += expanded[j]! * m.weights[j]![1]!;
+  }
+
+  // If model was trained on a different plane, reproject onto live plane.
+  if (m.trainingDisplayArea) {
+    const world = normToWorld(m.trainingDisplayArea, px, py);
+    return worldToNorm(liveArea, world);
+  }
+  return { x: px, y: py };
+}
+
+// ── Main state ──────────────────────────────────────────────────────
+
 let tracker: Source | null = null;
 let sampleCount = 0;
 let lastStatsT = performance.now();
@@ -129,13 +250,40 @@ function render(sample: GazeSample) {
 
   if (collectRunning || calRunning) {
     gazeEl.style.opacity = '0';
+    gazeCorrectedEl.style.opacity = '0';
   } else if (p && valid) {
     const x = Math.max(0, Math.min(1, p.x)) * window.innerWidth;
     const y = Math.max(0, Math.min(1, p.y)) * window.innerHeight;
     gazeEl.style.transform = `translate(${x}px, ${y}px)`;
     gazeEl.style.opacity = '1';
+
+    if (gazeModel) {
+      const c = modelPredict(gazeModel, sample, readForm());
+      if (c) {
+        if (sampleCount % 100 === 0) {
+          console.log('[model-debug]', {
+            prediction: c,
+            hasTrainingDA: !!gazeModel.trainingDisplayArea,
+            eo_L: sample.eye_origin_L_mm,
+            tb_L: sample.trackbox_eye_pos_L,
+            gaze_2d: sample.gaze_point_2d_norm,
+          });
+        }
+        const cx = Math.max(0, Math.min(1, c.x)) * window.innerWidth;
+        const cy = Math.max(0, Math.min(1, c.y)) * window.innerHeight;
+        gazeCorrectedEl.style.transform = `translate(${cx}px, ${cy}px)`;
+        gazeCorrectedEl.style.opacity = '1';
+        scene3d.setCorrectedGaze(c);
+      } else {
+        gazeCorrectedEl.style.opacity = '0.25';
+        scene3d.setCorrectedGaze(null);
+      }
+    } else {
+      scene3d.setCorrectedGaze(null);
+    }
   } else {
     gazeEl.style.opacity = '0.25';
+    gazeCorrectedEl.style.opacity = '0';
   }
 }
 
@@ -985,22 +1133,45 @@ function fitDisplayAreaRays(pts: CalPoint[], rays: Ray[]): DisplayArea | null {
 //     ]
 //   }
 
+type V2 = { x: number; y: number };
+
+type CollectedSample = {
+  validity_L?: number; validity_R?: number;
+  pupil_diameter_L_mm?: number; pupil_diameter_R_mm?: number;
+  eye_origin_L_mm?: V3; eye_origin_R_mm?: V3;
+  eye_origin_raw_L_mm?: V3; eye_origin_raw_R_mm?: V3;
+  eye_origin_L_display_mm?: V3; eye_origin_R_display_mm?: V3;
+  trackbox_eye_pos_L?: V3; trackbox_eye_pos_R?: V3;
+  trackbox_eye_pos_L_display?: V3; trackbox_eye_pos_R_display?: V3;
+  gaze_point_3d_L_mm?: V3; gaze_point_3d_R_mm?: V3;
+  gaze_point_2d_norm?: V2;
+  gaze_point_2d_L_norm?: V2; gaze_point_2d_R_norm?: V2;
+  gaze_point_2d_unfiltered?: V2;
+};
+
+function snapshotSample(s: GazeSample): CollectedSample {
+  const cp2 = (v?: V2) => v && { x: v.x, y: v.y };
+  const cp3 = (v?: V3) => v && { x: v.x, y: v.y, z: v.z };
+  return {
+    validity_L: s.validity_L, validity_R: s.validity_R,
+    pupil_diameter_L_mm: s.pupil_diameter_L_mm, pupil_diameter_R_mm: s.pupil_diameter_R_mm,
+    eye_origin_L_mm: cp3(s.eye_origin_L_mm), eye_origin_R_mm: cp3(s.eye_origin_R_mm),
+    eye_origin_raw_L_mm: cp3(s.eye_origin_raw_L_mm), eye_origin_raw_R_mm: cp3(s.eye_origin_raw_R_mm),
+    eye_origin_L_display_mm: cp3(s.eye_origin_L_display_mm), eye_origin_R_display_mm: cp3(s.eye_origin_R_display_mm),
+    trackbox_eye_pos_L: cp3(s.trackbox_eye_pos_L), trackbox_eye_pos_R: cp3(s.trackbox_eye_pos_R),
+    trackbox_eye_pos_L_display: cp3(s.trackbox_eye_pos_L_display), trackbox_eye_pos_R_display: cp3(s.trackbox_eye_pos_R_display),
+    gaze_point_3d_L_mm: cp3(s.gaze_point_3d_L_mm), gaze_point_3d_R_mm: cp3(s.gaze_point_3d_R_mm),
+    gaze_point_2d_norm: cp2(s.gaze_point_2d_norm),
+    gaze_point_2d_L_norm: cp2(s.gaze_point_2d_L_norm), gaze_point_2d_R_norm: cp2(s.gaze_point_2d_R_norm),
+    gaze_point_2d_unfiltered: cp2(s.gaze_point_2d_unfiltered),
+  };
+}
+
 type CollectedRecord = {
   t_ms: number;
   cursor_norm: [number, number];
   cursor_px: [number, number];
-  sample: {
-    validity_L?: number; validity_R?: number;
-    eye_origin_L_mm?: { x: number; y: number; z: number };
-    eye_origin_R_mm?: { x: number; y: number; z: number };
-    trackbox_eye_pos_L?: { x: number; y: number; z: number };
-    trackbox_eye_pos_R?: { x: number; y: number; z: number };
-    gaze_point_3d_L_mm?: { x: number; y: number; z: number };
-    gaze_point_3d_R_mm?: { x: number; y: number; z: number };
-    gaze_point_2d_norm?: { x: number; y: number };
-    gaze_point_2d_L_norm?: { x: number; y: number };
-    gaze_point_2d_R_norm?: { x: number; y: number };
-  };
+  sample: CollectedSample;
 };
 
 type CollectedDataset = {
@@ -1083,19 +1254,7 @@ async function runSampleCollection() {
       t_ms: performance.now() - startedAt,
       cursor_norm: [cursorX / vw, cursorY / vh],
       cursor_px: [cursorX, cursorY],
-      sample: {
-        validity_L: s.validity_L,
-        validity_R: s.validity_R,
-        eye_origin_L_mm: s.eye_origin_L_mm && { ...s.eye_origin_L_mm },
-        eye_origin_R_mm: s.eye_origin_R_mm && { ...s.eye_origin_R_mm },
-        trackbox_eye_pos_L: s.trackbox_eye_pos_L && { ...s.trackbox_eye_pos_L },
-        trackbox_eye_pos_R: s.trackbox_eye_pos_R && { ...s.trackbox_eye_pos_R },
-        gaze_point_3d_L_mm: s.gaze_point_3d_L_mm && { ...s.gaze_point_3d_L_mm },
-        gaze_point_3d_R_mm: s.gaze_point_3d_R_mm && { ...s.gaze_point_3d_R_mm },
-        gaze_point_2d_norm: s.gaze_point_2d_norm && { ...s.gaze_point_2d_norm },
-        gaze_point_2d_L_norm: s.gaze_point_2d_L_norm && { ...s.gaze_point_2d_L_norm },
-        gaze_point_2d_R_norm: s.gaze_point_2d_R_norm && { ...s.gaze_point_2d_R_norm },
-      },
+      sample: snapshotSample(s),
     });
   });
 
@@ -1385,19 +1544,7 @@ async function runSampleCollection2Plane() {
       cursor_norm: [cursorX / vw, cursorY / vh],
       cursor_px: [cursorX, cursorY],
       plane: currentPlane,
-      sample: {
-        validity_L: s.validity_L,
-        validity_R: s.validity_R,
-        eye_origin_L_mm: s.eye_origin_L_mm && { ...s.eye_origin_L_mm },
-        eye_origin_R_mm: s.eye_origin_R_mm && { ...s.eye_origin_R_mm },
-        trackbox_eye_pos_L: s.trackbox_eye_pos_L && { ...s.trackbox_eye_pos_L },
-        trackbox_eye_pos_R: s.trackbox_eye_pos_R && { ...s.trackbox_eye_pos_R },
-        gaze_point_3d_L_mm: s.gaze_point_3d_L_mm && { ...s.gaze_point_3d_L_mm },
-        gaze_point_3d_R_mm: s.gaze_point_3d_R_mm && { ...s.gaze_point_3d_R_mm },
-        gaze_point_2d_norm: s.gaze_point_2d_norm && { ...s.gaze_point_2d_norm },
-        gaze_point_2d_L_norm: s.gaze_point_2d_L_norm && { ...s.gaze_point_2d_L_norm },
-        gaze_point_2d_R_norm: s.gaze_point_2d_R_norm && { ...s.gaze_point_2d_R_norm },
-      },
+      sample: snapshotSample(s),
     });
   });
 
@@ -1932,6 +2079,26 @@ daOnboardCal.addEventListener('click', () => { void runOnboardCalibration(); });
 daCal.addEventListener('click', () => { void runCalibration(); });
 daCollect.addEventListener('click', () => { void runSampleCollection(); });
 daCollect2.addEventListener('click', () => { void runSampleCollection2Plane(); });
+function isDisplayArea(o: unknown): o is DisplayArea {
+  if (!o || typeof o !== 'object') return false;
+  const a = o as Record<string, unknown>;
+  const isV3 = (v: unknown): v is { x: number; y: number; z: number } =>
+    !!v && typeof v === 'object' && 'x' in v && 'y' in v && 'z' in v;
+  return isV3(a.tl) && isV3(a.tr) && isV3(a.bl);
+}
+
+async function applyDisplayArea(area: DisplayArea, label: string) {
+  if (!tracker) return;
+  const fmt = (v: { x: number; y: number; z: number }) => `(${v.x.toFixed(0)}, ${v.y.toFixed(0)}, ${v.z.toFixed(0)})`;
+  try {
+    await tracker.setDisplayAreaCorners(area);
+    setFormValues(area);
+    diagOut.textContent = `${label}: tl=${fmt(area.tl)} tr=${fmt(area.tr)} bl=${fmt(area.bl)}`;
+  } catch (e) {
+    diagOut.textContent = `Apply failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 daLoad.addEventListener('click', () => {
   const input = document.createElement('input');
   input.type = 'file';
@@ -1941,38 +2108,83 @@ daLoad.addEventListener('click', () => {
     if (!file) return;
     try {
       const text = await file.text();
-      const data = JSON.parse(text) as CollectedDataset2;
-      if (data.version !== 2 || !Array.isArray(data.samples)) {
-        diagOut.textContent = 'Not a v2 two-plane sample file.';
+      const data = JSON.parse(text) as Record<string, unknown>;
+
+      // 1) Bare display area: { tl, tr, bl }
+      if (isDisplayArea(data)) {
+        await applyDisplayArea(data, 'Applied display area');
         return;
       }
-      const fit = fitFromTwoPlaneSamples(data.samples, data.plane_A, data.plane_B);
-      if (!fit) {
-        diagOut.textContent = `Fit failed from ${file.name} (not enough valid samples).`;
+
+      // 2) Any dataset with prior_display_area or display_area_used
+      const da = (data.prior_display_area ?? data.display_area_used) as unknown;
+      if (isDisplayArea(da)) {
+        await applyDisplayArea(da, `Applied from ${file.name}`);
         return;
       }
-      const summary =
-        `${file.name}: ${fit.width_mm.toFixed(0)}×${fit.height_mm.toFixed(0)}mm · ` +
-        `angle=${fit.uv_angle_deg.toFixed(1)}° · affine RMSE A=${(fit.rmseA * 1000).toFixed(0)} B=${(fit.rmseB * 1000).toFixed(0)} · ` +
-        `n=${fit.nA}/${fit.nB}`;
-      console.log('[load fit]', fit);
-      diagOut.textContent = summary;
-      const apply = window.confirm(
-        `${summary}\n\nApply this display_area?\n\n` +
-        `tl=(${fit.area.tl.x.toFixed(0)}, ${fit.area.tl.y.toFixed(0)}, ${fit.area.tl.z.toFixed(0)})\n` +
-        `tr=(${fit.area.tr.x.toFixed(0)}, ${fit.area.tr.y.toFixed(0)}, ${fit.area.tr.z.toFixed(0)})\n` +
-        `bl=(${fit.area.bl.x.toFixed(0)}, ${fit.area.bl.y.toFixed(0)}, ${fit.area.bl.z.toFixed(0)})`,
-      );
-      if (apply && tracker) {
-        await tracker.setDisplayAreaCorners(fit.area);
-        setFormValues(fit.area);
-        diagOut.textContent = `Applied. ${summary}`;
+
+      // 3) V2 two-plane dataset → fit
+      const data2 = data as unknown as CollectedDataset2;
+      if (data2.version === 2 && Array.isArray(data2.samples)) {
+        const fit = fitFromTwoPlaneSamples(data2.samples, data2.plane_A, data2.plane_B);
+        if (!fit) {
+          diagOut.textContent = `Fit failed from ${file.name} (not enough valid samples).`;
+          return;
+        }
+        const summary =
+          `${file.name}: ${fit.width_mm.toFixed(0)}×${fit.height_mm.toFixed(0)}mm · ` +
+          `angle=${fit.uv_angle_deg.toFixed(1)}° · affine RMSE A=${(fit.rmseA * 1000).toFixed(0)} B=${(fit.rmseB * 1000).toFixed(0)} · ` +
+          `n=${fit.nA}/${fit.nB}`;
+        console.log('[load fit]', fit);
+        const apply = window.confirm(`${summary}\n\nApply this display_area?`);
+        if (apply) await applyDisplayArea(fit.area, summary);
+        return;
       }
+
+      diagOut.textContent = 'Unrecognized file — expected display area, dataset, or 2-plane samples.';
     } catch (e) {
       diagOut.textContent = `Load failed: ${e instanceof Error ? e.message : String(e)}`;
     }
   });
   input.click();
+});
+daLoadModel.addEventListener('click', () => {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.addEventListener('change', async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const m = JSON.parse(text) as GazeModel;
+      if (!m.featureNames || !m.weights || !m.inputMean || !m.inputStd) {
+        diagOut.textContent = 'Not a valid gaze model file.';
+        return;
+      }
+      gazeModel = m;
+      diagOut.textContent = `Model loaded: ${m.featureNames.length} features, poly${m.polyDegree}, ${m.weights.length} weights`;
+      daLoadModel.textContent = 'Model loaded';
+    } catch (e) {
+      diagOut.textContent = `Model load failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  });
+  input.click();
+});
+daBigPlane.addEventListener('click', async () => {
+  if (!tracker) return;
+  const big: DisplayArea = {
+    tl: { x: -500, y: 500, z: 0 },
+    tr: { x: 500, y: 500, z: 0 },
+    bl: { x: -500, y: 0, z: 0 },
+  };
+  try {
+    await tracker.setDisplayAreaCorners(big);
+    setFormValues(big);
+    diagOut.textContent = 'Set big plane (1000x500mm @ z=0) — matches collection mode';
+  } catch (e) {
+    diagOut.textContent = `Failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
 });
 daWinPerm.addEventListener('click', () => { void requestScreenDetails(); });
 daFs.addEventListener('click', async () => {

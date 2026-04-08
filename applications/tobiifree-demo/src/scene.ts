@@ -16,6 +16,8 @@ export type Scene = {
   /** Mouse position in viewport-normalized coords (0..1), or null to hide. */
   setMouse: (pos: { nx: number; ny: number } | null) => void;
   setGaze: (sample: GazeSample) => void;
+  /** Model-corrected gaze in display-normalized coords, or null to hide. */
+  setCorrectedGaze: (pos: { x: number; y: number } | null) => void;
   dispose: () => void;
 };
 
@@ -146,6 +148,14 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   );
   unfiltDot.visible = false;
   screenGroup.add(unfiltDot);
+
+  // Model-corrected gaze dot — orange, matches the 2D overlay colour
+  const correctedDot = new THREE.Mesh(
+    new THREE.SphereGeometry(7, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0xf9c87d }),
+  );
+  correctedDot.visible = false;
+  screenGroup.add(correctedDot);
 
   // Per-eye 3D gaze points — ray–plane intersections in tracker-space
   const gaze3dDotL = new THREE.Mesh(
@@ -799,11 +809,24 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     bl: { x: -200, y:   0, z: 0 },
   });
 
+  function setCorrectedGaze(pos: { x: number; y: number } | null) {
+    if (!pos || !currentArea) { correctedDot.visible = false; return; }
+    // pos is viewport-normalized; map through viewport rect to display-normalized
+    const vr = viewportRect ?? { x0: 0, y0: 0, x1: 1, y1: 1 };
+    const dnx = vr.x0 + pos.x * (vr.x1 - vr.x0);
+    const dny = vr.y0 + pos.y * (vr.y1 - vr.y0);
+    const w = projectNorm(dnx, dny);
+    if (!w) { correctedDot.visible = false; return; }
+    correctedDot.position.set(w.x, w.y, w.z + 1); // nudge in front of screen
+    correctedDot.visible = true;
+  }
+
   return {
     setDisplayArea,
     setViewportRect,
     setMouse,
     setGaze,
+    setCorrectedGaze,
     dispose() {
       cancelAnimationFrame(raf);
       ro.disconnect();

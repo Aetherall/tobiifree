@@ -23,6 +23,14 @@
         transition: transform 16ms linear, opacity 120ms ease-out;
         opacity: 0; will-change: transform;
       }
+      #gaze-corrected {
+        position: fixed; width: 20px; height: 20px; margin: -10px 0 0 -10px;
+        border-radius: 50%; pointer-events: none;
+        background: radial-gradient(circle, #f9c87d 0%, rgba(249,200,125,0.35) 45%, transparent 70%);
+        box-shadow: 0 0 20px 5px rgba(249,200,125,0.4);
+        transition: transform 16ms linear, opacity 120ms ease-out;
+        opacity: 0; will-change: transform; z-index: 2;
+      }
       #panel {
         position: fixed; top: 12px; left: 12px; padding: 12px 14px;
         background: rgba(20,20,28,0.82); border: 1px solid #2a2a36;
@@ -149,6 +157,7 @@
     <canvas id="stage3d"></canvas>
     <div id="stage">
       <div id="gaze"></div>
+      <div id="gaze-corrected"></div>
     </div>
     <div id="panel">
       <h1>Tobii ET5 — Live Gaze</h1>
@@ -197,6 +206,8 @@
           <button id="da-collect" class="secondary" type="button">Collect samples</button>
           <button id="da-collect2" class="secondary" type="button">Collect (2-plane)</button>
           <button id="da-load" class="secondary" type="button">Load &amp; apply</button>
+          <button id="da-load-model" class="secondary" type="button">Load model</button>
+          <button id="da-big-plane" class="secondary" type="button">Big plane</button>
         </div>
         <pre id="diag-out" style="margin:8px 0 0 0; color:#b0b0c0; font-size:10px; white-space:pre-wrap; line-height:1.4;"></pre>
       </div>
