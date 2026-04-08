@@ -508,8 +508,8 @@ function applyLockConstraints() {
   const blz = Number(sliders.bl.z.value);
   setSliderValue('bl', 'x', Number(sliders.tl.x.value));
   setSliderValue('tr', 'y', Number(sliders.tl.y.value));
-  setSliderValue('tl', 'z', blz + tilt);
-  setSliderValue('tr', 'z', blz + tilt);
+  setSliderValue('tl', 'z', blz - tilt);
+  setSliderValue('tr', 'z', blz - tilt);
 }
 
 function setSliderValue(c: CornerKey, a: AxisKey, v: number) {
@@ -532,8 +532,8 @@ function updateLockUi() {
 }
 
 function syncTiltFromCorners() {
-  // Reverse-derive tilt from the current corner values: tilt = tl.z - bl.z.
-  const tilt = Number(sliders.tl.z.value) - Number(sliders.bl.z.value);
+  // Reverse-derive tilt from the current corner values: tilt = bl.z - tl.z.
+  const tilt = Number(sliders.bl.z.value) - Number(sliders.tl.z.value);
   tiltSlider.value = String(tilt);
   tiltVal.textContent = tilt.toFixed(1);
 }
@@ -694,10 +694,10 @@ function applyRectToCorners() {
   setSliderValue('bl', 'z', cz);
   setSliderValue('tl', 'x', cx - halfW);
   setSliderValue('tl', 'y', cy + dy);
-  setSliderValue('tl', 'z', cz + tEff);
+  setSliderValue('tl', 'z', cz - tEff);
   setSliderValue('tr', 'x', cx + halfW);
   setSliderValue('tr', 'y', cy + dy);
-  setSliderValue('tr', 'z', cz + tEff);
+  setSliderValue('tr', 'z', cz - tEff);
 }
 
 function syncRectFromCorners() {
