@@ -53,6 +53,20 @@ export type TobiiCore = {
   requestSubscribe(streamId: number): Uint8Array;
   /** Build get_display_area. Returns request_id. */
   requestGetDisplayArea(): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_START — opens a calibration session. */
+  requestCalStart(): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_STOP — closes it. */
+  requestCalStop(): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_CLEAR — drops previously collected points. */
+  requestCalClear(): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_POINTS_APPLY — fits and commits the model. */
+  requestCalPointsApply(): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_POINT_ADD2D. eyeMask: 1=left, 2=right, 3=both. */
+  requestCalPointAdd2D(x: number, y: number, eyeMask: number): { requestId: number; bytes: Uint8Array };
+  /** CALIBRATE_DOWNLOAD, standalone (no recompute). */
+  requestCalRetrieve(): { requestId: number; bytes: Uint8Array };
+  /** True if any response was clamped to a buffer size. */
+  hadTruncation(): boolean;
   /** Build set_display_area. No response expected. */
   requestSetDisplayArea(w: number, h: number, ox: number, oy: number, z: number): Uint8Array;
   /** Build set_display_area from 9 corner coordinates (tl/tr/bl × xyz). No response expected. */
@@ -177,6 +191,27 @@ export async function loadCore(
     requestGetDisplayArea() {
       const requestId = exp.request_get_display_area();
       return { requestId, bytes: takeOutBytes() };
+    },
+    requestCalStart() {
+      return { requestId: (exp as any).request_cal_start(), bytes: takeOutBytes() };
+    },
+    requestCalStop() {
+      return { requestId: (exp as any).request_cal_stop(), bytes: takeOutBytes() };
+    },
+    requestCalClear() {
+      return { requestId: (exp as any).request_cal_clear(), bytes: takeOutBytes() };
+    },
+    requestCalPointsApply() {
+      return { requestId: (exp as any).request_cal_points_apply(), bytes: takeOutBytes() };
+    },
+    requestCalPointAdd2D(x, y, eyeMask) {
+      return { requestId: (exp as any).request_cal_point_add2d(x, y, eyeMask), bytes: takeOutBytes() };
+    },
+    requestCalRetrieve() {
+      return { requestId: (exp as any).request_cal_retrieve(), bytes: takeOutBytes() };
+    },
+    hadTruncation() {
+      return ((exp as any).had_truncation?.() ?? 0) !== 0;
     },
     requestSetDisplayArea(w, h, ox, oy, z) {
       exp.request_set_display_area(w, h, ox, oy, z);

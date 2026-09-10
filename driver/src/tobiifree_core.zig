@@ -31,7 +31,16 @@ pub const TTP_OP_GET_DISPLAY_AREA: u32 = 0x596;
 
 // Calibration / realm ops
 pub const TTP_OP_CAL_ADD_POINT: u32 = 0x408; // 1032 — add calibration point
-pub const TTP_OP_CAL_COMPUTE: u32 = 0x42F; // 1071 — compute and apply calibration
+pub const TTP_OP_CAL_EYE_APPLY: u32 = 0x42F; // CALIBRATE_EYE_APPLY (not points-apply)
+
+// A calibration requires an explicit session. Without CALIBRATE_START the device
+// acks every added point and discards it, so the flow completes with no errors
+// and leaves the calibration blob byte-identical.
+pub const TTP_OP_CAL_START: u32 = 0x3F2; // CALIBRATE_START
+pub const TTP_OP_CAL_STOP: u32 = 0x3FC; // CALIBRATE_STOP
+pub const TTP_OP_CAL_CLEAR: u32 = 0x424; // CALIBRATE_CLEAR
+pub const TTP_OP_CAL_POINT_ADD2D: u32 = 0x406; // CALIBRATE_POINT_ADD2D
+pub const TTP_OP_CAL_POINTS_APPLY: u32 = 0x42E; // CALIBRATE_POINTS_APPLY
 pub const TTP_OP_CAL_RETRIEVE: u32 = 0x44C; // 1100 — retrieve calibration blob
 pub const TTP_OP_CAL_APPLY: u32 = 0x456; // 1110 — apply calibration blob
 pub const TTP_OP_CAL_STIMULUS: u32 = 0x460; // 1120 — get_calibration_stimulus_pts
@@ -343,7 +352,25 @@ pub export fn q42_encode(mm: f64) i64 {
 
 // Fixed scratch buffer for outbound frame building. JS writes the
 // returned pointer once at startup and passes it into build_* calls.
-var out_scratch: [4096]u8 = undefined;
+// The ET5's calibration blob is ~414 KB (measured: 414,844 bytes including the
+// 11-byte TTP response header). 4096 was far too small: cal_retrieve was
+// silently truncated by the @min() clamps below, and build_cal_apply wrote the
+// blob through an unchecked [*]u8 into session_out[512] — an out-of-bounds
+// write. Sized with headroom from a single constant.
+pub const CAL_BLOB_MAX: usize = 640 * 1024;
+
+/// Set if any response had to be clamped to a buffer size. Callers should check
+/// this after a calibration read; clamping used to pass silently, so a truncated
+/// blob could reach cal_apply and corrupt the device calibration.
+var truncation_seen: u32 = 0;
+pub export fn had_truncation() u32 {
+    return truncation_seen;
+}
+pub export fn clear_truncation() void {
+    truncation_seen = 0;
+}
+
+var out_scratch: [CAL_BLOB_MAX]u8 = undefined;
 
 pub export fn scratch_ptr() [*]u8 {
     return &out_scratch;
@@ -549,7 +576,47 @@ pub export fn build_cal_add_point(seq: u32, x: f64, y: f64, eye_choice: u32, out
 pub export fn build_cal_compute(seq: u32, out: [*]u8) usize {
     var pay = [_]u8{ 0x00, 0x00 };
     var ttp_buf: [TTP_HDR_SIZE + 2]u8 = undefined;
-    const ttp_len = buildFrame(&ttp_buf, seq, TTP_OP_CAL_COMPUTE, &pay, pay.len);
+    const ttp_len = buildFrame(&ttp_buf, seq, TTP_OP_CAL_EYE_APPLY, &pay, pay.len);
+    return wrapEnvelopeOut(out, &ttp_buf, ttp_len);
+}
+
+fn buildEmptyCmd(seq: u32, op: u32, out: [*]u8) usize {
+    var pay = [_]u8{ 0x00, 0x00 };
+    var ttp_buf: [TTP_HDR_SIZE + 2]u8 = undefined;
+    const ttp_len = buildFrame(&ttp_buf, seq, op, &pay, pay.len);
+    return wrapEnvelopeOut(out, &ttp_buf, ttp_len);
+}
+
+/// CALIBRATE_START — opens a calibration session. Must precede point adds.
+pub export fn build_cal_start(seq: u32, out: [*]u8) usize {
+    return buildEmptyCmd(seq, TTP_OP_CAL_START, out);
+}
+/// CALIBRATE_STOP — closes the session after POINTS_APPLY.
+pub export fn build_cal_stop(seq: u32, out: [*]u8) usize {
+    return buildEmptyCmd(seq, TTP_OP_CAL_STOP, out);
+}
+/// CALIBRATE_CLEAR — drops previously collected points.
+pub export fn build_cal_clear(seq: u32, out: [*]u8) usize {
+    return buildEmptyCmd(seq, TTP_OP_CAL_CLEAR, out);
+}
+/// CALIBRATE_POINTS_APPLY — fits and commits the model.
+pub export fn build_cal_points_apply(seq: u32, out: [*]u8) usize {
+    return buildEmptyCmd(seq, TTP_OP_CAL_POINTS_APPLY, out);
+}
+
+/// CALIBRATE_POINT_ADD2D. eye_mask: 1=left, 2=right, 3=both.
+pub export fn build_cal_point_add2d(seq: u32, x: f64, y: f64, eye_mask: u32, out: [*]u8) usize {
+    var pay: [64]u8 = undefined;
+    var n: usize = 0;
+    pay[n] = 0x00;
+    n += 1;
+    pay[n] = 0x00;
+    n += 1;
+    n += tlvF64Q42(@ptrCast(&pay[n]), x);
+    n += tlvF64Q42(@ptrCast(&pay[n]), y);
+    n += tlvU32(@ptrCast(&pay[n]), eye_mask);
+    var ttp_buf: [TTP_HDR_SIZE + 64]u8 = undefined;
+    const ttp_len = buildFrame(&ttp_buf, seq, TTP_OP_CAL_POINT_ADD2D, @ptrCast(&pay), @intCast(n));
     return wrapEnvelopeOut(out, &ttp_buf, ttp_len);
 }
 
@@ -1048,7 +1115,8 @@ var next_req_id: u32 = 1;
 
 // Dedicated out buffer so request_* returns only a length; JS copies it
 // via take_session_out (or reads directly at session_out_ptr).
-var session_out: [512]u8 = undefined;
+// must hold ENVELOPE + TTP header + 2 + a full calibration blob (cal_apply)
+var session_out: [CAL_BLOB_MAX + 1024]u8 = undefined;
 var session_out_len: usize = 0;
 
 fn pendingInsert(seq: u32, req_id: u32) void {
@@ -1455,6 +1523,42 @@ pub export fn request_cal_compute() u32 {
     return req_id;
 }
 
+pub export fn request_cal_start() u32 {
+    const req_id = takeReqId();
+    const seq = takeSeq();
+    session_out_len = build_cal_start(seq, &session_out);
+    pendingInsert(seq, req_id);
+    return req_id;
+}
+pub export fn request_cal_stop() u32 {
+    const req_id = takeReqId();
+    const seq = takeSeq();
+    session_out_len = build_cal_stop(seq, &session_out);
+    pendingInsert(seq, req_id);
+    return req_id;
+}
+pub export fn request_cal_clear() u32 {
+    const req_id = takeReqId();
+    const seq = takeSeq();
+    session_out_len = build_cal_clear(seq, &session_out);
+    pendingInsert(seq, req_id);
+    return req_id;
+}
+pub export fn request_cal_points_apply() u32 {
+    const req_id = takeReqId();
+    const seq = takeSeq();
+    session_out_len = build_cal_points_apply(seq, &session_out);
+    pendingInsert(seq, req_id);
+    return req_id;
+}
+pub export fn request_cal_point_add2d(x: f64, y: f64, eye_mask: u32) u32 {
+    const req_id = takeReqId();
+    const seq = takeSeq();
+    session_out_len = build_cal_point_add2d(seq, x, y, eye_mask, &session_out);
+    pendingInsert(seq, req_id);
+    return req_id;
+}
+
 /// Retrieve calibration blob. Returns request_id.
 pub export fn request_cal_retrieve() u32 {
     const req_id = takeReqId();
@@ -1527,7 +1631,7 @@ var hs_state: HandshakeState = .idle;
 
 // Handshake response capture (reused across steps).
 var hs_resp_ready: bool = false;
-var hs_resp_buf: [4096]u8 = undefined;
+var hs_resp_buf: [CAL_BLOB_MAX]u8 = undefined;
 var hs_resp_len: u32 = 0;
 
 // Realm state captured during handshake.
@@ -1541,6 +1645,7 @@ var hs_stream_id: u16 = 0x500;
 fn hsResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
     _ = request_id;
     const n: usize = @min(payload_len, hs_resp_buf.len);
+    if (n < payload_len) truncation_seen = 1;
     @memcpy(hs_resp_buf[0..n], payload_ptr[0..n]);
     hs_resp_len = @intCast(n);
     hs_resp_ready = true;
@@ -1721,6 +1826,7 @@ var cs_prev_response_hook: HookFn_response = noop_response;
 fn csResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
     _ = request_id;
     const n: usize = @min(payload_len, hs_resp_buf.len);
+    if (n < payload_len) truncation_seen = 1;
     @memcpy(hs_resp_buf[0..n], payload_ptr[0..n]);
     hs_resp_len = @intCast(n);
     hs_resp_ready = true;
@@ -1865,6 +1971,7 @@ var cf_blob_len: u32 = 0;
 fn cfResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
     _ = request_id;
     const n: usize = @min(payload_len, hs_resp_buf.len);
+    if (n < payload_len) truncation_seen = 1;
     @memcpy(hs_resp_buf[0..n], payload_ptr[0..n]);
     hs_resp_len = @intCast(n);
     hs_resp_ready = true;
@@ -1924,6 +2031,7 @@ fn calFinishPollInner() HandshakeAction {
             if (hs_resp_ready) {
                 // Store the blob in out_scratch for the caller.
                 const n: usize = @min(hs_resp_len, out_scratch.len);
+                if (n < hs_resp_len) truncation_seen = 1;
                 @memcpy(out_scratch[0..n], hs_resp_buf[0..n]);
                 cf_blob_len = @intCast(n);
                 cf_state = .build_close_realm;
@@ -1991,6 +2099,7 @@ var ca_prev_response_hook: HookFn_response = noop_response;
 fn caResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
     _ = request_id;
     const n: usize = @min(payload_len, hs_resp_buf.len);
+    if (n < payload_len) truncation_seen = 1;
     @memcpy(hs_resp_buf[0..n], payload_ptr[0..n]);
     hs_resp_len = @intCast(n);
     hs_resp_ready = true;

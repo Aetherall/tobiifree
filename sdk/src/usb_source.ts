@@ -171,24 +171,62 @@ export class UsbSource implements Source {
     try { await this.getDisplayArea(); } catch {}
   }
 
+  private async calRequest(mk: () => { requestId: number; bytes: Uint8Array },
+                           timeoutMs = 20000): Promise<Uint8Array> {
+    const { requestId, bytes } = mk();
+    const waiter = this.awaitResponse(requestId, timeoutMs);
+    await this.transport.send(bytes);
+    return await waiter;
+  }
+
+  /**
+   * Open a calibration session.
+   *
+   * Unlocks the calibration realm, then issues CALIBRATE_START and
+   * CALIBRATE_CLEAR. The START was previously missing: without an open session
+   * the device acknowledges every added point and discards it, so the whole
+   * flow completed with no errors while leaving the calibration unchanged.
+   */
   async startCalibration(): Promise<void> {
     log('startCalibration');
     this.core.calStartInit();
-    await this.driveStateMachine(() => this.core.calStartPoll(), 'cal_start');
+    await this.driveStateMachine(() => this.core.calStartPoll(), 'cal_realm');
+    await this.calRequest(() => this.core.requestCalStart());
+    try {
+      await this.calRequest(() => this.core.requestCalClear());
+    } catch (e) {
+      log('cal_clear rejected (harmless if no prior points)', e);
+    }
   }
 
-  async addCalibrationPoint(x: number, y: number): Promise<void> {
-    const { requestId, bytes } = this.core.requestCalAddPoint(x, y, 0);
-    const waiter = this.awaitResponse(requestId, 10_000);
-    await this.transport.send(bytes);
-    await waiter;
+  /** Add a calibration point. eyeMask: 1=left, 2=right, 3=both (default). */
+  async addCalibrationPoint(x: number, y: number, eyeMask = 3): Promise<void> {
+    await this.calRequest(() => this.core.requestCalPointAdd2D(x, y, eyeMask));
   }
 
+  /**
+   * Commit the calibration and return the resulting blob.
+   *
+   * CALIBRATE_POINTS_APPLY -> CALIBRATE_STOP -> CALIBRATE_DOWNLOAD.
+   * Previously used CALIBRATE_EYE_APPLY (0x42F), which is a different
+   * operation and left the model unchanged.
+   */
   async finishCalibration(): Promise<Uint8Array> {
     log('finishCalibration');
-    this.core.calFinishInit();
-    await this.driveStateMachine(() => this.core.calFinishPoll(), 'cal_finish');
-    return this.core.calFinishBlob();
+    await this.calRequest(() => this.core.requestCalPointsApply(), 120_000);
+    await this.calRequest(() => this.core.requestCalStop());
+    const blob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
+    if (this.core.hadTruncation()) {
+      throw new Error(
+        `calibration blob was truncated to the wasm buffer (got ${blob.byteLength} bytes) — ` +
+        'do not apply it; raise CAL_BLOB_MAX');
+    }
+    return blob;
+  }
+
+  /** Read the calibration blob without recomputing it. */
+  async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
+    return this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
   }
 
   async calApply(blob: Uint8Array): Promise<void> {
