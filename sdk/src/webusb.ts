@@ -62,11 +62,53 @@ export class WebUsbTransport implements Transport {
 
   async send(bytes: Uint8Array): Promise<void> {
     log('send', bytes.byteLength, 'bytes');
-    const buf = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(buf).set(bytes);
-    const r = await this.device.transferOut(EP_OUT, buf);
-    if (r.status !== 'ok' || r.bytesWritten !== bytes.byteLength) {
-      throw new Error(`bulk OUT: ${r.status} (${r.bytesWritten}/${bytes.byteLength})`);
+    // All USB OUT transfers use the per-transfer envelope format:
+    //   [00 00 00 00][data_len: u32 LE][data_len bytes]
+    // For frames that fit in one transfer wrapEnvelopeOut already produces the
+    // correct bytes 4-7 (ttp_len == data.len - 8 = data_len for that case).
+    // For large frames the first chunk's bytes 4-7 hold the full ttp_len and
+    // must be patched to CONT_DATA (8184 = 8192 - 8) before sending.
+    const CHUNK = 8192;
+    const CONT_HDR = 8;
+    const CONT_DATA = CHUNK - CONT_HDR; // 8184
+
+    if (bytes.byteLength <= CHUNK) {
+      // Small frame: wrapEnvelopeOut bytes 4-7 already correct, send as-is.
+      const buf = new ArrayBuffer(bytes.byteLength);
+      new Uint8Array(buf).set(bytes);
+      const r = await this.device.transferOut(EP_OUT, buf);
+      if (r.status !== 'ok' || r.bytesWritten !== bytes.byteLength) {
+        throw new Error(`bulk OUT: ${r.status} (${r.bytesWritten}/${bytes.byteLength})`);
+      }
+      return;
+    }
+
+    // Large frame: copy first CHUNK bytes and patch bytes 4-7 to CONT_DATA.
+    const firstBuf = new ArrayBuffer(CHUNK);
+    new Uint8Array(firstBuf).set(bytes.subarray(0, CHUNK));
+    new DataView(firstBuf).setUint32(4, CONT_DATA, true);
+    {
+      const r = await this.device.transferOut(EP_OUT, firstBuf);
+      if (r.status !== 'ok' || r.bytesWritten !== CHUNK) {
+        throw new Error(`bulk OUT first chunk: ${r.status} (${r.bytesWritten}/${CHUNK})`);
+      }
+    }
+
+    // Continuation chunks.
+    let offset = CHUNK;
+    while (offset < bytes.byteLength) {
+      const dataEnd = Math.min(offset + CONT_DATA, bytes.byteLength);
+      const dataLen = dataEnd - offset;
+      const buf = new ArrayBuffer(CONT_HDR + dataLen);
+      const view = new DataView(buf);
+      view.setUint32(0, 0, true);       // [00 00 00 00]
+      view.setUint32(4, dataLen, true); // data_len LE
+      new Uint8Array(buf, CONT_HDR).set(bytes.subarray(offset, dataEnd));
+      const r = await this.device.transferOut(EP_OUT, buf);
+      if (r.status !== 'ok' || r.bytesWritten !== (CONT_HDR + dataLen)) {
+        throw new Error(`bulk OUT continuation @${offset}: ${r.status} (${r.bytesWritten}/${CONT_HDR + dataLen})`);
+      }
+      offset = dataEnd;
     }
   }
 

@@ -11,11 +11,16 @@ const log = std.log.scoped(.server);
 
 const MAX_CLIENTS = 16;
 
+// Large enough to buffer a complete CMD_CAL_APPLY message (calibration blob
+// up to ~640 KB + 5-byte header). `Server` is a global variable in main.zig
+// (not stack-allocated), so this size is safe.
+const CLIENT_BUF_SIZE = 700 * 1024;
+
 const Client = struct {
     fd: std.posix.fd_t,
     subscribed: bool,
     // Per-client read buffer for incoming commands.
-    buf: [4096]u8,
+    buf: [CLIENT_BUF_SIZE]u8,
     buf_len: usize,
 };
 
@@ -29,7 +34,10 @@ pub const Server = struct {
     socket_path_len: usize,
     forward_fn: ForwardFn,
 
-    pub fn init(forward_fn: ForwardFn) !Server {
+    /// Initialise the server in-place. The caller must ensure `self` lives in
+    /// non-stack memory (e.g. a global variable) because Client.buf is ~700 KB
+    /// per slot — putting 16 slots on the call stack would overflow it.
+    pub fn init(self: *Server, forward_fn: ForwardFn) !void {
         var path_buf: [512]u8 = undefined;
         const path = proto.socketPath(&path_buf) orelse return error.NoSocketPath;
 
@@ -52,18 +60,15 @@ pub const Server = struct {
         try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
         try std.posix.listen(fd, 8);
 
-        var self = Server{
-            .listen_fd = fd,
-            .clients = [_]?Client{null} ** MAX_CLIENTS,
-            .n_clients = 0,
-            .socket_path = undefined,
-            .socket_path_len = path.len,
-            .forward_fn = forward_fn,
-        };
+        // Initialise fields individually — no large struct temporary on the stack.
+        self.listen_fd = fd;
+        self.n_clients = 0;
+        self.socket_path_len = path.len;
+        self.forward_fn = forward_fn;
         @memcpy(self.socket_path[0..path.len], path);
+        for (&self.clients) |*slot| slot.* = null;
 
         log.info("listening on {s}", .{path});
-        return self;
     }
 
     /// Accept new clients (non-blocking).
@@ -100,7 +105,12 @@ pub const Server = struct {
             const client = &(slot.* orelse continue);
             const space = client.buf.len - client.buf_len;
             if (space == 0) {
-                client.buf_len = 0;
+                // Buffer full without a complete message — the client sent something
+                // larger than CLIENT_BUF_SIZE.  This should not happen with our
+                // protocol; disconnect rather than silently discarding data.
+                log.err("client fd={d} buffer overflow ({d} bytes), disconnecting",
+                    .{ client.fd, client.buf_len });
+                self.removeClient(slot);
                 continue;
             }
             const n = std.posix.read(client.fd, client.buf[client.buf_len..]) catch |err| {

@@ -94,7 +94,10 @@ pub fn encodeResponse(buf: []u8, cmd_type: u8, payload: []const u8) usize {
 }
 
 /// Encode an error response.
-pub fn encodeError(buf: *[HEADER_SIZE + 4]u8, err_code: u32) void {
-    encodeHeader(buf[0..HEADER_SIZE], @intFromEnum(Srv.err), 4);
-    std.mem.writeInt(u32, buf[HEADER_SIZE..][0..4], err_code, .little);
+/// Includes the originating cmd_type so clients can reject the matching
+/// pending request instead of leaving it to time out.
+pub fn encodeError(buf: *[HEADER_SIZE + 1 + 4]u8, cmd_type: u8, err_code: u32) void {
+    encodeHeader(buf[0..HEADER_SIZE], @intFromEnum(Srv.err), 1 + 4);
+    buf[HEADER_SIZE] = cmd_type;
+    std.mem.writeInt(u32, buf[HEADER_SIZE + 1 ..][0..4], err_code, .little);
 }

@@ -67,6 +67,8 @@ export type TobiiCore = {
   requestCalRetrieve(): { requestId: number; bytes: Uint8Array };
   /** True if any response was clamped to a buffer size. */
   hadTruncation(): boolean;
+  /** Reset the sticky truncation flag. Call before a retrieve/finish so a stale flag from an earlier request isn't misattributed. */
+  clearTruncation(): void;
   /** Build set_display_area. No response expected. */
   requestSetDisplayArea(w: number, h: number, ox: number, oy: number, z: number): Uint8Array;
   /** Build set_display_area from 9 corner coordinates (tl/tr/bl × xyz). No response expected. */
@@ -212,6 +214,9 @@ export async function loadCore(
     },
     hadTruncation() {
       return ((exp as any).had_truncation?.() ?? 0) !== 0;
+    },
+    clearTruncation() {
+      (exp as any).clear_truncation?.();
     },
     requestSetDisplayArea(w, h, ox, oy, z) {
       exp.request_set_display_area(w, h, ox, oy, z);

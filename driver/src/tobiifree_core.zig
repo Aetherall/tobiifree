@@ -770,6 +770,11 @@ pub fn set_hooks(
     if (f_raw_columns) |f| hook_raw_columns = f;
 }
 
+/// Return the currently installed response hook.
+pub fn get_response_hook() HookFn_response {
+    return hook_response;
+}
+
 const wasm_hooks = struct {
     extern "env" fn on_ttp_frame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_len: u32) void;
     extern "env" fn on_parse_error(code: u32) void;
@@ -1938,7 +1943,7 @@ fn calStartPollInner() HandshakeAction {
 // =====================================================================
 // Calibration finish — step-based state machine.
 //
-// Wraps: compute_and_apply → retrieve → close_realm.
+// Wraps: points_apply → stop → retrieve.
 // The retrieved calibration blob is stored internally and exposed via
 // cal_finish_blob_ptr / cal_finish_blob_len.
 //
@@ -1953,12 +1958,12 @@ fn calStartPollInner() HandshakeAction {
 
 const CalFinishState = enum {
     idle,
-    build_compute,
-    await_compute,
+    build_points_apply,
+    await_points_apply,
+    build_stop,
+    await_stop,
     build_retrieve,
     await_retrieve,
-    build_close_realm,
-    await_close_realm,
     done,
     failed,
 };
@@ -1978,9 +1983,8 @@ fn cfResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) v
 }
 
 /// Initialize the calibration finish sequence. Call before cal_finish_poll().
-/// realm_id is the value from cal_start_realm_id().
 pub export fn cal_finish_init() void {
-    cf_state = .build_compute;
+    cf_state = .build_points_apply;
     cf_blob_len = 0;
     hs_resp_ready = false;
     hs_resp_len = 0;
@@ -2007,13 +2011,27 @@ fn calFinishPollInner() HandshakeAction {
     switch (cf_state) {
         .idle => return .done,
 
-        .build_compute => {
-            _ = request_cal_compute();
+        .build_points_apply => {
+            _ = request_cal_points_apply();
             hs_resp_ready = false;
-            cf_state = .await_compute;
+            cf_state = .await_points_apply;
             return .send;
         },
-        .await_compute => {
+        .await_points_apply => {
+            if (hs_resp_ready) {
+                cf_state = .build_stop;
+                return calFinishPollInner();
+            }
+            return .recv;
+        },
+
+        .build_stop => {
+            _ = request_cal_stop();
+            hs_resp_ready = false;
+            cf_state = .await_stop;
+            return .send;
+        },
+        .await_stop => {
             if (hs_resp_ready) {
                 cf_state = .build_retrieve;
                 return calFinishPollInner();
@@ -2029,25 +2047,21 @@ fn calFinishPollInner() HandshakeAction {
         },
         .await_retrieve => {
             if (hs_resp_ready) {
-                // Store the blob in out_scratch for the caller.
-                const n: usize = @min(hs_resp_len, out_scratch.len);
-                if (n < hs_resp_len) truncation_seen = 1;
-                @memcpy(out_scratch[0..n], hs_resp_buf[0..n]);
+                // Every TTP response payload in this protocol begins with a
+                // 2-byte status/type prefix that all
+                // other decoders skip with r.pos = 2 or pos = 2).  Strip it
+                // here so out_scratch holds only the raw calibration data.
+                // build_cal_apply prepends [00 00] when building the apply
+                // request, so the correct wire format is:
+                //   apply TTP payload = [00 00] + raw_blob
+                // Without stripping, apply would send [00 00][00 00][raw_blob]
+                const STRIP: usize = 2;
+                const src_start: usize = if (hs_resp_len >= STRIP) STRIP else 0;
+                const raw_len: usize = hs_resp_len - src_start;
+                const n: usize = @min(raw_len, out_scratch.len);
+                if (raw_len > out_scratch.len) truncation_seen = 1;
+                @memcpy(out_scratch[0..n], hs_resp_buf[src_start..src_start + n]);
                 cf_blob_len = @intCast(n);
-                cf_state = .build_close_realm;
-                return calFinishPollInner();
-            }
-            return .recv;
-        },
-
-        .build_close_realm => {
-            _ = request_close_realm(cs_realm_id);
-            hs_resp_ready = false;
-            cf_state = .await_close_realm;
-            return .send;
-        },
-        .await_close_realm => {
-            if (hs_resp_ready) {
                 cf_state = .done;
                 return calFinishPollInner();
             }

@@ -2048,7 +2048,14 @@ async function runOnboardCalibration() {
 
     calStatus.textContent = 'Computing calibration…';
     const blob = await tracker.finishCalibration();
-    const b64 = btoa(String.fromCharCode(...blob));
+    // Spreading a large Uint8Array as arguments to String.fromCharCode exceeds
+    // the JS engine call-stack limit for blobs > ~100 KB.  Process in chunks.
+    let binStr = '';
+    const CHUNK = 8192;
+    for (let i = 0; i < blob.byteLength; i += CHUNK) {
+      binStr += String.fromCharCode(...blob.subarray(i, i + CHUNK));
+    }
+    const b64 = btoa(binStr);
     localStorage.setItem('tobii_onboard_cal', b64);
     console.log(`[onboard-cal] stored ${blob.byteLength}B calibration blob`);
 

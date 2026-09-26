@@ -213,20 +213,22 @@ export class UsbSource implements Source {
    */
   async finishCalibration(): Promise<Uint8Array> {
     log('finishCalibration');
+    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
     await this.calRequest(() => this.core.requestCalPointsApply(), 120_000);
     await this.calRequest(() => this.core.requestCalStop());
-    const blob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
+    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), 60_000);
     if (this.core.hadTruncation()) {
       throw new Error(
-        `calibration blob was truncated to the wasm buffer (got ${blob.byteLength} bytes) — ` +
+        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
         'do not apply it; raise CAL_BLOB_MAX');
     }
+    // Every TTP response payload begins with a 2-byte status prefix 
+    // that all other decoders skip (r.pos = 2).
+    // build_cal_apply prepends its own [00 00] when applying, so the blob
+    // stored/returned must be the raw data WITHOUT that prefix.
+    // Keeping the prefix would cause calApply to send [00 00][00 00][data]
+    const blob = rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
     return blob;
-  }
-
-  /** Read the calibration blob without recomputing it. */
-  async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
-    return this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
   }
 
   async calApply(blob: Uint8Array): Promise<void> {
@@ -251,6 +253,26 @@ export class UsbSource implements Source {
   }
 
   // ── UsbSource-only extras ─────────────────────────────────────────
+
+  /**
+   * Read the calibration blob without recomputing it.
+   *
+   * Not part of the `Source` interface: the daemon protocol has no
+   * cal_retrieve command, so `WsSource` cannot implement this. Only call it
+   * on a concrete `UsbSource`.
+   */
+  async calRetrieve(timeoutMs = 60_000): Promise<Uint8Array> {
+    this.core.clearTruncation(); // sticky flag; clear so a stale hit doesn't fail this retrieve
+    const rawBlob = await this.calRequest(() => this.core.requestCalRetrieve(), timeoutMs);
+    if (this.core.hadTruncation()) {
+      throw new Error(
+        `calibration blob was truncated to the wasm buffer (got ${rawBlob.byteLength} bytes) — ` +
+        'do not apply it; raise CAL_BLOB_MAX');
+    }
+    // Strip the 2-byte status prefix, same as finishCalibration() — calApply
+    // prepends its own prefix, so a stored/returned blob must not include one.
+    return rawBlob.length > 2 ? rawBlob.subarray(2) : rawBlob;
+  }
 
   /** Raw-column gaze listener (wasm-only, not part of Source interface). */
   subscribeToRawGaze(listener: (cols: RawGazeColumn[]) => void): Unsubscribe {

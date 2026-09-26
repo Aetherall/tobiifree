@@ -26,10 +26,24 @@ pub const Tracker = struct {
     connected: bool,
     gaze_cb: ?GazeFn,
     display: DisplayCorners,
+    /// Tracks which side owns the transport, so poll() and the calibration state
+    /// machines never call recv_fn/feed_usb_in concurrently (which would corrupt
+    /// the core parser). A plain bool + fixed sleep isn't enough here: recv_fn can
+    /// block for up to ~100ms, so the transition to `.calibrating` is done with a
+    /// CAS loop that only succeeds once poll() has observed `.idle` and is not
+    /// mid-read. A mutex is avoided because poll() would hold it across a
+    /// blocking read, which can deadlock.
+    usb_owner: std.atomic.Value(UsbOwner) = std.atomic.Value(UsbOwner).init(.idle),
+    /// Set while a calibration section wants the transport. poll() checks this
+    /// before even attempting the idle->busy CAS, so the USB thread stops
+    /// re-claiming ownership;
+    cal_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
     pub const GazeFn = *const fn (*const core.GazeSample) void;
+
+    pub const UsbOwner = enum(u8) { idle, busy, calibrating };
 
     /// Three-corner display area as reported by the device.
     pub const DisplayCorners = struct {
@@ -146,8 +160,13 @@ pub const Tracker = struct {
 
     /// Poll for USB data. First read blocks until data arrives (device-paced).
     /// Subsequent reads are non-blocking to drain any buffered packets.
+    /// Returns immediately (no reads) while a calibration state machine owns
+    /// (or is claiming) the transport, so the main thread has USB I/O exclusively.
     pub fn poll(self: *Tracker) void {
         if (!self.connected) return;
+        if (self.cal_pending.load(.acquire)) return;
+        if (self.usb_owner.cmpxchgStrong(.idle, .busy, .acquire, .monotonic) != null) return;
+        defer self.usb_owner.store(.idle, .release);
         active = self;
 
         var buf: [16384]u8 = undefined;
@@ -224,21 +243,56 @@ pub const Tracker = struct {
 
     // ── Calibration ─────────────────────────────────────────────────
 
+    /// Wait for poll() to be outside (or not about to enter) a read, then claim
+    /// the transport exclusively. Loops rather than sleeping a fixed duration
+    /// because recv_fn's blocking read can take arbitrarily long.
+    fn beginCalibrating(self: *Tracker) void {
+        // Tell poll() to stop contending for ownership; 
+        self.cal_pending.store(true, .release);
+        while (self.usb_owner.cmpxchgWeak(.idle, .calibrating, .acquire, .monotonic) != null) {
+            std.Thread.sleep(1_000_000); // 1 ms
+        }
+    }
+
+    fn endCalibrating(self: *Tracker) void {
+        self.usb_owner.store(.idle, .release);
+        self.cal_pending.store(false, .release);
+    }
+
     pub fn startCalibration(self: *Tracker) bool {
+        self.beginCalibrating();
+        defer self.endCalibrating();
+        // Step 1: unlock the calibration realm.
         core.cal_start_init();
-        return self.driveStateMachine(&core.cal_start_poll, "cal_start");
+        if (!self.driveStateMachine(&core.cal_start_poll, "cal_realm")) return false;
+
+        // Step 2: open a calibration session (CALIBRATE_START).
+        // Without this the device acks every added point and discards it,
+        // so the flow completes with no errors while leaving the calibration unchanged.
+        if (!self.sendAndAwait(core.request_cal_start, "cal_start")) return false;
+
+        // Step 3: drop any previously collected points (ok if the device rejects it).
+        _ = self.sendAndAwait(core.request_cal_clear, "cal_clear");
+
+        return true;
     }
 
     pub fn finishCalibration(self: *Tracker) bool {
+        self.beginCalibrating();
+        defer self.endCalibrating();
         core.cal_finish_init();
         return self.driveStateMachine(&core.cal_finish_poll, "cal_finish");
     }
 
     pub fn calApply(self: *Tracker, blob: []const u8) bool {
+        self.beginCalibrating();
+        defer self.endCalibrating();
+        if (blob.len > core.scratch_size()) return false;
         const scratch = core.scratch_ptr();
         @memcpy(scratch[0..blob.len], blob);
         core.cal_apply_init(@intCast(blob.len));
-        return self.driveStateMachine(&core.cal_apply_poll, "cal_apply");
+        // 120 s: realm unlock + large blob send + device processing + close realm
+        return self.driveStateMachineMs(&core.cal_apply_poll, "cal_apply", 120_000);
     }
 
     // ── State machine driver ─────────────────────────────────────────
@@ -247,37 +301,73 @@ pub const Tracker = struct {
         return self.driveStateMachine(&core.handshake_poll, "handshake");
     }
 
+    /// Send a single TTP request and wait for its response.
+    /// Returns true if a response was received, false on send failure or timeout.
+    fn sendAndAwait(self: *Tracker, build_fn: *const fn () callconv(.c) u32, label: [*:0]const u8) bool {
+        // Save and restore the active response hook so that hooks installed by
+        // the caller (e.g. the daemon's onResponse for command forwarding) are
+        // not permanently overwritten by the temporary captureResponse hook.
+        const saved_hook = core.get_response_hook();
+        core.set_hooks(null, null, captureResponse, null, null);
+        defer core.set_hooks(null, null, saved_hook, null, null);
+        const req_id = build_fn();
+        captured_request_id = req_id;
+        captured_payload = null;
+        const out_len = core.session_out_len_();
+        if (out_len == 0) {
+            log.err("{s}: empty output", .{label});
+            return false;
+        }
+        if (!self.send_fn(core.session_out_ptr()[0..out_len])) {
+            log.err("{s}: send failed", .{label});
+            return false;
+        }
+        self.drainReads(30);
+        if (captured_payload == null) {
+            log.warn("{s}: no response", .{label});
+            return false;
+        }
+        log.debug("{s}: ok ({} bytes)", .{ label, captured_payload.?.len });
+        return true;
+    }
+
     fn driveStateMachine(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8) bool {
-        var max_steps: u32 = 0;
-        while (max_steps < 200) : (max_steps += 1) {
+        return self.driveStateMachineMs(poll_fn, label, 150_000);
+    }
+
+    fn driveStateMachineMs(self: *Tracker, poll_fn: *const fn () callconv(.c) u8, label: [*:0]const u8, timeout_ms: i64) bool {
+        var steps: u32 = 0;
+        const start_ms = std.time.milliTimestamp();
+        while (std.time.milliTimestamp() - start_ms < timeout_ms) : (steps += 1) {
             const action: core.HandshakeAction = @enumFromInt(poll_fn());
             switch (action) {
                 .send => {
                     const len = core.session_out_len_();
-                    log.debug("{s} step {d}: send {d} bytes", .{ label, max_steps, len });
+                    log.debug("{s} step {d}: send {d} bytes", .{ label, steps, len });
                     if (len > 0) {
                         if (!self.send_fn(core.session_out_ptr()[0..len])) {
-                            log.err("{s}: send failed at step {d}", .{ label, max_steps });
+                            log.err("{s}: send failed at step {d}", .{ label, steps });
                             return false;
                         }
                     }
                     self.drainReads(10);
                 },
                 .recv => {
-                    log.debug("{s} step {d}: recv", .{ label, max_steps });
+                    // Only log intermittently to avoid spam
+                    if (steps % 100 == 0) log.debug("{s} step {d}: recv", .{ label, steps });
                     self.drainReads(5);
                 },
                 .done => {
-                    log.info("{s} complete in {d} steps", .{ label, max_steps });
+                    log.info("{s} complete in {d} steps", .{ label, steps });
                     return true;
                 },
                 .err => {
-                    log.err("{s} failed at step {d}", .{ label, max_steps });
+                    log.err("{s} failed at step {d}", .{ label, steps });
                     return false;
                 },
             }
         }
-        log.err("{s} timed out after 200 steps", .{label});
+        log.err("{s} timed out after {}ms ({} steps)", .{label, timeout_ms, steps});
         return false;
     }
 

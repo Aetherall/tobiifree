@@ -71,11 +71,89 @@ pub const LibusbTransport = struct {
     }
 
     pub fn send(self: *LibusbTransport, data: []const u8) bool {
-        var transferred: c_int = 0;
-        const r = c.libusb_bulk_transfer(self.usb_handle, EP_OUT, @constCast(data.ptr), @intCast(data.len), &transferred, 1000);
-        if (r != 0 or transferred != @as(c_int, @intCast(data.len))) {
-            log.err("send failed: r={d} transferred={d}/{d}", .{ r, transferred, data.len });
-            return false;
+        // All USB OUT transfers use the per-transfer envelope format:
+        //   [00 00 00 00][data_len: u32 LE][data_len bytes]
+        // where data_len = bytes in THIS transfer after the 8-byte header.
+        //
+        // For small frames (data.len ≤ 8192) wrapEnvelopeOut already writes
+        // ttp_len at bytes 4-7, and ttp_len == data.len − 8 == data_len, so
+        // no patching is needed.
+        //
+        // For large frames the first chunk's bytes 4-7 hold the full ttp_len
+        // (total TTP frame length) which is wrong for a fragmented transfer;
+        // it must be overwritten with CONT_DATA (8184 = 8192 − 8) before
+        // sending.  The device learns the total expected payload length from
+        // the plen field inside the TTP header (bytes 8-31), not from the
+        // USB envelope.
+        const CHUNK: usize = 8192;
+        const CONT_HDR: usize = 8;
+        const CONT_DATA: usize = CHUNK - CONT_HDR; // 8184
+
+        // ── Small frame: fits in one transfer, send as-is ──────────────────
+        if (data.len <= CHUNK) {
+            var xfr: c_int = 0;
+            const r = c.libusb_bulk_transfer(
+                self.usb_handle, EP_OUT,
+                @constCast(data.ptr), @intCast(data.len),
+                &xfr, 2000,
+            );
+            if (r != 0 or xfr != @as(c_int, @intCast(data.len))) {
+                log.err("send failed: r={d} transferred={d}/{d}", .{ r, xfr, data.len });
+                return false;
+            }
+            return true;
+        }
+
+        // ── Large frame: first chunk with bytes 4-7 patched to CONT_DATA ──
+        var first_buf: [CHUNK]u8 = undefined;
+        @memcpy(&first_buf, data[0..CHUNK]);
+        // Overwrite ttp_len with the data length in this transfer only.
+        first_buf[4] = @as(u8, @truncate(CONT_DATA));
+        first_buf[5] = @as(u8, @truncate(CONT_DATA >> 8));
+        first_buf[6] = @as(u8, @truncate(CONT_DATA >> 16));
+        first_buf[7] = @as(u8, @truncate(CONT_DATA >> 24));
+        {
+            var xfr: c_int = 0;
+            const r = c.libusb_bulk_transfer(
+                self.usb_handle, EP_OUT,
+                &first_buf, @intCast(CHUNK),
+                &xfr, 2000,
+            );
+            if (r != 0 or xfr != @as(c_int, @intCast(CHUNK))) {
+                log.err("send first chunk failed: r={d} transferred={d}/{d}", .{ r, xfr, CHUNK });
+                return false;
+            }
+        }
+
+        // ── Continuation chunks ────────────────────────────────────────────
+        var cont_buf: [CHUNK]u8 = undefined;
+        var offset: usize = CHUNK;
+        while (offset < data.len) {
+            const data_end = @min(offset + CONT_DATA, data.len);
+            const data_len = data_end - offset;
+
+            // Continuation envelope: [00 00 00 00][data_len: u32 LE]
+            cont_buf[0] = 0x00; cont_buf[1] = 0x00;
+            cont_buf[2] = 0x00; cont_buf[3] = 0x00;
+            cont_buf[4] = @as(u8, @truncate(data_len));
+            cont_buf[5] = @as(u8, @truncate(data_len >> 8));
+            cont_buf[6] = @as(u8, @truncate(data_len >> 16));
+            cont_buf[7] = @as(u8, @truncate(data_len >> 24));
+            @memcpy(cont_buf[CONT_HDR..][0..data_len], data[offset..data_end]);
+
+            const chunk_total = CONT_HDR + data_len;
+            var xfr: c_int = 0;
+            const r = c.libusb_bulk_transfer(
+                self.usb_handle, EP_OUT,
+                &cont_buf, @intCast(chunk_total),
+                &xfr, 2000,
+            );
+            if (r != 0 or xfr != @as(c_int, @intCast(chunk_total))) {
+                log.err("send continuation at offset={d} failed: r={d} transferred={d}/{d}",
+                    .{ offset, r, xfr, chunk_total });
+                return false;
+            }
+            offset = data_end;
         }
         return true;
     }

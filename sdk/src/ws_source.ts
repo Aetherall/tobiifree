@@ -230,9 +230,21 @@ export class WsSource implements Source {
         break;
       }
       case SRV.ERR: {
-        logErr('daemon error', payload.byteLength >= 4
-          ? '0x' + new DataView(payload.buffer, payload.byteOffset, 4).getUint32(0, true).toString(16)
-          : 'unknown');
+        // Payload: cmd_type (u8) + error code (u32 LE) — reject the matching
+        // pending request instead of leaving it to time out.
+        if (payload.byteLength >= 5) {
+          const cmdType = payload[0]!;
+          const code = new DataView(payload.buffer, payload.byteOffset + 1, 4).getUint32(0, true);
+          logErr('daemon error', 'cmd=0x' + cmdType.toString(16), '0x' + code.toString(16));
+          const r = this.pending.get(cmdType);
+          if (r) {
+            this.pending.delete(cmdType);
+            clearTimeout(r.timer);
+            r.reject(new Error(`Daemon cmd 0x${cmdType.toString(16)} failed (code=0x${code.toString(16)})`));
+          }
+        } else {
+          logErr('daemon error', 'malformed error payload', payload.byteLength, 'bytes');
+        }
         break;
       }
     }

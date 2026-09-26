@@ -5,10 +5,10 @@
 ```
 ┌──────────────────────────────────────────────────┐
 │                    Source                         │
-│  subscribeToGaze()   getDisplayArea()             │
-│  setDisplayArea()    calAddPoint()                │
-│  calComputeAndApply()  calRetrieve()              │
-│  calApply()          closeRealm()                 │
+│  subscribeToGaze()      getDisplayArea()          │
+│  setDisplayArea()       setDisplayAreaCorners()   │
+│  startCalibration()     addCalibrationPoint()     │
+│  finishCalibration()    calApply()                │
 │  close()                                          │
 └──────────┬────────────────────┬───────────────────┘
            │                    │
@@ -36,19 +36,23 @@ whether it talks directly to USB or through a daemon.
 **TypeScript:**
 ```ts
 interface Source {
+  readonly displayArea: DisplayArea | null;
   subscribeToGaze(listener: (s: GazeSample) => void): Unsubscribe;
   getDisplayArea(): Promise<DisplayArea>;
   setDisplayArea(rect: DisplayRect): Promise<void>;
   setDisplayAreaCorners(area: DisplayArea): Promise<void>;
-  getCalibrationStimulusPoints(): Promise<Uint8Array>;
-  calAddPoint(x: number, y: number, eyeChoice?: number): Promise<Uint8Array>;
-  calComputeAndApply(): Promise<Uint8Array>;
-  calRetrieve(): Promise<Uint8Array>;
+  startCalibration(): Promise<void>;
+  addCalibrationPoint(x: number, y: number): Promise<void>;
+  finishCalibration(): Promise<Uint8Array>;
   calApply(blob: Uint8Array): Promise<void>;
-  closeRealm(realmId: number): Promise<void>;
   close(): Promise<void>;
 }
 ```
+
+`UsbSource` additionally exposes `calRetrieve()` (re-read the calibration blob
+without recomputing), `subscribeToRawGaze()`, `onFrame()`, and `onParseError()`.
+These are wasm-only extras, not part of the `Source` contract — the daemon
+protocol has no matching commands, so `WsSource` can't implement them.
 
 ### All Source flavors
 
@@ -108,19 +112,14 @@ daemon protocol. This is the framing between daemon clients and tobiifreed:
 
 | Cmd | ID | Payload | Response |
 |---|---|---|---|
-| `subscribe` | 0x01 | — | gaze stream starts |
-| `get_display_area` | 0x02 | — | display_area response |
-| `set_display_area` | 0x03 | 5×f64 (w,h,ox,oy,z) | — |
-| `set_display_area_corners` | 0x04 | 9×f64 (tl,tr,bl) | — |
-| `query_realm` | 0x10 | — | realm info response |
-| `open_realm` | 0x11 | realm_type (u32) | challenge response |
-| `realm_response` | 0x12 | realm_id, field_210, digest | ack response |
-| `close_realm` | 0x13 | realm_id (u32) | ack response |
-| `cal_stimulus` | 0x20 | — | stimulus points response |
-| `cal_add_point` | 0x21 | x (f64), y (f64), eye_choice (u32) | status response |
-| `cal_compute` | 0x22 | — | status response |
-| `cal_retrieve` | 0x23 | — | calibration blob response |
-| `cal_apply` | 0x24 | calibration blob | ack response |
+| `subscribe` | 0x01 | u32 stream mask | gaze stream starts |
+| `get_display_area` | 0x02 | — | display_area response (9×f64 corners) |
+| `set_display_area` | 0x03 | 5×f64 (w,h,ox,oy,z) | ack response |
+| `set_display_area_corners` | 0x04 | 9×f64 (tl,tr,bl) | ack response |
+| `start_calibration` | 0x20 | — | ack response |
+| `add_calibration_point` | 0x21 | 2×f64 (x,y); eye_mask fixed at 3 (both eyes) | ack response |
+| `finish_calibration` | 0x22 | — | calibration blob response |
+| `cal_apply` | 0x23 | calibration blob | ack response |
 | `disconnect` | 0xFF | — | — |
 
 ### Daemon → Client events (`Srv`)
@@ -152,11 +151,10 @@ The daemon owns the USB device and its Tracker. It:
 
 ## Implementation Status
 
-- [x] `UsbSource` — TS (WebUSB + wasm), currently named `Tracker` class
-- [x] `SocketSource` — Zig native (Unix socket, gaze only)
+- [x] `UsbSource` — TS (WebUSB + wasm), implements `Source`
+- [x] `WsSource` — TS (WebSocket client), implements `Source`
+- [x] `Tobii.fromUsb()` / `Tobii.fromDaemon()` return `Source`; `Tobii.createSession()` is a deprecated alias for `fromUsb()`
 - [x] `WsServer` in tobiifreed (gaze + command forwarding)
-- [x] Daemon protocol: command forwarding (display area, calibration, realm)
-- [ ] Refactor TS `Tracker` class → `Source` interface + `UsbSource` impl
-- [ ] `WsSource` — TS (WebSocket client implementing `Source`)
+- [x] Daemon protocol: command forwarding (display area, calibration)
+- [x] `SocketSource` — Zig native (Unix socket, gaze only)
 - [ ] `SocketSource` — full daemon protocol on Zig side (currently gaze only)
-- [ ] `Tobii.createSession()` returns `Source` instead of `Tracker`
