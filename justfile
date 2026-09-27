@@ -130,6 +130,18 @@ tobiifreed-dev:
     done
 
 # -------------------------------------------------------------------
+# Mouse Emulator (tobiifree-mouse)
+# -------------------------------------------------------------------
+
+# Build and run the virtual mouse emulator
+tobiifree-mouse *ARGS:
+    cd applications/tobiifree-mouse && zig build run -- {{ARGS}}
+
+# Build the mouse emulator binary
+build-mouse:
+    cd applications/tobiifree-mouse && zig build -Doptimize=ReleaseSafe
+
+# -------------------------------------------------------------------
 # Try: build + run with 3s timeout, all output to stdout
 # -------------------------------------------------------------------
 

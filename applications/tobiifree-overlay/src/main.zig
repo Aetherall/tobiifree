@@ -55,7 +55,12 @@ fn onGaze(sample: *const core.GazeSample) void {
         gaze_valid = true;
         gaze_valid_count += 1;
         if (gaze_valid_count <= 3 or gaze_valid_count % 100 == 0) {
-            log.info("gaze: x={d:.3} y={d:.3} (sample #{d})", .{ gaze_x, gaze_y, gaze_count });
+            log.info("gaze norm: rx={d:.3} ry={d:.3} | screen px: x={d:.0} y={d:.0} | screen={d:.0}x{d:.0} (sample #{d})", .{ 
+                gaze_x, gaze_y, 
+                gaze_x * screen_w, gaze_y * screen_h,
+                screen_w, screen_h,
+                gaze_count 
+            });
         }
     } else {
         gaze_valid = false;
@@ -92,12 +97,24 @@ fn drawOverlay(_: [*c]c.GtkDrawingArea, cr: ?*c.cairo_t, width: c_int, height: c
     c.cairo_set_source_rgba(cr, 0, 0, 0, 0);
     c.cairo_paint(cr);
 
+    // Debug: Draw a red box at the four extreme corners of the screen
+    // so we know Cairo is mapping (0,0) to TL and (w,h) to BR properly!
+    c.cairo_set_source_rgba(cr, 1.0, 0.0, 0.0, 0.5);
+    c.cairo_rectangle(cr, 0, 0, 20, 20); // Top-Left
+    c.cairo_rectangle(cr, w - 20, 0, 20, 20); // Top-Right
+    c.cairo_rectangle(cr, 0, h - 20, 20, 20); // Bottom-Left
+    c.cairo_rectangle(cr, w - 20, h - 20, 20, 20); // Bottom-Right
+    c.cairo_fill(cr);
+
     // Draw gaze dot.
     c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
     const alpha: f64 = if (gaze_valid) 0.85 else 0.15;
     c.cairo_set_source_rgba(cr, 0.49, 0.98, 0.66, alpha); // #7df9a8
-    const px = gaze_x * w;
+    
+    // Project normalized coordinates to pixels 
+    const px = gaze_x * w; 
     const py = gaze_y * h;
+
     c.cairo_arc(cr, px, py, DOT_RADIUS, 0, 2.0 * std.math.pi);
     c.cairo_fill(cr);
 }
@@ -132,9 +149,14 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 
     c.gtk_window_set_decorated(@ptrCast(window), 0);
 
-    // CSS — unset window background for transparency.
+    // CSS — explicitly force GTK4 window background transparent
     const css = c.gtk_css_provider_new();
-    c.gtk_css_provider_load_from_string(css, "window, headerbar { background: unset; }");
+    c.gtk_css_provider_load_from_string(css, 
+        \\window, window.background, window > contents {
+        \\    background-color: transparent;
+        \\    background: none;
+        \\}
+    );
     c.gtk_style_context_add_provider_for_display(
         c.gdk_display_get_default(),
         @ptrCast(css),
@@ -176,6 +198,9 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
             }
         }
     }
+
+    // Explicitly avoid fullscreen bypass in Mutter by using a floating unmanaged window set to logical fractional dimensions
+    c.gtk_window_set_default_size(@ptrCast(window), @as(c_int, @intFromFloat(screen_w)), @as(c_int, @intFromFloat(screen_h)));
 
     // Single drawing area — all rendering via cairo.
     const da = c.gtk_drawing_area_new();
@@ -426,10 +451,8 @@ pub fn main() void {
             return;
         };
         usb_source.bind();
-        if (usb_source.tracker.display.isReset()) {
-            log.info("device display area looks reset, applying config", .{});
-            _ = usb_source.setDisplayArea(display);
-        }
+        log.info("applying config to device", .{});
+        _ = usb_source.setDisplayArea(display);
         source = usb_source.gazeSource();
         log.info("source: direct USB", .{});
     }

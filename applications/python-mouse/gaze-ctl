@@ -1,0 +1,38 @@
+#!/bin/sh
+# gaze-ctl — send a command to a running gaze_mouse.py instance via its FIFO.
+#
+# Usage:
+#   gaze-ctl <command> [arg]
+#
+# Examples:
+#   gaze-ctl toggle_pause
+#   gaze-ctl toggle_correction_window
+#   gaze-ctl toggle_head_assist
+#   gaze-ctl smoothing 0.3
+#   gaze-ctl head_gain 20.0
+#
+# Bind gaze-ctl calls to global hotkeys in your desktop environment.
+# Unlike running `echo ... > fifo` directly, this script can be invoked
+# as a plain executable — no shell interpretation is needed by the hotkey
+# daemon, so redirection and variable expansion work correctly regardless
+# of the hotkey system used.
+#
+# The FIFO path matches gaze_mouse.py's default: /run/user/<uid>/gaze_mouse.fifo
+# Override with GAZE_MOUSE_FIFO env var or --fifo when starting gaze_mouse.py.
+
+FIFO="${GAZE_MOUSE_FIFO:-/run/user/$(id -u)/gaze_mouse.fifo}"
+
+if [ $# -eq 0 ]; then
+    echo "Usage: gaze-ctl <command> [arg]" >&2
+    echo "Commands: toggle_pause  pause  resume  toggle_correction_window" >&2
+    echo "          toggle_head_assist  calibrate  smoothing <val>  head_gain <val>" >&2
+    exit 1
+fi
+
+if [ ! -p "$FIFO" ]; then
+    echo "gaze-ctl: FIFO not found: $FIFO (is gaze_mouse.py running?)" >&2
+    exit 1
+fi
+
+
+printf '%s\n' "$*" > "$FIFO"
