@@ -7,8 +7,14 @@
 // is approximate — we just stretch the normalized point across the
 // browser viewport.
 
-import { Tobii, UsbSource, type Source, type GazeSample, type DisplayArea, type RawGazeColumn } from 'tobiifree-sdk-ts';
+import {
+  Tobii, UsbSource, TOBII_VID, TOBII_PIDS,
+  type Source, type GazeSample, type DisplayArea, type RawGazeColumn,
+} from 'tobiifree-sdk-ts';
 import { createScene } from './scene';
+
+const isTobiiDevice = (device: Pick<USBDevice, 'vendorId' | 'productId'>): boolean =>
+  device.vendorId === TOBII_VID && TOBII_PIDS.some(pid => pid === device.productId);
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -333,7 +339,7 @@ async function connect() {
       await connectWithWs(wsUrlInput.value.trim() || 'ws://localhost:7081');
     } else {
       const device = await navigator.usb.requestDevice({
-        filters: [{ vendorId: 0x2104, productId: 0x0313 }],
+        filters: TOBII_PIDS.map(productId => ({ vendorId: TOBII_VID, productId })),
       });
       await connectWithDevice(device);
     }
@@ -2217,7 +2223,7 @@ async function tryAutoConnect() {
   if (typeof navigator === 'undefined' || !('usb' in navigator)) return;
   try {
     const devices = await navigator.usb.getDevices();
-    const dev = devices.find(d => d.vendorId === 0x2104 && d.productId === 0x0313);
+    const dev = devices.find(isTobiiDevice);
     if (dev) await connectWithDevice(dev);
   } catch (e) {
     console.warn('auto-connect failed', e);
@@ -2229,14 +2235,14 @@ if (typeof navigator !== 'undefined' && 'usb' in navigator) {
   navigator.usb.addEventListener('connect', (e) => {
     const dev = (e as USBConnectionEvent).device;
     if (tracker || transportSel.value !== 'usb') return;
-    if (dev.vendorId === 0x2104 && dev.productId === 0x0313) {
+    if (isTobiiDevice(dev)) {
       void connectWithDevice(dev);
     }
   });
   navigator.usb.addEventListener('disconnect', (e) => {
     const dev = (e as USBConnectionEvent).device;
     if (!tracker) return;
-    if (dev.vendorId === 0x2104 && dev.productId === 0x0313) {
+    if (isTobiiDevice(dev)) {
       void disconnect();
     }
   });
