@@ -11,7 +11,8 @@ const log = (...args: unknown[]) => console.log('[webusb]', ...args);
 const logErr = (...args: unknown[]) => console.error('[webusb]', ...args);
 
 export const TOBII_VID = 0x2104;
-export const TOBII_PID_RUNTIME = 0x0313;
+export const TOBII_PIDS = [0x0313, 0x031e, 0x0127] as const;
+export const TOBII_PID_RUNTIME = TOBII_PIDS[0];
 const INTERFACE = 0;
 const EP_IN = 3;   // hw 0x83
 const EP_OUT = 5;  // hw 0x05
@@ -30,7 +31,7 @@ export class WebUsbTransport implements Transport {
       throw new Error('WebUSB not available in this environment');
     }
     const device = await navigator.usb.requestDevice({
-      filters: [{ vendorId: TOBII_VID, productId: TOBII_PID_RUNTIME }],
+      filters: TOBII_PIDS.map(productId => ({ vendorId: TOBII_VID, productId })),
     });
     return WebUsbTransport.fromDevice(device);
   }
