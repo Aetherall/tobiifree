@@ -12,6 +12,12 @@ const logErr = (...args: unknown[]) => console.error('[webusb]', ...args);
 
 export const TOBII_VID = 0x2104;
 export const TOBII_PID_RUNTIME = 0x0313;
+/** Tobii Eye Tracker 4C (IS4 platform). Same interface/endpoint layout and TTP protocol as the ET5. */
+export const TOBII_PID_IS4 = 0x0127;
+export const TOBII_PIDS = [TOBII_PID_RUNTIME, TOBII_PID_IS4];
+export const TOBII_USB_FILTERS: USBDeviceFilter[] = TOBII_PIDS.map((productId) => ({ vendorId: TOBII_VID, productId }));
+export const isTobiiTracker = (d: { vendorId: number; productId: number }): boolean =>
+  d.vendorId === TOBII_VID && TOBII_PIDS.includes(d.productId);
 const INTERFACE = 0;
 const EP_IN = 3;   // hw 0x83
 const EP_OUT = 5;  // hw 0x05
@@ -30,7 +36,7 @@ export class WebUsbTransport implements Transport {
       throw new Error('WebUSB not available in this environment');
     }
     const device = await navigator.usb.requestDevice({
-      filters: [{ vendorId: TOBII_VID, productId: TOBII_PID_RUNTIME }],
+      filters: TOBII_USB_FILTERS,
     });
     return WebUsbTransport.fromDevice(device);
   }

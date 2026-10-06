@@ -333,7 +333,7 @@ async function connect() {
       await connectWithWs(wsUrlInput.value.trim() || 'ws://localhost:7081');
     } else {
       const device = await navigator.usb.requestDevice({
-        filters: [{ vendorId: 0x2104, productId: 0x0313 }],
+        filters: [{ vendorId: 0x2104, productId: 0x0313 }, { vendorId: 0x2104, productId: 0x0127 }],
       });
       await connectWithDevice(device);
     }
@@ -2209,7 +2209,11 @@ document.addEventListener('fullscreenchange', () => {
 
 connectBtn.onclick = connect;
 
-// Auto-connect if the user has previously authorised an ET5. Browsers
+// ET5 (0x0313) and Tobii 4C / IS4 (0x0127) speak the same protocol.
+const isTobiiDevice = (d: USBDevice) =>
+  d.vendorId === 0x2104 && (d.productId === 0x0313 || d.productId === 0x0127);
+
+// Auto-connect if the user has previously authorised an ET5 or 4C. Browsers
 // persist the grant across reloads, and `getDevices()` returns it
 // without requiring a user gesture (unlike `requestDevice()`).
 async function tryAutoConnect() {
@@ -2217,7 +2221,7 @@ async function tryAutoConnect() {
   if (typeof navigator === 'undefined' || !('usb' in navigator)) return;
   try {
     const devices = await navigator.usb.getDevices();
-    const dev = devices.find(d => d.vendorId === 0x2104 && d.productId === 0x0313);
+    const dev = devices.find(isTobiiDevice);
     if (dev) await connectWithDevice(dev);
   } catch (e) {
     console.warn('auto-connect failed', e);
@@ -2229,14 +2233,14 @@ if (typeof navigator !== 'undefined' && 'usb' in navigator) {
   navigator.usb.addEventListener('connect', (e) => {
     const dev = (e as USBConnectionEvent).device;
     if (tracker || transportSel.value !== 'usb') return;
-    if (dev.vendorId === 0x2104 && dev.productId === 0x0313) {
+    if (isTobiiDevice(dev)) {
       void connectWithDevice(dev);
     }
   });
   navigator.usb.addEventListener('disconnect', (e) => {
     const dev = (e as USBConnectionEvent).device;
     if (!tracker) return;
-    if (dev.vendorId === 0x2104 && dev.productId === 0x0313) {
+    if (isTobiiDevice(dev)) {
       void disconnect();
     }
   });

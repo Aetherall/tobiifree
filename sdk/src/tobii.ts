@@ -5,7 +5,7 @@
 
 import { UsbSource, type UsbSourceOptions } from './usb_source';
 import { WsSource } from './ws_source';
-import { WebUsbTransport, TOBII_VID, TOBII_PID_RUNTIME } from './webusb';
+import { WebUsbTransport, TOBII_USB_FILTERS, isTobiiTracker } from './webusb';
 import { wasmBytes } from './wasm-bundle';
 import type { Source } from './source';
 
@@ -24,7 +24,7 @@ export type DaemonOptions = {
 async function pickDevice(): Promise<USBDevice> {
   if (typeof navigator !== 'undefined' && 'usb' in navigator) {
     return navigator.usb.requestDevice({
-      filters: [{ vendorId: TOBII_VID, productId: TOBII_PID_RUNTIME }],
+      filters: TOBII_USB_FILTERS,
     });
   }
   const usbModName = 'usb';
@@ -37,11 +37,9 @@ async function pickDevice(): Promise<USBDevice> {
   const WebUSB = (mod as { WebUSB: new (opts: { allowAllDevices: boolean }) => { getDevices(): Promise<USBDevice[]> } }).WebUSB;
   const webusb = new WebUSB({ allowAllDevices: true });
   const devices = await webusb.getDevices();
-  const device = devices.find(
-    (d) => d.vendorId === TOBII_VID && d.productId === TOBII_PID_RUNTIME,
-  );
+  const device = devices.find(isTobiiTracker);
   if (!device) {
-    throw new Error(`ET5 not found (vid=0x${TOBII_VID.toString(16)} pid=0x${TOBII_PID_RUNTIME.toString(16)})`);
+    throw new Error('Tobii tracker not found (vid=0x2104 pid=0x0313 ET5 / 0x0127 4C)');
   }
   return device;
 }

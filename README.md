@@ -66,6 +66,7 @@ nix build .#tobiifree-demo     # static SPA (deployable to any web server)
 |--------|---------|--------|
 | Tobii Eye Tracker 5 (runtime) | `2104:0313` | Working — gaze, calibration, display area |
 | Tobii Eye Tracker 5 (bootloader) | `2104:0102` | DFU flash only |
+| Tobii Eye Tracker 4C (IS4) | `2104:0127` | Working over WebUSB — live gaze (same TTP protocol as the ET5) |
 
 ## License
 

@@ -3,7 +3,7 @@
 //
 // Requires `usb` (npm: usb) as a peer dependency. The caller installs it.
 
-import { WebUsbTransport, TOBII_VID, TOBII_PID_RUNTIME } from './webusb';
+import { WebUsbTransport, isTobiiTracker } from './webusb';
 
 /**
  * Open the first connected ET5 via the node-usb WebUSB polyfill.
@@ -20,10 +20,8 @@ export async function openNodeTracker(): Promise<WebUsbTransport> {
   const mod = (await import(/* @vite-ignore */ usbModName)) as UsbMod;
   const webusb = new mod.WebUSB({ allowAllDevices: true });
   const devices = await webusb.getDevices();
-  const device = devices.find(
-    (d: USBDevice) => d.vendorId === TOBII_VID && d.productId === TOBII_PID_RUNTIME,
-  );
-  if (!device) throw new Error('ET5 not found (vid=0x2104 pid=0x0313)');
+  const device = devices.find(isTobiiTracker);
+  if (!device) throw new Error('Tobii tracker not found (vid=0x2104 pid=0x0313 ET5 / 0x0127 4C)');
   return WebUsbTransport.fromDevice(device);
 }
 
