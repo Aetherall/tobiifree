@@ -69,7 +69,7 @@ export class GUsbTransport implements Transport {
       device = ctx.find_by_vid_pid(TOBII_VID, pid);
       if (device) break;
     }
-    if (!device) throw new Error('ET5 not found (vid=0x2104)');
+    if (!device) throw new Error('No supported tracker found (vid=0x2104)');
 
     device.open();
     device.claim_interface(INTERFACE, gusb.DeviceClaimInterfaceFlags.NONE);
