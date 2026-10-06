@@ -16,7 +16,7 @@ pub const LibusbTransport = struct {
     usb_handle: ?*c.libusb_device_handle,
 
     const VID: u16 = 0x2104;
-    const PID: u16 = 0x0313;
+    const PIDS = [_]u16{ 0x0313, 0x031e, 0x0127 };
     const EP_IN: u8 = 0x83;
     const EP_OUT: u8 = 0x05;
 
@@ -38,13 +38,23 @@ pub const LibusbTransport = struct {
             return error.LibusbInit;
         }
 
-        self.usb_handle = c.libusb_open_device_with_vid_pid(self.usb_ctx, VID, PID);
+        var opened_pid: u16 = 0;
+        for (PIDS) |pid| {
+            self.usb_handle = c.libusb_open_device_with_vid_pid(self.usb_ctx, VID, pid);
+            if (self.usb_handle != null) {
+                opened_pid = pid;
+                break;
+            }
+        }
         if (self.usb_handle == null) {
-            log.err("device {x:0>4}:{x:0>4} not found", .{ VID, PID });
+            log.err("no supported tracker PID found for VID {x:0>4}", .{VID});
+            for (PIDS) |pid| {
+                log.err("supported PID: {x:0>4}", .{pid});
+            }
             c.libusb_exit(self.usb_ctx);
             return error.DeviceNotFound;
         }
-        log.info("opened device {x:0>4}:{x:0>4}", .{ VID, PID });
+        log.info("opened device {x:0>4}:{x:0>4}", .{ VID, opened_pid });
 
         if (c.libusb_kernel_driver_active(self.usb_handle, 0) == 1) {
             log.debug("detaching kernel driver", .{});

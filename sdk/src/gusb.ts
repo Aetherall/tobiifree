@@ -40,7 +40,8 @@ interface GUsbModule {
 }
 
 export const TOBII_VID = 0x2104;
-export const TOBII_PID_RUNTIME = 0x0313;
+export const TOBII_PIDS = [0x0313, 0x031e, 0x0127] as const;
+export const TOBII_PID_RUNTIME = TOBII_PIDS[0];
 const INTERFACE = 0;
 const EP_IN = 0x83;   // endpoint 3, IN direction
 const EP_OUT = 0x05;  // endpoint 5, OUT direction
@@ -57,14 +58,18 @@ export class GUsbTransport implements Transport {
   }
 
   /**
-   * Open the first connected ET5 via GUsb.
+   * Open the first connected supported tracker via GUsb.
    * @param gusb The GUsb module, imported as `import GUsb from 'gi://GUsb'` in GJS.
    */
   static async open(gusb: GUsbModule): Promise<GUsbTransport> {
     const ctx = new gusb.Context();
     ctx.enumerate();
-    const device = ctx.find_by_vid_pid(TOBII_VID, TOBII_PID_RUNTIME);
-    if (!device) throw new Error('ET5 not found (vid=0x2104 pid=0x0313)');
+    let device: GUsbDevice | null = null;
+    for (const pid of TOBII_PIDS) {
+      device = ctx.find_by_vid_pid(TOBII_VID, pid);
+      if (device) break;
+    }
+    if (!device) throw new Error('No supported tracker found (vid=0x2104)');
 
     device.open();
     device.claim_interface(INTERFACE, gusb.DeviceClaimInterfaceFlags.NONE);
