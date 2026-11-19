@@ -126,6 +126,9 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_layer_set_anchor(@ptrCast(window), c.GTK_LAYER_SHELL_EDGE_LEFT, 1);
     c.gtk_layer_set_anchor(@ptrCast(window), c.GTK_LAYER_SHELL_EDGE_RIGHT, 1);
     c.gtk_layer_set_keyboard_mode(@ptrCast(window), c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    // Cover bars too: the gaze is normalized to the whole output, so the surface must be
+    // the whole output (otherwise a top bar shifts and squeezes every dot downward).
+    c.gtk_layer_set_exclusive_zone(@ptrCast(window), -1);
     c.gtk_layer_set_namespace(@ptrCast(window), "tobiifree-overlay");
 
     _ = c.g_signal_connect_data(@ptrCast(window), "realize", @ptrCast(&onRealize), null, null, 0);
