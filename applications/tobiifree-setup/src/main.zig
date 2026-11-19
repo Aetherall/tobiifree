@@ -27,6 +27,7 @@ const SocketSource = @import("socket_source").SocketSource;
 const Reply = @import("socket_source").Reply;
 const geo = @import("geometry.zig");
 const config = @import("config.zig");
+const fixation = @import("fixation.zig");
 
 const c = @cImport({
     @cInclude("gtk/gtk.h");
@@ -62,6 +63,50 @@ const Only = enum { all, display, calibrate, validate };
 var opt_output: ?[]const u8 = null;
 var opt_gap: f64 = geo.DEFAULT_GAP_MM;
 var opt_only: Only = .all;
+
+// ─── Gaze-contingent dots (tune here) ───────────────────────────────
+//
+// A fixation is FIX_WINDOW_S of valid gaze whose dispersion (x range +
+// y range on the screen) stays under FIX_DISPERSION_DEG, newest sample not
+// older than FIX_MAX_AGE_S. Angles are converted to mm with the current eye
+// distance (eye_origin z).
+
+const FIX_WINDOW_S = 0.3;
+const FIX_DISPERSION_DEG = 1.0;
+const FIX_MAX_AGE_S = 0.15;
+/// No valid gaze for this long: "eyes not found" hint.
+const GAZE_LOST_S = 1.0;
+
+/// Calibration: the dot waits (pulsing) for a fixation this close to it.
+/// Generous: the uncalibrated gaze can be 5–10° off.
+const CAL_RADIUS_DEG = 8.0;
+/// No fixation near the dot after this long: any stable fixation counts
+/// (the error is then larger than CAL_RADIUS_DEG, which the calibration is
+/// there to fix) and a "look at the centre of the dot" hint is shown.
+const CAL_FALLBACK_S = 5.0;
+/// The dot shrinks over this time while the fixation holds, then add_point.
+const CAL_SHRINK_S = 0.7;
+/// When the fixation breaks the dot grows back this many times faster.
+const CAL_GROW_FACTOR = 2.0;
+
+/// Validation: fixation this close to the dot (larger than any realistic
+/// error after a calibration: the error is what we measure).
+const VAL_RADIUS_DEG = 5.0;
+/// No fixation near the dot after this long: measure on any stable fixation
+/// (the dot is then flagged, its error is > VAL_RADIUS_DEG or doubtful).
+const VAL_FALLBACK_S = 5.0;
+/// Seconds of fixation samples collected per dot.
+const VAL_COLLECT_S = 1.0;
+/// Give up a dot after this long; it keeps what was collected if at least
+/// VAL_MIN_COLLECT_S, else "no fixation".
+const VAL_TIMEOUT_S = 12.0;
+const VAL_MIN_COLLECT_S = 0.3;
+
+/// Waiting dots pulse between these radii (px × ui), shrink to DOT_SMALL.
+const DOT_BIG = 28.0;
+const DOT_PULSE = 4.0;
+const DOT_SMALL = 9.0;
+const PULSE_PERIOD_S = 1.2;
 
 // ─── Colours ────────────────────────────────────────────────────────
 
@@ -101,6 +146,9 @@ var daemon_lost: bool = false;
 var gaze: core.GazeSample = std.mem.zeroes(core.GazeSample);
 var gaze_time_us: i64 = 0;
 var gaze_count: u64 = 0;
+var gaze_last_valid_us: i64 = 0;
+var fix_det: fixation.Detector = .{};
+var eye_z_mm: f64 = 650; // latest eye distance (eye_origin z)
 
 const Step = enum { display, position, calibrate, validate };
 var step: Step = .display;
@@ -487,11 +535,10 @@ const CAL_POINTS = [6][2]f64{
     .{ 0.1, 0.1 }, .{ 0.9, 0.1 }, .{ 0.5, 0.9 },
     .{ 0.1, 0.9 }, .{ 0.9, 0.9 }, .{ 0.5, 0.1 },
 };
-const SHRINK_S = 1.0;
 const INTRO_S = 2.0;
 const BETWEEN_S = 0.8;
 
-const CalPhase = enum { starting, intro, shrinking, adding, between, finishing, cancelling, restoring, failed, done };
+const CalPhase = enum { starting, intro, gazing, adding, between, finishing, cancelling, restoring, failed, done };
 var cal_phase: CalPhase = .done;
 var cal_idx: usize = 0;
 var cal_t0: i64 = 0;
@@ -501,6 +548,26 @@ var cal_fail_buf: [160]u8 = undefined;
 var cal_fail: []const u8 = "";
 var cal_blob: ?[]u8 = null;
 var cal_retries: u32 = 0; // of the current dot
+// Gaze gating of the current dot.
+var cal_progress: f64 = 0; // 0 = big (waiting), 1 = shrunk -> add_point
+var cal_dot_t0: i64 = 0; // dot shown
+var cal_fix_t: i64 = 0; // first qualifying fixation (0: none yet)
+var cal_fix_offset: f64 = 0; // its distance to the dot (deg)
+var cal_holding = false;
+var cal_breaks: u32 = 0; // fixation lost while shrinking
+var cal_fallback = false;
+var cal_last_tick: i64 = 0;
+
+fn startDot() void {
+    cal_phase = .gazing;
+    cal_progress = 0;
+    cal_dot_t0 = now();
+    cal_last_tick = cal_dot_t0;
+    cal_fix_t = 0;
+    cal_holding = false;
+    cal_breaks = 0;
+    cal_fallback = false;
+}
 /// The device refuses a point when it has no usable gaze for it (eyes lost,
 /// blink, looking away: status 0x20000502). Re-show the dot this many times.
 const MAX_POINT_RETRIES = 2;
@@ -537,7 +604,12 @@ fn onCalStarted(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
 
 fn sendPoint() void {
     const pt = CAL_POINTS[cal_idx];
+    const fix_after = @as(f64, @floatFromInt(cal_fix_t - cal_dot_t0)) / 1e6;
+    const shrink = @as(f64, @floatFromInt(now() - cal_fix_t)) / 1e6;
+    const fb: []const u8 = if (cal_fallback) " (fallback: any stable fixation)" else "";
+    log.info("calibration: dot {d} ({d:.1},{d:.1}): fixation after {d:.2}s at {d:.1} deg{s}, shrink {d:.2}s, {d} break(s)", .{ cal_idx, pt[0], pt[1], fix_after, cal_fix_offset, fb, shrink, cal_breaks });
     cal_phase = .adding;
+    cal_t0 = now();
     src.addCalibrationPoint(pt[0], pt[1], onPointAdded, null) catch |err| {
         calFailed(true, "Could not send add_calibration_point: {}", .{err});
         return;
@@ -547,7 +619,7 @@ fn sendPoint() void {
 fn onPointAdded(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
     switch (reply) {
         .ok => {
-            log.info("calibration: point {d} ({d:.1},{d:.1}) added in {d:.2}s", .{ cal_idx, CAL_POINTS[cal_idx][0], CAL_POINTS[cal_idx][1], secsSince(cal_t0) - SHRINK_S });
+            log.info("calibration: point {d} ({d:.1},{d:.1}) added in {d:.2}s", .{ cal_idx, CAL_POINTS[cal_idx][0], CAL_POINTS[cal_idx][1], secsSince(cal_t0) });
             if (cal_cancel_req) return restorePrevious(true);
             cal_idx += 1;
             cal_retries = 0;
@@ -561,17 +633,14 @@ fn onPointAdded(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
                 log.info("calibration: finish", .{});
             } else if (cal_idx == 3) {
                 cal_phase = .between;
-            } else {
-                cal_phase = .shrinking;
-            }
+            } else startDot();
         },
         .err => |e| {
             if (cal_cancel_req) return restorePrevious(true);
             if (e >= 0x100 and cal_retries < MAX_POINT_RETRIES) {
                 cal_retries += 1;
                 log.warn("calibration: dot {d} refused by the device (0x{x}), showing it again ({d}/{d})", .{ cal_idx, e, cal_retries, MAX_POINT_RETRIES });
-                cal_phase = .shrinking;
-                cal_t0 = now();
+                startDot();
             } else calFailed(true, "The tracker could not use dot {d} ({s}): were your eyes visible?", .{ cal_idx + 1, errName(e) });
         },
     }
@@ -668,7 +737,7 @@ fn calibrationPath(buf: []u8) ?[]const u8 {
 
 fn escCalibrate() void {
     switch (cal_phase) {
-        .intro, .shrinking, .between => restorePrevious(true),
+        .intro, .gazing, .between => restorePrevious(true),
         .starting, .adding, .finishing => {
             cal_cancel_req = true;
             cal_quit_after = true;
@@ -680,17 +749,41 @@ fn escCalibrate() void {
 
 fn tickCalibrate() void {
     switch (cal_phase) {
-        .intro => if (secsSince(cal_t0) >= INTRO_S) {
-            cal_phase = .shrinking;
-            cal_t0 = now();
-        },
-        .between => if (secsSince(cal_t0) >= BETWEEN_S) {
-            cal_phase = .shrinking;
-            cal_t0 = now();
-        },
-        .shrinking => if (secsSince(cal_t0) >= SHRINK_S) sendPoint(),
+        .intro => if (secsSince(cal_t0) >= INTRO_S) startDot(),
+        .between => if (secsSince(cal_t0) >= BETWEEN_S) startDot(),
+        .gazing => tickDot(),
         else => {},
     }
+}
+
+/// Gate the current dot on the gaze: shrink while the person fixates near
+/// it, grow back when the fixation breaks, add_point once shrunk.
+fn tickDot() void {
+    const t = now();
+    const dt = @as(f64, @floatFromInt(t - cal_last_tick)) / 1e6;
+    cal_last_tick = t;
+    if (!cal_fallback and cal_fix_t == 0 and secsSince(cal_dot_t0) >= CAL_FALLBACK_S) {
+        cal_fallback = true;
+        log.warn("calibration: dot {d}: no fixation within {d:.0} deg after {d:.0}s, accepting any stable fixation", .{ cal_idx, CAL_RADIUS_DEG, CAL_FALLBACK_S });
+    }
+    const pt = CAL_POINTS[cal_idx];
+    var ok = false;
+    if (currentFixation()) |f| {
+        const off = fixOffsetDeg(f, pt[0], pt[1]);
+        ok = cal_fallback or off <= CAL_RADIUS_DEG;
+        if (ok and cal_fix_t == 0) {
+            cal_fix_t = t;
+            cal_fix_offset = off;
+        }
+    }
+    if (ok) {
+        cal_progress += dt / CAL_SHRINK_S;
+    } else {
+        if (cal_holding) cal_breaks += 1;
+        cal_progress = @max(0, cal_progress - dt * CAL_GROW_FACTOR / CAL_SHRINK_S);
+    }
+    cal_holding = ok;
+    if (cal_progress >= 1) sendPoint();
 }
 
 fn drawTarget(cr: *c.cairo_t, x: f64, y: f64, r: f64, col: Rgb) void {
@@ -704,23 +797,28 @@ fn drawTarget(cr: *c.cairo_t, x: f64, y: f64, r: f64, col: Rgb) void {
 
 fn drawCalibrate(cr: *c.cairo_t, w: f64, h: f64) void {
     switch (cal_phase) {
-        .intro, .shrinking, .adding, .between, .starting => {
+        .intro, .gazing, .adding, .between, .starting => {
             const screen_b = cal_idx >= 3;
             const first: usize = if (screen_b) 3 else 0;
             if (cal_phase == .intro or cal_phase == .starting) {
                 _ = text(cr, w / 2, h * 0.45, 28, .center, FG, "Look at each dot until it disappears", .{});
                 _ = text(cr, w / 2, h * 0.45 + 44 * ui, 18, .center, DIM, "Keep your head still · ESC cancels and keeps the previous calibration", .{});
-            } else if (cal_retries > 0) {
-                _ = text(cr, w / 2, h * 0.45, 22, .center, DIM, "Keep looking at the dot", .{});
+            } else if (cal_phase == .gazing) {
+                drawDotHint(cr, w, h, cal_fallback or cal_retries > 0);
             }
             for (first..first + 3) |i| {
                 const pt = CAL_POINTS[i];
                 const x = pt[0] * w;
                 const y = pt[1] * h;
                 if (i < cal_idx) continue; // done
-                if (i == cal_idx and (cal_phase == .shrinking or cal_phase == .adding)) {
-                    const t = if (cal_phase == .adding) 1.0 else std.math.clamp(secsSince(cal_t0) / SHRINK_S, 0, 1);
-                    drawTarget(cr, x, y, (28 - 18 * t) * ui, ACC);
+                if (i == cal_idx and (cal_phase == .gazing or cal_phase == .adding)) {
+                    const r = if (cal_phase == .adding)
+                        DOT_SMALL
+                    else if (cal_progress <= 0)
+                        pulseRadius()
+                    else
+                        DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(cal_progress, 0, 1);
+                    drawTarget(cr, x, y, r * ui, ACC);
                 } else {
                     drawTarget(cr, x, y, 8 * ui, ACC_DIM);
                 }
@@ -749,20 +847,31 @@ const VAL_POINTS = blk: {
     }
     break :blk pts;
 };
-const VAL_SETTLE_S = 0.9;
-const VAL_COLLECT_S = 1.2;
-
-const ValPhase = enum { waiting_area, intro, settle, collect, results };
+const ValPhase = enum { intro, dot, results };
 var val_phase: ValPhase = .intro;
 var val_idx: usize = 0;
 var val_t0: i64 = 0;
 var val_results: [9]?geo.PointError = .{null} ** 9;
 var val_sum: struct { gx: f64 = 0, gy: f64 = 0, n: u32 = 0, z: f64 = 0, zn: u32 = 0 } = .{};
+var val_fallback: [9]bool = .{false} ** 9; // measured on a fixation away from the dot
+var val_collected_s: f64 = 0;
+var val_last_acc: i64 = 0; // last accepted sample
+var val_fix_t: i64 = 0; // first accepted sample of the dot
+
+fn startValDot() void {
+    val_phase = .dot;
+    val_t0 = now();
+    val_sum = .{};
+    val_collected_s = 0;
+    val_last_acc = 0;
+    val_fix_t = 0;
+}
 var val_live = false;
 
 fn enterValidate() void {
     val_idx = 0;
     val_results = .{null} ** 9;
+    val_fallback = .{false} ** 9;
     val_t0 = now();
     val_phase = .intro;
     setCursorHidden(true);
@@ -770,11 +879,21 @@ fn enterValidate() void {
     src.getDisplayArea(onAreaGot, null) catch {};
 }
 
+/// Collect the sample if it belongs to a fixation on the dot (or anywhere
+/// once in fallback). Called after the sample went into the detector.
 fn valAccumulate(s: *const core.GazeSample) void {
-    if (step != .validate or val_phase != .collect) return;
+    if (step != .validate or val_phase != .dot) return;
+    if (val_collected_s >= VAL_COLLECT_S) return;
     const l = eyeValid(s.validity_L);
     const r = eyeValid(s.validity_R);
     if (!l and !r) return;
+    const f = currentFixation() orelse return;
+    const t = VAL_POINTS[val_idx];
+    if (!val_fallback[val_idx] and fixOffsetDeg(f, t[0], t[1]) > VAL_RADIUS_DEG) return;
+    const tn = now();
+    if (val_fix_t == 0) val_fix_t = tn;
+    if (val_last_acc != 0 and tn - val_last_acc < 100_000) val_collected_s += @as(f64, @floatFromInt(tn - val_last_acc)) / 1e6;
+    val_last_acc = tn;
     val_sum.gx += s.gaze_point_2d_norm[0];
     val_sum.gy += s.gaze_point_2d_norm[1];
     val_sum.n += 1;
@@ -790,24 +909,28 @@ fn valAccumulate(s: *const core.GazeSample) void {
 
 fn tickValidate() void {
     switch (val_phase) {
-        .intro => if (secsSince(val_t0) >= INTRO_S) {
-            val_phase = .settle;
-            val_t0 = now();
-        },
-        .settle => if (secsSince(val_t0) >= VAL_SETTLE_S) {
-            val_phase = .collect;
-            val_sum = .{};
-            val_t0 = now();
-        },
-        .collect => if (secsSince(val_t0) >= VAL_COLLECT_S) {
+        .intro => if (secsSince(val_t0) >= INTRO_S) startValDot(),
+        .dot => {
+            const el = secsSince(val_t0);
+            if (!val_fallback[val_idx] and val_fix_t == 0 and el >= VAL_FALLBACK_S) {
+                val_fallback[val_idx] = true;
+                log.warn("validation dot {d}: no fixation within {d:.0} deg after {d:.0}s, measuring on any stable fixation", .{ val_idx, VAL_RADIUS_DEG, VAL_FALLBACK_S });
+            }
+            if (val_collected_s < VAL_COLLECT_S and el < VAL_TIMEOUT_S) return;
             const t = VAL_POINTS[val_idx];
-            if (val_sum.n > 0 and val_sum.zn > 0 and device_area != null) {
+            const enough = val_collected_s >= VAL_MIN_COLLECT_S;
+            if (val_fix_t != 0) {
+                const fix_after = @as(f64, @floatFromInt(val_fix_t - val_t0)) / 1e6;
+                const fb: []const u8 = if (val_fallback[val_idx]) ", fallback (not near the dot)" else "";
+                log.info("validation dot {d}: fixation after {d:.2}s, {d:.2}s of fixation ({d} samples) in {d:.2}s{s}", .{ val_idx, fix_after, val_collected_s, val_sum.n, el, fb });
+            }
+            if (enough and val_sum.n > 0 and val_sum.zn > 0 and device_area != null) {
                 const n: f64 = @floatFromInt(val_sum.n);
                 const e = geo.pointError(t[0], t[1], val_sum.gx / n, val_sum.gy / n, val_sum.z / @as(f64, @floatFromInt(val_sum.zn)), device_area.?, val_sum.n);
                 val_results[val_idx] = e;
                 log.info("validation dot {d} ({d:.1},{d:.1}): {d:.2} deg, {d:.1} mm (dx {d:.1} dy {d:.1}), eye z {d:.0} mm, {d} samples", .{ val_idx, t[0], t[1], e.err_deg, e.err_mm, e.dx_mm, e.dy_mm, e.eye_z_mm, e.samples });
             } else {
-                log.warn("validation dot {d}: no valid gaze", .{val_idx});
+                log.warn("validation dot {d}: no fixation ({d:.2}s collected in {d:.1}s)", .{ val_idx, val_collected_s, el });
             }
             val_idx += 1;
             val_t0 = now();
@@ -816,7 +939,7 @@ fn tickValidate() void {
                 setCursorHidden(false);
                 const s = geo.summarize(&val_results);
                 log.info("validation: {d}/9 dots, mean {d:.2} deg ({d:.1} mm), max {d:.2} deg ({d:.1} mm), eye distance {d:.0} mm", .{ s.n, s.mean_deg, s.mean_mm, s.max_deg, s.max_mm, s.mean_eye_z_mm });
-            } else val_phase = .settle;
+            } else startValDot();
         },
         else => {},
     }
@@ -835,15 +958,19 @@ fn keyValidate(keyval: c_uint) void {
 
 fn drawValidate(cr: *c.cairo_t, w: f64, h: f64) void {
     switch (val_phase) {
-        .waiting_area, .intro => {
-            _ = text(cr, w / 2, h * 0.45, 28, .center, FG, "Validation: look at each dot until it moves on", .{});
+        .intro => {
+            _ = text(cr, w / 2, h * 0.45, 28, .center, FG, "Validation: look at each dot until it shrinks away", .{});
             _ = text(cr, w / 2, h * 0.45 + 44 * ui, 18, .center, DIM, "ESC quits (the calibration is already saved)", .{});
             const t = VAL_POINTS[0];
             drawTarget(cr, t[0] * w, t[1] * h, 8 * ui, ACC_DIM);
         },
-        .settle, .collect => {
+        .dot => {
             const t = VAL_POINTS[val_idx];
-            const r = if (val_phase == .settle) (28 - 18 * std.math.clamp(secsSince(val_t0) / VAL_SETTLE_S, 0, 1)) else 10;
+            const r = if (val_collected_s <= 0)
+                pulseRadius()
+            else
+                DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(val_collected_s / VAL_COLLECT_S, 0, 1);
+            drawDotHint(cr, w, h, val_fallback[val_idx]);
             drawTarget(cr, t[0] * w, t[1] * h, r * ui, ACC);
         },
         .results => drawResults(cr, w, h),
@@ -855,7 +982,8 @@ fn qualityColour(deg: f64) Rgb {
 }
 
 fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
-    for (VAL_POINTS, val_results) |t, r| {
+    var any_fallback = false;
+    for (VAL_POINTS, val_results, val_fallback) |t, r, fb| {
         const tx = t[0] * w;
         const ty = t[1] * h;
         c.cairo_set_line_width(cr, 2 * ui);
@@ -876,9 +1004,10 @@ fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
             c.cairo_arc(cr, gx, gy, 5 * ui, 0, 2 * std.math.pi);
             c.cairo_fill(cr);
             const below = t[1] < 0.5;
-            _ = text(cr, tx, ty + @as(f64, if (below) 22 else -48) * ui, 18, .center, col, "{d:.2}° · {d:.1} mm", .{ e.err_deg, e.err_mm });
+            _ = text(cr, tx, ty + @as(f64, if (below) 22 else -48) * ui, 18, .center, col, "{d:.2}° · {d:.1} mm{s}", .{ e.err_deg, e.err_mm, if (fb) " *" else "" });
+            any_fallback = any_fallback or fb;
         } else {
-            _ = text(cr, tx, ty + 22 * ui, 18, .center, WARN, "no gaze", .{});
+            _ = text(cr, tx, ty + 22 * ui, 18, .center, WARN, "no fixation", .{});
         }
     }
 
@@ -891,6 +1020,7 @@ fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
     } else {
         y += text(cr, w / 2, y, 26, .center, qualityColour(s.mean_deg), "mean error {d:.2}° ({d:.1} mm) · max {d:.2}° ({d:.1} mm)", .{ s.mean_deg, s.mean_mm, s.max_deg, s.max_mm });
         y += text(cr, w / 2, y, 18, .center, DIM, "{d}/9 dots · eyes at {d:.0} cm · below 1° is good, above 2° redo the calibration", .{ s.n, s.mean_eye_z_mm / 10 });
+        if (any_fallback) y += text(cr, w / 2, y, 18, .center, ACC, "* no fixation within {d:.0}° of the dot: measured on the fixation found, the error may be larger", .{VAL_RADIUS_DEG});
     }
     y += 16 * ui;
     _ = text(cr, w / 2, y, 20, .center, FG, "R redo calibration · V validate again · G live gaze {s} · ENTER done", .{if (val_live) "off" else "on"});
@@ -1019,10 +1149,62 @@ fn onDragEnd(_: ?*c.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c)
 // ─── Main loop hooks ────────────────────────────────────────────────
 
 fn onGaze(s: *const core.GazeSample) void {
+    const t = now();
     gaze = s.*;
-    gaze_time_us = now();
+    gaze_time_us = t;
     gaze_count += 1;
+    const l = eyeValid(s.validity_L);
+    const r = eyeValid(s.validity_R);
+    if (l or r) {
+        var z: f64 = 0;
+        if (l) z += s.eye_origin_L_mm[2];
+        if (r) z += s.eye_origin_R_mm[2];
+        z /= @as(f64, if (l and r) 2 else 1);
+        if (z > 100) eye_z_mm = z;
+        const mm = screenSizeMm();
+        fix_det.add(t, s.gaze_point_2d_norm[0] * mm[0], s.gaze_point_2d_norm[1] * mm[1]);
+        gaze_last_valid_us = t;
+    } else fix_det.reset();
     valAccumulate(s);
+}
+
+/// Screen size in mm: the device area, else the monitor's EDID size.
+fn screenSizeMm() [2]f64 {
+    if (device_area) |a| return geo.areaSize(a);
+    if (mon_mm[0] > 0 and mon_mm[1] > 0) return .{ @floatFromInt(mon_mm[0]), @floatFromInt(mon_mm[1]) };
+    return .{ @as(f64, @floatFromInt(width_px)) * 0.27, @as(f64, @floatFromInt(height_px)) * 0.27 };
+}
+
+fn usFromS(s: f64) i64 {
+    return @intFromFloat(s * 1e6);
+}
+
+fn currentFixation() ?fixation.Fixation {
+    return fix_det.fixation(now(), usFromS(FIX_WINDOW_S), fixation.degToMm(FIX_DISPERSION_DEG, eye_z_mm), usFromS(FIX_MAX_AGE_S));
+}
+
+/// Angle (deg) between a fixation and a target (normalised coords).
+fn fixOffsetDeg(f: fixation.Fixation, tx: f64, ty: f64) f64 {
+    const mm = screenSizeMm();
+    return fixation.mmToDeg(std.math.hypot(f.x - tx * mm[0], f.y - ty * mm[1]), eye_z_mm);
+}
+
+fn gazeLost() bool {
+    return gaze_last_valid_us == 0 or now() - gaze_last_valid_us > usFromS(GAZE_LOST_S);
+}
+
+fn pulseRadius() f64 {
+    const ph = @as(f64, @floatFromInt(@mod(now(), usFromS(PULSE_PERIOD_S)))) / 1e6 / PULSE_PERIOD_S;
+    return DOT_BIG + DOT_PULSE * @sin(2 * std.math.pi * ph);
+}
+
+/// Hint under a gaze-contingent dot (centre of the screen, where no dot is).
+fn drawDotHint(cr: *c.cairo_t, w: f64, h: f64, fallback: bool) void {
+    if (gazeLost()) {
+        _ = text(cr, w / 2, h * 0.45, 24, .center, ACC, "Eyes not found: look at the screen", .{});
+    } else if (fallback) {
+        _ = text(cr, w / 2, h * 0.45, 22, .center, DIM, "Look at the centre of the orange dot", .{});
+    }
 }
 
 fn onReadable(_: c_int, _: c.GIOCondition, _: ?*anyopaque) callconv(.c) c.gboolean {

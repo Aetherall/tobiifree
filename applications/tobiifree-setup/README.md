@@ -35,15 +35,26 @@ confirmed.
    `trackbox_eye_pos`), distance from `eye_origin` z (50–85 cm is green),
    hints. SPACE continues.
 3. **Calibration** — `start_calibration`, then 3 dots ▽ (0.1,0.1) (0.9,0.1)
-   (0.5,0.9) and 3 dots △ (0.1,0.9) (0.9,0.9) (0.5,0.1); the active dot shrinks
-   for 1 s, then `add_calibration_point`. A dot the device refuses (no usable
-   gaze) is shown again, twice at most. Then `finish_calibration`: the daemon
+   (0.5,0.9) and 3 dots △ (0.1,0.9) (0.9,0.9) (0.5,0.1). Gaze-contingent: the
+   active dot stays big (pulsing) until the person fixates near it (within
+   8°: the uncalibrated gaze can be 5–10° off), then shrinks over 0.7 s while
+   the fixation holds (it grows back when it breaks), then
+   `add_calibration_point`. After 5 s without such a fixation any stable
+   fixation counts and a "look at the centre of the dot" hint is shown. A dot
+   the device refuses (no usable gaze) is shown again, twice at most. Then `finish_calibration`: the daemon
    stores and applies the blob. On ESC or failure: `cancel_calibration`, then
    `cal_apply` of the stored blob (`$XDG_STATE_HOME/tobiifree/calibration.bin`),
    because starting a calibration clears the device's points.
-4. **Validation** — 9 dots (0.9 s settle, 1.2 s of samples each); per-dot error
+4. **Validation** — 9 dots, gaze-contingent too: samples are collected only
+   while the person fixates within 5° of the dot, until 1 s of them (after
+   5 s any stable fixation counts and the dot is flagged `*`; after 12 s the
+   dot keeps what it has if ≥ 0.3 s, else "no fixation"). Per-dot error
    and mean/max in degrees (atan of the on-screen error over the eye distance
    `eye_origin` z) and mm. R redo calibration, V validate again, G live gaze
    dot, ENTER done.
+
+A fixation is 0.3 s of valid gaze with a dispersion (x range + y range) under
+1°; all thresholds are constants at the top of `src/main.zig`, the detector is
+`src/fixation.zig`. Fixation times per dot are logged.
 
 Exit status: 0 done, 1 cancelled or error, 2 bad arguments / unknown output.

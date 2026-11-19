@@ -110,7 +110,7 @@ pub fn build(b: *std.Build) void {
 
     // Pure logic (geometry, validation stats, tobii.json handling).
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/geometry.zig", "src/config.zig" }) |path| {
+    for ([_][]const u8{ "src/geometry.zig", "src/config.zig", "src/fixation.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
