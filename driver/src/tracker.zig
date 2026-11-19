@@ -153,14 +153,28 @@ pub const Tracker = struct {
     /// into `self.display`. Only for use before the caller starts poll()ing
     /// on another thread (it reads the transport synchronously).
     pub fn setDisplayAreaCorners(self: *Tracker, c: DisplayCorners) bool {
-        _ = core.request_set_display_area_corners(c.tl_x, c.tl_y, c.tl_z, c.tr_x, c.tr_y, c.tr_z, c.bl_x, c.bl_y, c.bl_z);
+        core.set_hooks(null, null, captureResponse, null, null);
+        const req_id = core.request_set_display_area_corners(c.tl_x, c.tl_y, c.tl_z, c.tr_x, c.tr_y, c.tr_z, c.bl_x, c.bl_y, c.bl_z);
+        captured_request_id = req_id;
+        captured_payload = null;
         const out_len = core.session_out_len_();
         if (out_len == 0) return false;
         if (!self.send_fn(core.session_out_ptr()[0..out_len])) return false;
 
-        // Read back from device (the 0x5a0 ack is skipped by request_id).
+        // Wait for the 0x5a0 ack before reading back: a get sent right behind
+        // the set is answered first, with the old area.
+        const start_ms = std.time.milliTimestamp();
+        while (captured_payload == null and std.time.milliTimestamp() - start_ms < 1000) {
+            self.drainReads(20);
+        }
+        if (captured_payload == null) {
+            log.warn("setDisplayAreaCorners: no ack", .{});
+        } else if (captured_status != 0) {
+            log.warn("setDisplayAreaCorners: device rejected the area (status 0x{x})", .{captured_status});
+        }
+
         self.display = self.queryDisplayArea() orelse self.display;
-        return true;
+        return captured_payload != null and captured_status == 0;
     }
 
     /// Register a gaze callback. Called from the poll() context.
@@ -206,6 +220,7 @@ pub const Tracker = struct {
     var captured_request_id: u32 = 0;
 
     var captured_buf: [4096]u8 = undefined;
+    var captured_status: u32 = 0;
 
     fn captureResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
         if (request_id == captured_request_id) {
@@ -214,6 +229,7 @@ pub const Tracker = struct {
             const n = @min(payload_len, captured_buf.len);
             @memcpy(captured_buf[0..n], payload_ptr[0..n]);
             captured_payload = captured_buf[0..n];
+            captured_status = core.response_status();
         }
     }
 

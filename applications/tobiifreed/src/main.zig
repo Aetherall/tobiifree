@@ -181,10 +181,10 @@ fn sendReply(c: Client, cmd_type: u8, payload: []const u8) void {
 const Kind = enum {
     /// get_display_area: reply 9×f64.
     get_area,
-    /// 0x5a0 ack of a set: non-zero status → error to client; else silent
-    /// (the paired readback carries the reply).
+    /// 0x5a0 ack of a set: non-zero status → error to client; else send
+    /// the readback.
     set_ack,
-    /// get_display_area sent right after a set: reply 9×f64 (the area the
+    /// get_display_area sent after a set's ack: reply 9×f64 (the area the
     /// device actually holds) under the set's cmd_type, and persist it.
     set_readback,
     /// Reply with the raw TTP payload.
@@ -199,8 +199,6 @@ const PendingEntry = struct {
     cmd_type: u8,
     kind: Kind,
     deadline_ms: i64,
-    /// For set_ack: request_id of the paired readback.
-    pair_id: u32 = 0,
 };
 
 const MAX_PENDING = 64;
@@ -244,25 +242,6 @@ fn pendingCount() usize {
     return n;
 }
 
-// Readbacks whose set was rejected: their reply is suppressed (main thread only).
-var suppressed: [8]u32 = [_]u32{0} ** 8;
-var suppressed_next: usize = 0;
-
-fn suppress(id: u32) void {
-    suppressed[suppressed_next % suppressed.len] = id;
-    suppressed_next += 1;
-}
-
-fn takeSuppressed(id: u32) bool {
-    for (&suppressed) |*s| {
-        if (s.* == id and id != 0) {
-            s.* = 0;
-            return true;
-        }
-    }
-    return false;
-}
-
 /// Expire requests the device never answered (main thread).
 fn sweepPending() void {
     const now = std.time.milliTimestamp();
@@ -283,8 +262,6 @@ fn sweepPending() void {
     }
     for (expired[0..n]) |e| {
         log.warn("request_id={} (cmd=0x{x:0>2}, {s}) timed out", .{ e.request_id, e.cmd_type, @tagName(e.kind) });
-        if (e.kind == .set_ack) continue; // the readback reports
-        if (takeSuppressed(e.request_id)) continue;
         sendError(e.client, e.cmd_type, proto.Err.timeout);
     }
 }
@@ -360,8 +337,6 @@ fn handleResponse(m: *const RespMsg) void {
 
     if (m.status != 0) {
         log.warn("device rejected cmd=0x{x:0>2} ({s}): status 0x{x}", .{ e.cmd_type, @tagName(e.kind), m.status });
-        if (e.kind == .set_ack) suppress(e.pair_id);
-        if (e.kind == .set_readback and takeSuppressed(e.request_id)) return;
         sendError(e.client, e.cmd_type, m.status);
         return;
     }
@@ -371,9 +346,8 @@ fn handleResponse(m: *const RespMsg) void {
     }
 
     switch (e.kind) {
-        .set_ack => {},
+        .set_ack => _ = sendRequest(e.client, e.cmd_type, .set_readback, core.request_get_display_area()),
         .get_area, .set_readback => {
-            if (e.kind == .set_readback and takeSuppressed(e.request_id)) return;
             const c = decodeArea(payload) orelse {
                 log.warn("display area decode failed (len={})", .{payload.len});
                 sendError(e.client, e.cmd_type, proto.Err.failed);
@@ -383,7 +357,7 @@ fn handleResponse(m: *const RespMsg) void {
             proto.encodeDisplayArea(&out, c);
             sendReply(e.client, e.cmd_type, &out);
             if (e.kind == .set_readback) {
-                log.info("display area set: TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+                log.info("display area set: TL=({d:.3},{d:.3},{d:.3}) TR=({d:.3},{d:.3},{d:.3}) BL=({d:.3},{d:.3},{d:.3})", .{
                     c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8],
                 });
                 config.saveDisplayArea(gpa, c) catch |err| {
@@ -588,7 +562,7 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
         },
 
         .get_display_area => {
-            _ = sendRequest(c, cmd_type, .get_area, core.request_get_display_area(), 0);
+            _ = sendRequest(c, cmd_type, .get_area, core.request_get_display_area());
         },
         .set_display_area, .set_display_area_corners => {
             const corners: ?config.Corners = if (cmd == .set_display_area) blk: {
@@ -612,16 +586,16 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
             }
             var f: [2]f64 = undefined;
             @memcpy(std.mem.asBytes(&f), payload[0..16]);
-            _ = sendRequest(c, cmd_type, .raw, core.request_cal_point_add2d(f[0], f[1], 3), 0); // eye_mask=3: both eyes
+            _ = sendRequest(c, cmd_type, .raw, core.request_cal_point_add2d(f[0], f[1], 3)); // eye_mask=3: both eyes
         },
         .get_calibration_stimulus => {
-            _ = sendRequest(c, cmd_type, .stimulus, core.request_cal_stimulus(), 0);
+            _ = sendRequest(c, cmd_type, .stimulus, core.request_cal_stimulus());
         },
     }
 }
 
 /// Register + send the request the core just built into session_out.
-fn sendRequest(c: Client, cmd_type: u8, kind: Kind, request_id: u32, pair_id: u32) bool {
+fn sendRequest(c: Client, cmd_type: u8, kind: Kind, request_id: u32) bool {
     const out_len = core.session_out_len_();
     if (out_len == 0 or request_id == 0) {
         sendError(c, cmd_type, proto.Err.failed);
@@ -635,7 +609,6 @@ fn sendRequest(c: Client, cmd_type: u8, kind: Kind, request_id: u32, pair_id: u3
         .cmd_type = cmd_type,
         .kind = kind,
         .deadline_ms = std.time.milliTimestamp() + REQUEST_TIMEOUT_MS,
-        .pair_id = pair_id,
     })) {
         sendError(c, cmd_type, proto.Err.busy);
         return false;
@@ -643,44 +616,21 @@ fn sendRequest(c: Client, cmd_type: u8, kind: Kind, request_id: u32, pair_id: u3
     if (!transport.send(core.session_out_ptr()[0..out_len])) {
         log.err("USB send failed for cmd=0x{x:0>2}", .{cmd_type});
         _ = takePending(request_id);
-        if (kind != .set_ack) sendError(c, cmd_type, proto.Err.usb);
+        sendError(c, cmd_type, proto.Err.usb);
         return false;
     }
     log.debug("forwarded cmd=0x{x:0>2} ({s}) request_id={} for fd={}", .{ cmd_type, @tagName(kind), request_id, c.fd });
     return true;
 }
 
-/// set → ack (status checked), then get → reply with what the device holds.
-/// The device handles requests in order, so the readback sees the new area.
+/// set → ack (status checked) → get → reply with what the device holds.
+/// The readback is only sent once the ack is in: the device answers a get
+/// sent right behind a set *before* acking the set, with the old area.
 fn setDisplayArea(c: Client, cmd_type: u8, a: config.Corners) void {
-    log.info("set display area from fd={}: TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+    log.info("set display area from fd={}: TL=({d:.3},{d:.3},{d:.3}) TR=({d:.3},{d:.3},{d:.3}) BL=({d:.3},{d:.3},{d:.3})", .{
         c.fd, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
     });
-    const set_id = core.request_set_display_area_corners(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
-    // Pair id = the readback's request_id, which the core hands out next.
-    // Build the readback only after the set frame went out (session_out is reused).
-    const set_len = core.session_out_len_();
-    var set_frame: [512]u8 = undefined;
-    @memcpy(set_frame[0..set_len], core.session_out_ptr()[0..set_len]);
-
-    const get_id = core.request_get_display_area();
-    const get_len = core.session_out_len_();
-    var get_frame: [64]u8 = undefined;
-    @memcpy(get_frame[0..get_len], core.session_out_ptr()[0..get_len]);
-
-    const now = std.time.milliTimestamp();
-    _ = addPending(.{ .request_id = set_id, .client = c, .cmd_type = cmd_type, .kind = .set_ack, .deadline_ms = now + REQUEST_TIMEOUT_MS, .pair_id = get_id });
-    if (!addPending(.{ .request_id = get_id, .client = c, .cmd_type = cmd_type, .kind = .set_readback, .deadline_ms = now + REQUEST_TIMEOUT_MS })) {
-        _ = takePending(set_id);
-        sendError(c, cmd_type, proto.Err.busy);
-        return;
-    }
-    if (!transport.send(set_frame[0..set_len]) or !transport.send(get_frame[0..get_len])) {
-        log.err("USB send failed for cmd=0x{x:0>2}", .{cmd_type});
-        _ = takePending(set_id);
-        _ = takePending(get_id);
-        sendError(c, cmd_type, proto.Err.usb);
-    }
+    _ = sendRequest(c, cmd_type, .set_ack, core.request_set_display_area_corners(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]));
 }
 
 // ── Startup display area ────────────────────────────────────────────
