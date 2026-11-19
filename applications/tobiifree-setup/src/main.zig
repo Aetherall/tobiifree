@@ -78,8 +78,8 @@ const FIX_MAX_AGE_S = 0.15;
 const GAZE_LOST_S = 1.0;
 
 /// Calibration: the dot waits (pulsing) for a fixation this close to it.
-/// Generous: the uncalibrated gaze can be 5–10° off.
-const CAL_RADIUS_DEG = 8.0;
+/// Generous: the uncalibrated gaze can be 5–10° off (3.6–10.2° measured).
+const CAL_RADIUS_DEG = 12.0;
 /// No fixation near the dot after this long: any stable fixation counts
 /// (the error is then larger than CAL_RADIUS_DEG, which the calibration is
 /// there to fix) and a "look at the centre of the dot" hint is shown.
@@ -116,6 +116,8 @@ const FG: Rgb = .{ 0.9, 0.9, 0.9 };
 const DIM: Rgb = .{ 0.55, 0.55, 0.6 };
 const ACC: Rgb = .{ 1.0, 0.667, 0.157 };
 const ACC_DIM: Rgb = .{ 0.43, 0.31, 0.12 };
+/// Gaze-contingent dot while the gaze is on it (fixation accepted).
+const ON_GAZE: Rgb = .{ 0.25, 0.6, 1.0 };
 const GOOD: Rgb = .{ 0.35, 0.85, 0.45 };
 const WARN: Rgb = .{ 1.0, 0.45, 0.3 };
 
@@ -818,7 +820,8 @@ fn drawCalibrate(cr: *c.cairo_t, w: f64, h: f64) void {
                         pulseRadius()
                     else
                         DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(cal_progress, 0, 1);
-                    drawTarget(cr, x, y, r * ui, ACC);
+                    const on = cal_phase == .adding or cal_holding;
+                    drawTarget(cr, x, y, r * ui, if (on) ON_GAZE else ACC);
                 } else {
                     drawTarget(cr, x, y, 8 * ui, ACC_DIM);
                 }
@@ -971,7 +974,9 @@ fn drawValidate(cr: *c.cairo_t, w: f64, h: f64) void {
             else
                 DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(val_collected_s / VAL_COLLECT_S, 0, 1);
             drawDotHint(cr, w, h, val_fallback[val_idx]);
-            drawTarget(cr, t[0] * w, t[1] * h, r * ui, ACC);
+            // Collecting: an accepted sample in the last 150 ms.
+            const on = val_last_acc != 0 and now() - val_last_acc < 150_000;
+            drawTarget(cr, t[0] * w, t[1] * h, r * ui, if (on) ON_GAZE else ACC);
         },
         .results => drawResults(cr, w, h),
     }
