@@ -437,6 +437,8 @@ pub const Stats = struct {
     max_raw_deg: f64 = 0,
     mean_loo_deg: f64 = 0,
     max_loo_deg: f64 = 0,
+    /// Validation runs pooled into the control points.
+    runs: u32 = 1,
 };
 
 /// $XDG_STATE_HOME/tobiifree/correction.json
@@ -481,6 +483,93 @@ pub fn parseFile(gpa: std.mem.Allocator, text: []const u8) !std.json.Parsed(File
     if (!(s[0] > 10 and s[1] > 10)) return error.BadArea;
     if (!(p.value.lambda > 0) or !(p.value.cap_mm > 0) or !(p.value.fade_mm > 0)) return error.BadParams;
     return p;
+}
+
+// ── Validation history (runs pooled into one map) ───────────────────
+//
+// $XDG_STATE_HOME/tobiifree/correction_runs.json, written by the setup tool
+// after every validation: the per-dot raw medians of each run made with one
+// calibration blob on one display area. The map is fitted on the per-target
+// pool of all runs (pool()). tobiifreed deletes the file whenever it deletes
+// a map for a blob / area change; a history for another blob or area is
+// ignored (and replaced) by the tool.
+
+pub const HISTORY_VERSION = 1;
+pub const MAX_RUNS = 20;
+
+pub const Run = struct {
+    created_unix: i64 = 0,
+    /// Usable dots of the run (fixation near the dot): target, median gaze.
+    dots: []const FilePoint,
+};
+
+pub const History = struct {
+    version: u32 = HISTORY_VERSION,
+    calibration_sha256: []const u8,
+    display_area: [9]f64,
+    runs: []const Run,
+
+    pub fn stringify(self: *const History, gpa: std.mem.Allocator) ![]u8 {
+        return std.json.Stringify.valueAlloc(gpa, self.*, .{ .whitespace = .indent_1 });
+    }
+
+    /// Made with this blob on this area?
+    pub fn matches(self: *const History, calibration_sha256: []const u8, area: [9]f64) bool {
+        return std.mem.eql(u8, self.calibration_sha256, calibration_sha256) and areaMatches(self.display_area, area);
+    }
+};
+
+pub fn parseHistory(gpa: std.mem.Allocator, text: []const u8) !std.json.Parsed(History) {
+    const p = try std.json.parseFromSlice(History, gpa, text, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    errdefer p.deinit();
+    if (p.value.version != HISTORY_VERSION) return error.UnsupportedVersion;
+    if (p.value.calibration_sha256.len != 64) return error.BadHash;
+    return p;
+}
+
+fn sameTarget(a: [2]f64, b: [2]f64) bool {
+    return @abs(a[0] - b[0]) < 1e-4 and @abs(a[1] - b[1]) < 1e-4;
+}
+
+/// Robust mean: median for 3+ values, mean otherwise. Reorders `xs`.
+fn robustMean(xs: []f64) f64 {
+    if (xs.len == 0) return 0;
+    if (xs.len < 3) {
+        var s: f64 = 0;
+        for (xs) |x| s += x;
+        return s / @as(f64, @floatFromInt(xs.len));
+    }
+    std.mem.sort(f64, xs, {}, std.sort.asc(f64));
+    const m = xs.len / 2;
+    return if (xs.len % 2 == 1) xs[m] else (xs[m - 1] + xs[m]) / 2;
+}
+
+/// Per-target pool of the runs: one Point per distinct target, gaze = robust
+/// mean of the runs' median gaze (x and y separately), n = total samples.
+/// Returns the number of points written to `out`.
+pub fn pool(runs: []const Run, out: []Point) usize {
+    var n: usize = 0;
+    var gx: [MAX_RUNS * 4]f64 = undefined;
+    var gy: [MAX_RUNS * 4]f64 = undefined;
+    for (runs) |run| for (run.dots) |d| {
+        var seen = false;
+        for (out[0..n]) |q| if (sameTarget(.{ q.tx, q.ty }, d.target)) {
+            seen = true;
+        };
+        if (seen or n == out.len) continue;
+        var k: usize = 0;
+        var samples: u32 = 0;
+        for (runs) |r2| for (r2.dots) |d2| {
+            if (!sameTarget(d.target, d2.target) or k == gx.len) continue;
+            gx[k] = d2.gaze[0];
+            gy[k] = d2.gaze[1];
+            samples += d2.n;
+            k += 1;
+        };
+        out[n] = .{ .tx = d.target[0], .ty = d.target[1], .gx = robustMean(gx[0..k]), .gy = robustMean(gy[0..k]), .n = samples };
+        n += 1;
+    };
+    return n;
 }
 
 pub fn sha256Hex(data: []const u8) [64]u8 {
@@ -684,6 +773,44 @@ test "file round trip and refit" {
     try testing.expectError(error.BadHash, parseFile(testing.allocator,
         \\{"calibration_sha256":"ab","display_area":[0,300,0,500,300,0,0,10,0],"lambda":1,"points":[]}
     ));
+}
+
+test "history: pool per target, robust to one bad run" {
+    const a = [_]FilePoint{ .{ .target = .{ 0.1, 0.1 }, .gaze = .{ 0.11, 0.12 }, .n = 30 }, .{ .target = .{ 0.9, 0.9 }, .gaze = .{ 0.9, 0.95 }, .n = 30 } };
+    const b = [_]FilePoint{ .{ .target = .{ 0.1, 0.1 }, .gaze = .{ 0.13, 0.12 }, .n = 30 }, .{ .target = .{ 0.9, 0.9 }, .gaze = .{ 0.9, 0.93 }, .n = 30 } };
+    const bad = [_]FilePoint{.{ .target = .{ 0.1, 0.1 }, .gaze = .{ 0.5, 0.5 }, .n = 30 }};
+    var out: [8]Point = undefined;
+    // Two runs: mean.
+    const runs2 = [_]Run{ .{ .dots = &a }, .{ .dots = &b } };
+    try testing.expectEqual(@as(usize, 2), pool(&runs2, &out));
+    try testing.expectApproxEqAbs(@as(f64, 0.12), out[0].gx, 1e-12);
+    try testing.expectEqual(@as(u32, 60), out[0].n);
+    try testing.expectApproxEqAbs(@as(f64, 0.94), out[1].gy, 1e-12);
+    // Three runs, one wild: median ignores it.
+    const runs3 = [_]Run{ .{ .dots = &a }, .{ .dots = &b }, .{ .dots = &bad } };
+    try testing.expectEqual(@as(usize, 2), pool(&runs3, &out));
+    try testing.expectApproxEqAbs(@as(f64, 0.13), out[0].gx, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.12), out[0].gy, 1e-12);
+    // A target only some runs have still pools.
+    try testing.expectApproxEqAbs(@as(f64, 0.94), out[1].gy, 1e-12);
+}
+
+test "history round trip and matching" {
+    const a = [_]FilePoint{.{ .target = .{ 0.1, 0.1 }, .gaze = .{ 0.11, 0.12 }, .n = 30 }};
+    const runs = [_]Run{ .{ .created_unix = 1, .dots = &a }, .{ .created_unix = 2, .dots = &a } };
+    const hash = sha256Hex("blob");
+    const area: [9]f64 = .{ -233.184, 308.741, 0, 297.911, 308.741, 0, -233.184, 10, 0 };
+    const h = History{ .calibration_sha256 = &hash, .display_area = area, .runs = &runs };
+    const text = try h.stringify(testing.allocator);
+    defer testing.allocator.free(text);
+    const p = try parseHistory(testing.allocator, text);
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.value.runs.len);
+    try testing.expect(p.value.matches(&hash, area));
+    try testing.expect(!p.value.matches(&sha256Hex("other"), area));
+    var area2 = area;
+    area2[7] = 30;
+    try testing.expect(!p.value.matches(&hash, area2));
 }
 
 test "invalidation helpers" {
