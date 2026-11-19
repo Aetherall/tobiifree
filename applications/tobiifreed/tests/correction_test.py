@@ -18,6 +18,12 @@ env = dict(os.environ, HOME=HOME, XDG_STATE_HOME=STATE, XDG_RUNTIME_DIR=RUN)
 SOCK = f"{RUN}/tobiifreed/gaze.sock"
 CAL = f"{STATE}/tobiifree/calibration.bin"
 CORR = f"{STATE}/tobiifree/correction.json"
+RUNS = f"{STATE}/tobiifree/correction_runs.json"
+
+def write_history(blob, area=None):
+    area = area or AREA
+    json.dump({"version": 1, "calibration_sha256": hashlib.sha256(blob).hexdigest(), "display_area": area,
+               "runs": [{"created_unix": 1, "dots": [{"target": [0.1, 0.1], "gaze": [0.11, 0.1], "n": 30}]}]}, open(RUNS, "w"))
 AREA = [-233.184, 308.741, 0, 297.911, 308.741, 0, -233.184, 10, 0]
 W = math.hypot(AREA[3]-AREA[0], AREA[4]-AREA[1]); H = math.hypot(AREA[0]-AREA[6], AREA[1]-AREA[7])
 
@@ -98,17 +104,26 @@ r = a.cmd(0x31); check("state inactive while disabled", r[1][:1] == b"\x02")
 a.cmd(0x33, b"\x01")
 stop(d)
 
-d = start(); a = C(); r = a.cmd(0x31); check("restart: map reloaded, active", r[1][:1] == b"\x01", r[1][:1]); stop(d)
+write_history(blob)
+d = start(); a = C(); r = a.cmd(0x31); check("restart: map reloaded, active", r[1][:1] == b"\x01", r[1][:1])
+check("matching validation history kept", os.path.exists(RUNS)); stop(d)
 
 open(CAL, "wb").write(b"fake calibration blob B")
 d = start(); a = C(); r = a.cmd(0x31)
-check("new calibration blob: map deleted at startup", r == (True, b"\x00") and not os.path.exists(CORR), r); stop(d)
+check("new calibration blob: map deleted at startup", r == (True, b"\x00") and not os.path.exists(CORR), r)
+check("new calibration blob: history deleted at startup", not os.path.exists(RUNS)); stop(d)
 
-open(CAL, "wb").write(blob); open(CORR, "wb").write(make_map(blob)); write_config(area2)
+open(CAL, "wb").write(blob); open(CORR, "wb").write(make_map(blob)); write_history(blob); write_config(area2)
 d = start(); a = C(); r = a.cmd(0x31)
-check("other display area: map deleted at startup", r == (True, b"\x00") and not os.path.exists(CORR), r); stop(d)
+check("other display area: map deleted at startup", r == (True, b"\x00") and not os.path.exists(CORR), r)
+check("other display area: history deleted at startup", not os.path.exists(RUNS)); stop(d)
+
+write_config(AREA); write_history(b"another blob")
+d = start(); a = C(); a.cmd(0x31); check("history of another blob deleted (no map)", not os.path.exists(RUNS)); stop(d)
+write_history(blob)
 
 write_config(AREA); open(CORR, "wb").write(make_map(blob))
-d = start(); a = C(); r = a.cmd(0x32); check("clear", r == (True, b"") and not os.path.exists(CORR)); r = a.cmd(0x31); check("cleared: none", r == (True, b"\x00")); stop(d)
+d = start(); a = C(); r = a.cmd(0x32); check("clear", r == (True, b"") and not os.path.exists(CORR)); r = a.cmd(0x31); check("cleared: none", r == (True, b"\x00"))
+check("clear keeps the validation history", os.path.exists(RUNS)); stop(d)
 print("ALL PASS" if ok else "SOME FAILED")
 sys.exit(0 if ok else 1)

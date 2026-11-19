@@ -388,6 +388,7 @@ fn handleResponse(m: *const RespMsg) void {
                 });
                 cur_area = c;
                 if (correction) |*cr| if (!corr_mod.areaMatches(cr.area, c)) deleteCorrection("the display area changed");
+                checkHistory();
                 updateCorrectionActive();
                 config.saveDisplayArea(gpa, c) catch |err| {
                     log.err("failed to save display area to ~/{s}: {}", .{ config.CONFIG_REL_PATH, err });
@@ -534,6 +535,7 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
             };
             log.info("calibration saved to {s} ({} bytes)", .{ path, blob.len });
             if (correction != null) deleteCorrection("a new calibration was saved");
+            deleteHistory("a new calibration was saved");
         },
     }
 }
@@ -647,6 +649,37 @@ fn installCorrection(c: Correction) void {
     const f = &c.parsed.value;
     log.info("correction map loaded: {} points, lambda {d}, cap {d:.0} mm, fade {d:.0} mm", .{ f.points.len, f.lambda, f.cap_mm, f.fade_mm });
     updateCorrectionActive();
+}
+
+/// Drop the setup tool's validation history (runs pooled into the map).
+fn deleteHistory(reason: []const u8) void {
+    var pbuf: [512]u8 = undefined;
+    const path = config.correctionRunsPath(&pbuf) orelse return;
+    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            log.warn("could not delete {s}: {}", .{ path, err });
+            return;
+        },
+    };
+    log.info("validation history deleted: {s}", .{reason});
+}
+
+/// Keep the validation history only while it matches the stored calibration
+/// blob and the current display area.
+fn checkHistory() void {
+    var pbuf: [512]u8 = undefined;
+    const path = config.correctionRunsPath(&pbuf) orelse return;
+    const text = config.readFile(gpa, path, 4 << 20) orelse return;
+    defer gpa.free(text);
+    const h = corr_mod.parseHistory(gpa, text) catch {
+        deleteHistory("unreadable");
+        return;
+    };
+    defer h.deinit();
+    const stored = storedCalibrationSha();
+    if (stored == null or !std.mem.eql(u8, &stored.?, h.value.calibration_sha256)) return deleteHistory("made with another calibration");
+    if (cur_area == null or !corr_mod.areaMatches(cur_area.?, h.value.display_area)) return deleteHistory("made on another display area");
 }
 
 fn deleteCorrection(reason: []const u8) void {
@@ -1229,6 +1262,7 @@ pub fn main() void {
         tracker.onGaze(onGaze);
     }
     loadCorrection();
+    checkHistory();
 
     // Install hooks for command forwarding (after the synchronous startup
     // queries, which use their own capture hook).
