@@ -109,6 +109,9 @@ const Opts = struct {
     settle_ms: f64 = 200,
     filter: follow.FilterParams = .{},
     ease: follow.EaseParams = .{},
+    /// device: the device-filtered gaze as is (as the overlay draws it);
+    /// fixation: follow.zig's fixation filter and easing.
+    follow_filter: enum { device, fixation } = .device,
     /// Follow stops by itself after this long (missed key release).
     follow_timeout_ms: i64 = 10_000,
 };
@@ -171,7 +174,8 @@ const Follow = struct {
     last_step: i64,
     last_sent: [2]f64,
     fixations: usize = 0,
-    /// Target refinements within fixations (beyond the deadband).
+    /// fixation filter: target refinements within fixations (beyond the
+    /// deadband); device filter: valid samples followed.
     updates: usize = 0,
     /// Next new fixation is the first: ease it in.
     first: bool = true,
@@ -222,7 +226,10 @@ const Server = struct {
         }
         if (gaze.toSample(s, t)) |g| {
             self.ring.push(g);
-            if (self.follow != null) self.followSample(g);
+            if (self.follow != null and self.opts.follow_filter == .fixation) self.followSample(g);
+        }
+        if (self.follow != null and self.opts.follow_filter == .device) {
+            if (gaze.toSampleP(s, t, .filtered)) |g| self.followDevice(g);
         }
     }
 
@@ -465,7 +472,7 @@ const Server = struct {
         // Seed from the current fixation, if any: the cursor sets off at once.
         const f = &self.follow.?;
         var seeded = false;
-        switch (select.select(&self.ring, nowNs(), self.opts.params)) {
+        if (self.opts.follow_filter == .fixation) switch (select.select(&self.ring, nowNs(), self.opts.params)) {
             .ok => |pick| {
                 const c = f.filter.seed(&[_]select.Sample{.{ .t_ns = nowNs(), .x = pick.x, .y = pick.y }});
                 f.fixations += 1;
@@ -474,15 +481,25 @@ const Server = struct {
                 seeded = true;
             },
             else => {},
-        }
+        };
         const msg = std.fmt.bufPrint(&msg_buf, "following on {s} from {d:.0},{d:.0}{s}{s}", .{
-            mon.name, cur[0], cur[1], if (seeded) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
+            mon.name, cur[0], cur[1], if (seeded or self.opts.follow_filter == .device) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
         }) catch "following";
         self.finish(j, msg);
         if (seeded) self.followStep(null);
     }
 
     /// A valid sample while following.
+    /// Default follow: like tobiifree-overlay, the cursor goes straight to
+    /// the device-filtered gaze of every valid sample (invalid: holds).
+    fn followDevice(self: *Server, g: select.Sample) void {
+        const f = if (self.follow) |*ff| ff else return;
+        f.updates += 1; // valid samples followed
+        f.easer.setTarget(layout.mapNorm(f.mon, g.x, g.y), 0);
+        self.followStep(g.t_ns);
+    }
+
+    /// --follow-filter fixation.
     fn followSample(self: *Server, g: select.Sample) void {
         const f = if (self.follow) |*ff| ff else return;
         const e = f.filter.update(g);
@@ -537,11 +554,12 @@ const Server = struct {
         const s = f.session;
         var buf: [384]u8 = undefined;
         const first_ms = if (s.first_move_ns) |t| msSince(s.started_ns, t) else -1;
-        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {d} fixations, {d} in-fixation updates, {d} moves{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
+        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {s} filter, {d} fixations, {d} updates, {d} moves{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
             @tagName(why),
             msSince(s.started_ns, now) / 1000,
             f.last_sent[0],
             f.last_sent[1],
+            @tagName(self.opts.follow_filter),
             f.fixations,
             f.updates,
             s.moves,
@@ -653,8 +671,8 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
     g_server = &srv;
     defer srv.deinit();
 
-    log.info("follow: radius {d:.2} deg, deadband {d:.2} deg, confirm {d}, window {d}, tau fixation {d:.0} / saccade {d:.0} / first {d:.0} ms, timeout {d} ms", .{
-        opts.filter.radius_deg, opts.filter.deadband_deg, opts.filter.confirm, opts.filter.window, opts.ease.fix_tau_ms, opts.ease.saccade_tau_ms, opts.ease.first_tau_ms, opts.follow_timeout_ms,
+    log.info("follow: filter {s}; fixation filter: radius {d:.2} deg, deadband {d:.2} deg, confirm {d}, window {d}, tau fixation {d:.0} / saccade {d:.0} / first {d:.0} ms, timeout {d} ms", .{
+        @tagName(opts.follow_filter), opts.filter.radius_deg, opts.filter.deadband_deg, opts.filter.confirm, opts.filter.window, opts.ease.fix_tau_ms, opts.ease.saccade_tau_ms, opts.ease.first_tau_ms, opts.follow_timeout_ms,
     });
     log.info("listening on {s}; output {s}, window {d:.0} ms, max dispersion {d:.2} deg, settle {d:.0} ms, display {d:.0}x{d:.0} mm{s}", .{
         path,
@@ -689,6 +707,10 @@ const usage =
     \\  --dry-run                 log the target, never move the cursor
     \\
     \\follow mode (cursor follows the gaze between follow-start and follow-stop):
+    \\  --follow-filter MODE      device: the device-filtered gaze of every sample, as
+    \\                            tobiifree-overlay draws it (default); fixation: the
+    \\                            fixation filter below
+    \\  (fixation filter only:)
     \\  --radius-deg DEG          a sample this close to the fixation joins it (1.5)
     \\  --deadband-deg DEG        within a fixation, move only when the median drifts this far (0.4)
     \\  --confirm N               samples that must agree to start a new fixation (2)
@@ -696,6 +718,7 @@ const usage =
     \\  --fix-tau-ms MS           easing time constant within a fixation (80)
     \\  --saccade-tau-ms MS       easing to a new fixation, 0 = jump (0)
     \\  --first-tau-ms MS         easing of the first move (60)
+    \\  (both:)
     \\  --follow-timeout-ms MS    stop by itself after this long, missed release (10000)
     \\
 ;
@@ -763,6 +786,12 @@ pub fn main() u8 {
             opts.params.stale_ms = parseF(&args, a) orelse return 2;
         } else if (std.mem.eql(u8, a, "--settle-ms") and mode == .serve) {
             opts.settle_ms = parseF(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--follow-filter") and mode == .serve) {
+            const v = args.next() orelse "";
+            if (std.mem.eql(u8, v, "device")) opts.follow_filter = .device else if (std.mem.eql(u8, v, "fixation")) opts.follow_filter = .fixation else {
+                std.debug.print("--follow-filter: device or fixation\n", .{});
+                return 2;
+            }
         } else if (std.mem.eql(u8, a, "--radius-deg") and mode == .serve) {
             opts.filter.radius_deg = parseF(&args, a) orelse return 2;
         } else if (std.mem.eql(u8, a, "--deadband-deg") and mode == .serve) {

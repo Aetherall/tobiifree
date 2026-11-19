@@ -51,31 +51,32 @@ Safety: follow stops by itself after `--follow-timeout-ms` (10 s; a missed
 release), when tobiifreed goes away, or when a move fails. A new
 `follow-start` replaces a running follow.
 
-Filter (src/follow.zig), fixation-aware rather than a generic low-pass:
+Filter, `--follow-filter`:
 
-- a valid sample within `--radius-deg` (1.5°) of the current fixation
-  joins it; the target is the median of the fixation's last `--fix-window`
-  (12) samples, and it only moves once that median has drifted more than
-  `--deadband-deg` (0.4°) from it: the cursor sits still during a fixation
-  (live: 0–3 small corrections per 3 s hold) yet follows slow drift;
-- a sample outside starts a candidate fixation, adopted once `--confirm`
-  (2) consecutive samples agree: a saccade lands one sample (~30 ms) after
-  the eye does, an isolated spike is ignored;
-- invalid samples (blinks, eyes lost) are not fed: the cursor holds;
-- the cursor eases toward the target at ~120 Hz with time constants
-  `--fix-tau-ms` (80) within a fixation, `--saccade-tau-ms` (0: land at
-  once) on a new fixation and `--first-tau-ms` (60) for the first move.
+- `device` (default): the same processing as tobiifree-overlay. On every
+  valid sample the cursor goes straight to the device's temporally filtered
+  combined gaze (`gaze_point_2d_norm`, corrected by the daemon; if it is
+  invalid: the unfiltered combined point, then the valid eye's own point).
+  No dead zone, no confirmation, no easing; a move is skipped only when the
+  pixel does not change. Invalid samples (blinks, eyes lost): the cursor
+  holds.
+- `fixation` (src/follow.zig): a fixation-aware filter. A valid sample
+  within `--radius-deg` (1.5°) of the current fixation joins it; the target
+  is the median of its last `--fix-window` (12) samples and moves only once
+  that median has drifted more than `--deadband-deg` (0.4°). A sample
+  outside starts a candidate, adopted once `--confirm` (2) consecutive
+  samples agree (a saccade lands ~30 ms after the eye; a spike is ignored).
+  The cursor eases at ~120 Hz: `--fix-tau-ms` (80) within a fixation,
+  `--saccade-tau-ms` (0) to a new one, `--first-tau-ms` (60) first move.
+  Stiller, but the dead zone felt uncomfortable in use.
 
-A One-Euro filter was the alternative; at 33 Hz with saccades lasting 1–2
-samples its speed estimate cannot both kill fixation jitter and not lag a
-saccade, and "sit still, then jump" is what this mode is for.
-
-At follow start the monitor layout is read once and the current fixation
-(if any) seeds the filter, so the cursor sets off at once. The stop reply
-and the log give a summary: fixations, corrections, moves, time to the
-first move, Hyprland move cost (live: 0.56 ms avg, 2.2 ms max per move; the
-socket is one request per connection on Hyprland's side, so it cannot be
-kept open).
+At follow start the monitor layout is read once (with `fixation`, the
+current fixation seeds the filter). The stop reply and the log give a
+summary: updates, moves, time to the first move, Hyprland move cost. Live,
+`device` at 33 Hz: 33 moves/s, 0.54 ms avg / 0.87 ms max per move, sample
+arrival → cursor moved 0.54 ms (Hyprland's socket takes one request per
+connection, so it cannot be kept open; at 33 Hz that is ~2 % of one core's
+time at most, spent in Hyprland and us).
 
 ## How a jump is decided
 
@@ -152,7 +153,8 @@ nix build .#tobiifree-warp
 cd applications/tobiifree-warp && zig build test   # in `nix develop`
 ```
 
-Tests cover the follow filter (noisy fixation stays put and converges,
+Tests cover the follow gaze source (filtered point first, fallbacks), the
+fixation filter (noisy fixation stays put and converges,
 deadband, saccade lands after one confirming sample, spike ignored, drift
 followed), the easing, the follow session timeout, the sample selection (window, stale data, saccade rejection,
 landing after a saccade, degrees vs viewing distance, median, ring wrap),
