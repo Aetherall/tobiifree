@@ -250,6 +250,15 @@ client-requested calibration state machines.
 `SocketSource` (`get-area`, `set-area`, `stimulus`, `start-calibration`,
 `add-point`, `finish-calibration`, `apply`).
 
+### tobiifree-setup
+
+`applications/tobiifree-setup` is the configurator (GTK4 + layer-shell,
+fullscreen on the tracker's output): display area from two lines placed over
+the ET5's marks, position guide, calibration (cancel + re-apply of the stored
+blob on abort), validation. It drives a `SocketSource` from the GLib main
+loop (`g_unix_fd_add`) and stores the chosen output as `"output"` in
+`~/.config/tobii.json`. See its README.
+
 ```
 ┌─────────┐      ┌─────────┐      ┌──────────┐
 │ Browser  │─ws──▶│         │      │          │
