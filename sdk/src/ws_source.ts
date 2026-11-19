@@ -24,6 +24,7 @@ const CMD = {
   ADD_CALIBRATION_POINT: 0x21,
   FINISH_CALIBRATION: 0x22,
   CAL_APPLY: 0x23,
+  GET_CALIBRATION_STIMULUS: 0x24,
 } as const;
 
 type Resolver = { resolve: (payload: Uint8Array) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
@@ -87,31 +88,38 @@ export class WsSource implements Source {
 
   async getDisplayArea(): Promise<DisplayArea> {
     const payload = await this.request(CMD.GET_DISPLAY_AREA);
-    if (payload.byteLength < 72) {
-      throw new Error(`display_area response too short: ${payload.byteLength}`);
-    }
-    const dv = new DataView(payload.buffer, payload.byteOffset, 72);
-    const da: DisplayArea = {
-      tl: { x: dv.getFloat64(0, true), y: dv.getFloat64(8, true), z: dv.getFloat64(16, true) },
-      tr: { x: dv.getFloat64(24, true), y: dv.getFloat64(32, true), z: dv.getFloat64(40, true) },
-      bl: { x: dv.getFloat64(48, true), y: dv.getFloat64(56, true), z: dv.getFloat64(64, true) },
-    };
+    const da = decodeArea(payload);
     this._displayArea = da;
     return da;
   }
 
+  // The daemon replies to a set with the 9×f64 area the device actually holds
+  // (read back after the set), or an error if the device rejected it.
   async setDisplayArea(rect: DisplayRect): Promise<void> {
-    this.sendCmd(CMD.SET_DISPLAY_AREA, encodeF64s(rect.w, rect.h, rect.ox, rect.oy, rect.z));
-    try { await this.getDisplayArea(); } catch {}
+    await this.setArea(CMD.SET_DISPLAY_AREA, encodeF64s(rect.w, rect.h, rect.ox, rect.oy, rect.z));
   }
 
   async setDisplayAreaCorners(area: DisplayArea): Promise<void> {
-    this.sendCmd(CMD.SET_DISPLAY_AREA_CORNERS, encodeF64s(
+    await this.setArea(CMD.SET_DISPLAY_AREA_CORNERS, encodeF64s(
       area.tl.x, area.tl.y, area.tl.z,
       area.tr.x, area.tr.y, area.tr.z,
       area.bl.x, area.bl.y, area.bl.z,
     ));
-    try { await this.getDisplayArea(); } catch {}
+  }
+
+  private async setArea(cmd: number, payload: Uint8Array): Promise<void> {
+    this._displayArea = decodeArea(await this.request(cmd, payload));
+  }
+
+  /** Reply of the device's get_calibration_stimulus_pts (op 0x460):
+   *  decoded points (whatever point2d values the payload contains) + raw payload. */
+  async getCalibrationStimulus(): Promise<{ points: { x: number; y: number }[]; raw: Uint8Array }> {
+    const p = await this.request(CMD.GET_CALIBRATION_STIMULUS);
+    const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+    const n = dv.getUint32(0, true);
+    const points: { x: number; y: number }[] = [];
+    for (let i = 0; i < n; i++) points.push({ x: dv.getFloat64(4 + i * 16, true), y: dv.getFloat64(12 + i * 16, true) });
+    return { points, raw: p.slice(4 + n * 16) };
   }
 
   async startCalibration(): Promise<void> {
@@ -252,6 +260,18 @@ export class WsSource implements Source {
 }
 
 // ── Encoding helpers ──────────────────────────────────────────────
+
+function decodeArea(payload: Uint8Array): DisplayArea {
+  if (payload.byteLength < 72) {
+    throw new Error(`display_area response too short: ${payload.byteLength}`);
+  }
+  const dv = new DataView(payload.buffer, payload.byteOffset, 72);
+  return {
+    tl: { x: dv.getFloat64(0, true), y: dv.getFloat64(8, true), z: dv.getFloat64(16, true) },
+    tr: { x: dv.getFloat64(24, true), y: dv.getFloat64(32, true), z: dv.getFloat64(40, true) },
+    bl: { x: dv.getFloat64(48, true), y: dv.getFloat64(56, true), z: dv.getFloat64(64, true) },
+  };
+}
 
 function encodeF64s(...values: number[]): Uint8Array {
   const buf = new ArrayBuffer(values.length * 8);
