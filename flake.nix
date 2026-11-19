@@ -60,6 +60,13 @@
       buildInputs = [pkgs.libusb1 pkgs.gtk4 pkgs.gtk4-layer-shell];
     };
 
+    # Gaze-to-cursor jump on a shortcut; talks to tobiifreed and Hyprland
+    # over their sockets only (no libusb, no GTK).
+    tobiifree-warp = mkZigApp {
+      name = "tobiifree-warp";
+      dir = "applications/tobiifree-warp";
+    };
+
     # Static SPA: wasm build → bundle → npm install → vite build.
     tobiifree-demo = pkgs.buildNpmPackage {
       pname = "tobiifree-demo";
@@ -98,7 +105,7 @@
     };
   in {
     packages.${system} = {
-      inherit tobiifreed tobiifree-overlay tobiifree-setup tobiifree-demo;
+      inherit tobiifreed tobiifree-overlay tobiifree-setup tobiifree-warp tobiifree-demo;
       default = tobiifreed;
     };
 
