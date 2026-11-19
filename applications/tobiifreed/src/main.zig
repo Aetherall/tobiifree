@@ -456,6 +456,7 @@ fn queueJob(j: Job) void {
 
 fn jobThreadFn() void {
     const j = job_current;
+    core.clear_truncation(); // sticky flag; finish checks it for the blob
     job_ok = switch (j.kind) {
         .start_cal => tracker.startCalibration(),
         .finish_cal => tracker.finishCalibration(),
