@@ -142,13 +142,23 @@ pub const Tracker = struct {
         const tr_x = d.ox_mm + d.w_mm;
         const tr_y = tl_y;
         const tr_z = tl_z;
+        return self.setDisplayAreaCorners(.{
+            .tl_x = tl_x, .tl_y = tl_y, .tl_z = tl_z,
+            .tr_x = tr_x, .tr_y = tr_y, .tr_z = tr_z,
+            .bl_x = bl_x, .bl_y = bl_y, .bl_z = bl_z,
+        });
+    }
 
-        _ = core.request_set_display_area_corners(tl_x, tl_y, tl_z, tr_x, tr_y, tr_z, bl_x, bl_y, bl_z);
+    /// Set display area from explicit corners. Sends to device and reads back
+    /// into `self.display`. Only for use before the caller starts poll()ing
+    /// on another thread (it reads the transport synchronously).
+    pub fn setDisplayAreaCorners(self: *Tracker, c: DisplayCorners) bool {
+        _ = core.request_set_display_area_corners(c.tl_x, c.tl_y, c.tl_z, c.tr_x, c.tr_y, c.tr_z, c.bl_x, c.bl_y, c.bl_z);
         const out_len = core.session_out_len_();
         if (out_len == 0) return false;
         if (!self.send_fn(core.session_out_ptr()[0..out_len])) return false;
 
-        // Read back from device.
+        // Read back from device (the 0x5a0 ack is skipped by request_id).
         self.display = self.queryDisplayArea() orelse self.display;
         return true;
     }
@@ -195,10 +205,15 @@ pub const Tracker = struct {
     var captured_payload: ?[]const u8 = null;
     var captured_request_id: u32 = 0;
 
+    var captured_buf: [4096]u8 = undefined;
+
     fn captureResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
         if (request_id == captured_request_id) {
-            // Store pointer+length; valid until next feed_usb_in.
-            captured_payload = payload_ptr[0..payload_len];
+            // Copy: the core's frame buffer is reused by later reads in the
+            // same drain loop.
+            const n = @min(payload_len, captured_buf.len);
+            @memcpy(captured_buf[0..n], payload_ptr[0..n]);
+            captured_payload = captured_buf[0..n];
         }
     }
 
@@ -219,8 +234,12 @@ pub const Tracker = struct {
             return null;
         }
 
-        // Wait for response (up to ~20 reads).
-        self.drainReads(20);
+        // Wait for the response. Other frames (gaze, a preceding 0x5a0 ack)
+        // may arrive first, so keep reading until it shows up or ~1 s passes.
+        const start_ms = std.time.milliTimestamp();
+        while (captured_payload == null and std.time.milliTimestamp() - start_ms < 1000) {
+            self.drainReads(20);
+        }
 
         const payload = captured_payload orelse {
             log.warn("queryDisplayArea: no response", .{});
