@@ -777,6 +777,15 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
             sendReply(c, cmd_type, &.{});
             return;
         },
+        // --no-device (tests): the area the daemon knows (config).
+        .get_display_area => if (opt_no_device) {
+            if (cur_area) |ar| {
+                var out: [proto.DISPLAY_AREA_SIZE]u8 = undefined;
+                proto.encodeDisplayArea(&out, ar);
+                sendReply(c, cmd_type, &out);
+            } else sendError(c, cmd_type, proto.Err.no_device);
+            return;
+        },
         .set_correction_enabled => {
             correction_enabled = payload.len > 0 and payload[0] != 0;
             log.info("correction map {s} by a client", .{if (correction_enabled) "enabled" else "disabled"});
