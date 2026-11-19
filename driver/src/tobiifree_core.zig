@@ -671,6 +671,37 @@ pub export fn build_cal_stimulus(seq: u32, out: [*]u8) usize {
     return wrapEnvelopeOut(out, &ttp_buf, ttp_len);
 }
 
+// Decode a cal_stimulus (op 0x460) response: walks the TLV payload (after
+// the 2-byte prefix) and collects every point2d (prolog 0x021f40 + 2×Q42) in
+// order, descending into structs. Writes up to `max` (x, y) f64 pairs to
+// `out` and returns the number of points found. Unknown field types are
+// skipped by their size, so the walk is tolerant of extra fields.
+pub export fn decode_cal_stimulus(src: [*]const u8, len: usize, out: [*]u8, max: u32) u32 {
+    if (len < 2) return 0;
+    var r = tlv.Reader.init(src[0..len]);
+    r.pos = 2;
+    var n: u32 = 0;
+    while (r.remaining() >= 5 and n < max) {
+        const h = r.peekHeader() catch break;
+        if (h.type_byte == 5) {
+            if (r.remaining() < 9) break;
+            const tag = std.mem.readInt(u32, src[r.pos + 5 ..][0..4], .big);
+            if (tag == 0x021f40) {
+                const p = r.readPoint2d() catch break;
+                putF64(out + n * 16, p[0]);
+                putF64(out + n * 16 + 8, p[1]);
+                n += 1;
+            } else {
+                r.pos += 9; // prolog: descend into the struct's fields
+            }
+        } else {
+            if (r.remaining() < 5 + @as(usize, h.size)) break;
+            r.pos += 5 + h.size;
+        }
+    }
+    return n;
+}
+
 // Compute HMAC-MD5 for realm authentication.
 // key_ptr/key_len: the HMAC key (typically 32 bytes "aaa...ddd")
 // msg_ptr/msg_len: the challenge from the device
@@ -2391,6 +2422,29 @@ test "set_display_area_corners is acked with status" {
     feed_usb_in(&buf, n2);
     try std.testing.expectEqual(req2, test_resp_id);
     try std.testing.expectEqual(@as(u32, 0), test_resp_status);
+}
+
+test "decode_cal_stimulus collects point2d in order" {
+    var pay: [256]u8 = undefined;
+    var n: usize = 0;
+    pay[0] = 0;
+    pay[1] = 0;
+    n = 2;
+    n += tlvU32(@ptrCast(&pay[n]), 2); // a count, skipped
+    n += tlvTag(@ptrCast(&pay[n]), 0x020bb8); // some struct prolog, descended
+    const pts = [_][2]f64{ .{ 0.1, 0.1 }, .{ 0.9, 0.5 } };
+    for (pts) |p| {
+        n += tlvTag(@ptrCast(&pay[n]), 0x021f40);
+        n += tlvF64Q42(@ptrCast(&pay[n]), p[0]);
+        n += tlvF64Q42(@ptrCast(&pay[n]), p[1]);
+    }
+    var out: [4]f64 align(8) = undefined;
+    const got = decode_cal_stimulus(&pay, n, @ptrCast(&out), 2);
+    try std.testing.expectEqual(@as(u32, 2), got);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), out[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[3], 1e-9);
+    // max caps the output.
+    try std.testing.expectEqual(@as(u32, 1), decode_cal_stimulus(&pay, n, @ptrCast(&out), 1));
 }
 
 test "parse single complete frame" {

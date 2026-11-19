@@ -38,8 +38,38 @@ pub const Cmd = enum(u8) {
     add_calibration_point = 0x21,
     finish_calibration = 0x22,
     cal_apply = 0x23,
+    get_calibration_stimulus = 0x24,
     disconnect = 0xFF,
 };
+
+// ── Error codes (Srv.err payload: [u8 cmd_type][u32 LE code]) ────────
+//
+// Codes below 0x100 are daemon-side. Anything else is the non-zero TTP
+// status word the device answered with (e.g. 0x20000502 when a
+// set_display_area is rejected), passed through unchanged.
+
+pub const Err = struct {
+    pub const failed: u32 = 0x01; // operation failed (state machine error / bad reply)
+    pub const too_large: u32 = 0x02; // reply does not fit the transport (WS frame)
+    pub const busy: u32 = 0x03; // a calibration operation owns the device; retry later
+    pub const timeout: u32 = 0x04; // device did not answer in time
+    pub const bad_payload: u32 = 0x05; // malformed command payload
+    pub const unknown_cmd: u32 = 0x06;
+    pub const usb: u32 = 0x07; // USB send failed
+};
+
+/// 9×f64 LE display area: TL.xyz, TR.xyz, BL.xyz (mm, tracker frame).
+pub const DISPLAY_AREA_SIZE = 72;
+
+pub fn encodeDisplayArea(out: *[DISPLAY_AREA_SIZE]u8, c: [9]f64) void {
+    for (c, 0..) |v, i| std.mem.writeInt(u64, out[i * 8 ..][0..8], @bitCast(v), .little);
+}
+
+pub fn decodeDisplayArea(in: *const [DISPLAY_AREA_SIZE]u8) [9]f64 {
+    var c: [9]f64 = undefined;
+    for (&c, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u64, in[i * 8 ..][0..8], .little));
+    return c;
+}
 
 // ── Encode helpers ──────────────────────────────────────────────────
 
