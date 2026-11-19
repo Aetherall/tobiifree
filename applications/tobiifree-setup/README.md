@@ -15,7 +15,8 @@ The window is a layer-shell OVERLAY surface covering the whole output, with
 exclusive keyboard. Output: `--output NAME`, else `"output"` in
 `~/.config/tobii.json` (written by the tool when step 1 is confirmed;
 tobiifreed keeps the key when it rewrites the file), else the focused output
-(Hyprland), else the first one.
+(Hyprland), else the first one. Everything is computed in physical pixels of
+that output (logical size × monitor scale, fractional scales included).
 
 Without `--output`, step 1 starts with a **screen picker**: a drop-down of
 the outputs (connector, model/description, logical size, scale; the saved one
@@ -26,8 +27,7 @@ one), not on the saved output: that is where the person is looking and
 typing, and the saved output may be the wrong one (that is why they would
 pick). ↑/↓ or the mouse choose, ENTER (or "Use this screen") moves the
 surface to that output and step 1 continues there; the choice is saved with
-step 1. `--step calibrate|validate` use the default output without a picker. Everything is computed in physical pixels of
-that output (logical size × monitor scale, fractional scales included).
+step 1. `--step calibrate|validate` use the default output without a picker.
 
 The gap g is the y of the screen's bottom edge in the tracker's frame, in mm.
 It is an offset of the ET5's coordinate frame, **not a ruler distance**: the
