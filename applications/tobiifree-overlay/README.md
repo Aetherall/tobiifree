@@ -31,6 +31,11 @@ cd applications/tobiifree-overlay
 zig build run
 ```
 
+## Output
+
+The overlay covers `--output NAME`, else the `"output"` of `~/.config/tobii.json`
+(the screen chosen in tobiifree-setup), else the largest monitor.
+
 ## Wayland / X11
 
 - **Wayland**: uses `gtk4-layer-shell` OVERLAY layer. Click-through via empty input region.

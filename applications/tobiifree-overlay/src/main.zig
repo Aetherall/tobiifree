@@ -41,6 +41,9 @@ var socket_source: SocketSource = undefined;
 var source: GazeSource = undefined;
 var gtk_app: ?*c.GApplication = null;
 var quit: bool = false;
+/// Output to cover: --output NAME, else "output" of tobii.json (written by
+/// tobiifree-setup), else the largest monitor.
+var want_output: ?[]const u8 = null;
 
 // ─── Tracker callback ───────────────────────────────────────────────
 
@@ -144,8 +147,21 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         c.GTK_STYLE_PROVIDER_PRIORITY_USER,
     );
 
-    // Pin overlay to the largest monitor.
+    // Pin the overlay to the configured output, else the largest monitor.
     const display = c.gdk_display_get_default();
+    if (want_output) |name| if (display) |d| {
+        if (monitorByConnector(d, name)) |m| {
+            var geo: c.GdkRectangle = undefined;
+            c.gdk_monitor_get_geometry(m, &geo);
+            screen_w = @floatFromInt(geo.width);
+            screen_h = @floatFromInt(geo.height);
+            c.gtk_layer_set_monitor(@ptrCast(window), m);
+            log.info("overlay: output {s}, {d:.0}x{d:.0}", .{ name, screen_w, screen_h });
+            c.g_object_unref(m);
+            return finishActivate(window);
+        }
+        log.warn("output {s} not found, using the largest monitor", .{name});
+    };
     if (display) |d| {
         const monitors = c.gdk_display_get_monitors(d);
         if (monitors) |mons| {
@@ -180,6 +196,10 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         }
     }
 
+    finishActivate(window);
+}
+
+fn finishActivate(window: *c.GtkWidget) void {
     // Single drawing area — all rendering via cairo.
     const da = c.gtk_drawing_area_new();
     c.gtk_drawing_area_set_draw_func(@ptrCast(da), drawOverlay, null, null);
@@ -189,6 +209,19 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_window_present(@ptrCast(window));
 
     _ = c.g_idle_add(@as(c.GSourceFunc, @ptrCast(&pollTracker)), null);
+}
+
+/// Monitor whose connector is `name` (caller unrefs), or null.
+fn monitorByConnector(d: *c.GdkDisplay, name: []const u8) ?*c.GdkMonitor {
+    const mons = c.gdk_display_get_monitors(d) orelse return null;
+    const n = c.g_list_model_get_n_items(mons);
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
+        if (c.gdk_monitor_get_connector(m)) |conn| if (std.mem.eql(u8, std.mem.span(conn), name)) return m;
+        c.g_object_unref(m);
+    }
+    return null;
 }
 
 // ─── Signal handling ─────────────────────────────────────────────────
@@ -212,6 +245,7 @@ fn installSignalHandlers() void {
 
 const Config = struct {
     display_area: ?std.json.Value = null,
+    output: ?[]const u8 = null,
 };
 
 fn loadConfig() ?std.json.Parsed(Config) {
@@ -389,10 +423,15 @@ pub fn main() void {
             mode = .direct;
         } else if (std.mem.eql(u8, arg, "--socket")) {
             mode = .socket;
+        } else if (std.mem.eql(u8, arg, "--output")) {
+            want_output = args.next();
         }
     }
 
     const cfg = loadConfig();
+    if (want_output == null) if (cfg) |p| {
+        want_output = p.value.output;
+    };
     const display = displayAreaFromConfig(cfg);
     if (cfg != null) {
         log.info("config: loaded from ~/{s}", .{CONFIG_PATH});
