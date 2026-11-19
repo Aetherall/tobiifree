@@ -58,6 +58,7 @@ const BIT_TRACKBOX_R_DISP   = 1 << 18;
 const BIT_EYE_ORIGIN_RAW_L  = 1 << 19;
 const BIT_EYE_ORIGIN_RAW_R  = 1 << 20;
 const BIT_GAZE_2D_UNFILT    = 1 << 21;
+const BIT_CORRECTED         = 1 << 22; // set by tobiifreed's correction map
 
 export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   const dv = new DataView(buffer, ptr, 392);
@@ -98,6 +99,7 @@ export function readGazeSample(buffer: ArrayBuffer, ptr: number): GazeSample {
   if (mask & BIT_GAZE_2D_UNFILT) {
     s.gaze_point_2d_unfiltered = { x: dv.getFloat64(OFF_GAZE_2D_UNFILT, true), y: dv.getFloat64(OFF_GAZE_2D_UNFILT + 8, true) };
   }
+  if (mask & BIT_CORRECTED) s.corrected = true;
   return s;
 }
 

@@ -86,6 +86,9 @@ export type GazeSample = {
   eye_origin_raw_R_mm?: Vec3;
   /** Combined binocular 2D gaze before temporal smoothing, [0,1]². */
   gaze_point_2d_unfiltered?: Vec2;
+  /** tobiifreed applied its correction map to the 2D gaze fields
+   *  (GAZE_BIT_CORRECTED). Absent/false: raw device values. */
+  corrected?: boolean;
 };
 
 export type DisplayArea = {

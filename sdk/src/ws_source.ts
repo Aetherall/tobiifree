@@ -26,7 +26,21 @@ const CMD = {
   CAL_APPLY: 0x23,
   GET_CALIBRATION_STIMULUS: 0x24,
   CANCEL_CALIBRATION: 0x25,
+  SET_CORRECTION: 0x30,
+  GET_CORRECTION: 0x31,
+  CLEAR_CORRECTION: 0x32,
+  SET_CORRECTION_ENABLED: 0x33,
+  SET_GAZE_RAW: 0x34,
 } as const;
+
+/** State of tobiifreed's correction map (get_correction). */
+export type CorrectionState = {
+  /** none: no map; active: applied to gaze; inactive: stored but not applied
+   *  (other calibration blob / display area on the device, or disabled). */
+  state: 'none' | 'active' | 'inactive';
+  /** correction.json text (see driver/src/correction.zig), if any. */
+  json: string | null;
+};
 
 export type CalPoint = {
   x: number; y: number;
@@ -135,6 +149,39 @@ export class WsSource implements Source {
       });
     }
     return { points, raw: p.slice(4 + n * 64) };
+  }
+
+  // ── Correction map (daemon-side; WS payloads are capped at ~4 KB in,
+  //    ~8 KB out, enough for a 16-point map) ──────────────────────────
+
+  /** Install a correction map (correction.json text). Rejected (mismatch)
+   *  if it was made for another calibration blob or display area. */
+  async setCorrection(json: string): Promise<void> {
+    await this.request(CMD.SET_CORRECTION, new TextEncoder().encode(json));
+  }
+
+  async getCorrection(): Promise<CorrectionState> {
+    const p = await this.request(CMD.GET_CORRECTION);
+    const s = p.length > 0 ? p[0] : 0;
+    return {
+      state: s === 1 ? 'active' : s === 2 ? 'inactive' : 'none',
+      json: s === 0 ? null : new TextDecoder().decode(p.subarray(1)),
+    };
+  }
+
+  /** Delete the stored map. */
+  async clearCorrection(): Promise<void> {
+    await this.request(CMD.CLEAR_CORRECTION);
+  }
+
+  /** Enable/disable the map for all clients until the daemon restarts. */
+  async setCorrectionEnabled(on: boolean): Promise<void> {
+    await this.request(CMD.SET_CORRECTION_ENABLED, new Uint8Array([on ? 1 : 0]));
+  }
+
+  /** Receive raw (uncorrected) gaze on this connection. */
+  async setGazeRaw(raw: boolean): Promise<void> {
+    await this.request(CMD.SET_GAZE_RAW, new Uint8Array([raw ? 1 : 0]));
   }
 
   /** End a calibration session without applying it (device keeps its calibration). */

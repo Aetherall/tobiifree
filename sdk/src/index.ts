@@ -7,6 +7,7 @@ export type { Source, Unsubscribe } from './source';
 export { UsbSource } from './usb_source';
 export type { UsbSourceOptions } from './usb_source';
 export { WsSource } from './ws_source';
+export type { CorrectionState } from './ws_source';
 
 export type { Transport } from './transport';
 export { TOBII_VID, TOBII_PIDS, TOBII_PID_RUNTIME } from './webusb';
