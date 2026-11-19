@@ -110,36 +110,109 @@ daemon protocol. This is the framing between daemon clients and tobiifreed:
 
 ### Client → Daemon commands (`Cmd`)
 
-| Cmd | ID | Payload | Response |
+All multi-byte values are little-endian. Corners are mm in the tracker frame
+(origin front centre of the tracker, x right, y up, z toward the user), in the
+order TL.xyz, TR.xyz, BL.xyz.
+
+| Cmd | ID | Payload | Reply (`response`, after the cmd_type byte) |
 |---|---|---|---|
-| `subscribe` | 0x01 | u32 stream mask | gaze stream starts |
-| `get_display_area` | 0x02 | — | display_area response (9×f64 corners) |
-| `set_display_area` | 0x03 | 5×f64 (w,h,ox,oy,z) | ack response |
-| `set_display_area_corners` | 0x04 | 9×f64 (tl,tr,bl) | ack response |
-| `start_calibration` | 0x20 | — | ack response |
-| `add_calibration_point` | 0x21 | 2×f64 (x,y); eye_mask fixed at 3 (both eyes) | ack response |
-| `finish_calibration` | 0x22 | — | calibration blob response |
-| `cal_apply` | 0x23 | calibration blob | ack response |
+| `subscribe` | 0x01 | u32 stream mask | — (gaze stream starts) |
+| `get_display_area` | 0x02 | — | 9×f64 corners |
+| `set_display_area` | 0x03 | 5×f64 (w,h,ox,oy,z), no tilt | 9×f64 corners the device holds after the set |
+| `set_display_area_corners` | 0x04 | 9×f64 corners | 9×f64 corners the device holds after the set |
+| `start_calibration` | 0x20 | — | empty |
+| `add_calibration_point` | 0x21 | 2×f64 (x,y) normalised display coords; eye_mask fixed at 3 (both eyes) | raw device reply |
+| `finish_calibration` | 0x22 | — | calibration blob (~400–640 KB; unix socket only) |
+| `cal_apply` | 0x23 | calibration blob | empty |
+| `get_calibration_stimulus` | 0x24 | — | u32 n, n×(f64 x, f64 y), then the raw TTP payload of op 0x460 |
 | `disconnect` | 0xFF | — | — |
+
+Every command except `subscribe`/`disconnect` gets exactly one reply: a
+`response` or an `err`. Replies carry the cmd_type; the daemon answers commands
+of one type in the order they were sent, so clients match replies FIFO per
+command type.
+
+Sets: the device acks op 0x5a0 with an empty payload and a status word in the
+TTP header (bytes 16..19; 0 = ok, e.g. 0x20000502 when the area is rejected,
+in which case the device keeps its previous area). The daemon checks it, then
+reads the area back and replies with it. A successful set is persisted (see
+below).
+
+Calibration commands (`start_calibration`, `finish_calibration`, `cal_apply`)
+run one at a time on a daemon job thread that owns USB while it runs: gaze
+pauses, and any device command sent meanwhile gets `err` busy.
 
 ### Daemon → Client events (`Srv`)
 
 | Srv | ID | Payload |
 |---|---|---|
 | `gaze` | 0x01 | GazeSample (232 bytes) |
-| `response` | 0x02 | cmd_type (u8) + response payload |
-| `display_area` | 0x03 | 9×f64 corners |
-| `err` | 0xFF | error code (u32) |
+| `response` | 0x02 | cmd_type (u8) + reply payload |
+| `display_area` | 0x03 | 9×f64 corners (reserved; not sent by tobiifreed today) |
+| `err` | 0xFF | cmd_type (u8) + error code (u32) |
+
+Error codes (`daemon_protocol.Err`): 0x01 failed, 0x02 too large for the
+transport (WS frames are capped at ~8 KB, so no blobs over WS), 0x03 busy
+(calibration job running), 0x04 device timeout (5 s), 0x05 bad payload,
+0x06 unknown command, 0x07 USB send failed, 0x08 disconnected (client-side,
+SocketSource). Any other value is the device's non-zero TTP status, passed
+through.
+
+### Calibration stimulus (op 0x460)
+
+`get_calibration_stimulus` forwards TTP op 0x460 (`get_calibration_stimulus_pts`,
+empty `[00 00]` request payload) and returns any point2d values found in the reply
+(`tobiifree_core.decode_cal_stimulus`) plus the raw payload. Not yet probed on
+hardware: what the points are (the device's recommended calibration targets?)
+and whether the request needs an open calibration realm is still to be
+established.
 
 ## tobiifreed (daemon)
 
 The daemon owns the USB device and its Tracker. It:
 
 1. Opens USB, runs the TTP handshake (hello → realm → display area → subscribe)
-2. Listens on Unix socket + optionally WebSocket (`--ws`)
-3. Accepts client connections
-4. Forwards client commands to the Tracker over TTP
-5. Broadcasts gaze samples and command responses to subscribed clients
+2. Pushes the configured display area (see Persistence)
+3. Listens on Unix socket + optionally WebSocket (`--ws`)
+4. Re-applies the stored calibration, if any, on the job thread
+5. Accepts client connections, forwards their commands over TTP and routes
+   the replies back
+6. Broadcasts gaze samples to subscribed clients
+
+Threads: the USB thread only feeds the core and queues gaze samples /
+responses; the main thread does all client I/O, request building and
+persistence; a job thread runs the calibration state machines.
+
+### Persistence
+
+- **Display area** — every successful set from a client is written to
+  `~/.config/tobii.json` as explicit corners (`"tl"`, `"tr"`, `"bl"` arrays)
+  plus the equivalent legacy fields (`w_mm`, `h_mm`, `z_mm`, `tilt`, numeric
+  `cx`/`cy`) so the overlay keeps reading it; other top-level keys are kept.
+  The hand-written legacy form (`cy: "b - 10"` etc.) is still read. At startup
+  the config area is pushed to the device **whenever it differs** from what the
+  device reports: the device forgets its area on power-cycle and other tools
+  (WebUSB demo, another OS) may change it, so the config, which records the
+  last area set through the daemon, is the source of truth.
+  `--keep-device-area` restores the old rule (only push when the device looks
+  reset). Without a config area, the built-in default is pushed only when the
+  device looks reset.
+- **Calibration** — a successful `finish_calibration` saves the blob to
+  `$XDG_STATE_HOME/tobiifree/calibration.bin` (default
+  `~/.local/state/tobiifree/calibration.bin`). At startup, if the file exists,
+  it is `cal_apply`'d on the job thread after the sockets are up: clients can
+  connect immediately, gaze starts when the apply ends (success, failure, or
+  the 120 s state-machine timeout), and device commands sent meanwhile get
+  `err` busy (0x03). Timing and result are logged.
+  `--no-restore-calibration` skips it. Note the file is only written by
+  tobiifreed's `finish_calibration`; a calibration made another way is
+  overwritten at the next daemon start while the file exists.
+
+### tobiifree-ctl
+
+`applications/tobiifreed` also builds `tobiifree-ctl`, a CLI over the Zig
+`SocketSource` (`get-area`, `set-area`, `stimulus`, `start-calibration`,
+`add-point`, `finish-calibration`, `apply`).
 
 ```
 ┌─────────┐      ┌─────────┐      ┌──────────┐
@@ -156,5 +229,5 @@ The daemon owns the USB device and its Tracker. It:
 - [x] `Tobii.fromUsb()` / `Tobii.fromDaemon()` return `Source`; `Tobii.createSession()` is a deprecated alias for `fromUsb()`
 - [x] `WsServer` in tobiifreed (gaze + command forwarding)
 - [x] Daemon protocol: command forwarding (display area, calibration)
-- [x] `SocketSource` — Zig native (Unix socket, gaze only)
-- [ ] `SocketSource` — full daemon protocol on Zig side (currently gaze only)
+- [x] `SocketSource` — Zig native (Unix socket): gaze + full daemon command set,
+      async callbacks driven by `poll()` (GLib: `g_unix_fd_add` on `fd`), `call()` for blocking use
