@@ -53,13 +53,31 @@ confirmed.
    `finish_calibration`: the daemon stores and applies the blob. On ESC or failure: `cancel_calibration`, then
    `cal_apply` of the stored blob (`$XDG_STATE_HOME/tobiifree/calibration.bin`),
    because starting a calibration clears the device's points.
-4. **Validation** — 9 dots, gaze-contingent too: samples are collected only
-   while the person fixates within 5° of the dot, until 1 s of them (after
-   5 s any stable fixation counts and the dot is flagged `*`; after 12 s the
-   dot keeps what it has if ≥ 0.3 s, else "no fixation"). Per-dot error
-   and mean/max in degrees (atan of the on-screen error over the eye distance
-   `eye_origin` z) and mm. R redo calibration, V validate again, G live gaze
-   dot, ENTER done.
+4. **Validation and correction map** — 16 dots (4×4 at 0.1, 0.3667, 0.6333,
+   0.9), gaze-contingent too: samples are collected only while the person
+   fixates within 5° of the dot, until 1 s of them (after 5 s any stable
+   fixation counts and the dot is flagged `*`; after 12 s the dot keeps what
+   it has if ≥ 0.3 s, else "no fixation"). Gaze is collected raw
+   (`set_gaze_raw`: the daemon's correction map is not applied), and each
+   dot's gaze is the median of its samples. Errors in degrees (atan of the
+   on-screen error over the eye distance `eye_origin` z) and mm, computed
+   from the same samples three ways:
+   - **uncorrected** (the device calibration alone);
+   - **current map**, if the daemon holds an active one;
+   - **new map, leave-one-out**: each dot corrected by a map fitted on the
+     15 others (λ chosen inside each fold), an honest estimate on gaze the
+     map was not fitted on.
+
+   The new map (fitted on all non-fallback dots, see `driver/src/correction.zig`)
+   is proposed only if its leave-one-out mean beats both the uncorrected and
+   the current-map mean by at least 0.02°; a current map that does worse than
+   no map is proposed for removal. The results show, per dot, a grey arrow to
+   the raw gaze and a coloured one to the leave-one-out corrected gaze
+   ("raw° → corrected°"), the three summaries and the decision. ENTER
+   applies it (saves the map / removes it / nothing) and finishes, V
+   validates again, R redoes the calibration, G shows the live gaze (green
+   raw, blue through the new map), ESC quits changing nothing. The analysis
+   takes ~10 ms in release builds (a few seconds in Debug).
 
 Dots are orange while waiting for the gaze and blue while the gaze is on them
 (shrinking / collecting); they turn orange again when the fixation breaks. The
@@ -72,5 +90,10 @@ A fixation is 0.3 s of valid gaze with a dispersion (x range + y range) under
 Tested on an ET5 under a BenQ XL2430T (1920×1080): lines 667 px apart give a
 531 mm wide area (EDID 530 mm); validation after calibration 0.56–0.68° mean
 over several runs, last run 0.58° mean / 0.91° max at 71 cm.
+
+`--simulate-gaze` (testing) replaces the tracker's gaze by a synthetic
+viewer who looks at the active dot with a fixed drift field;
+`tests/headless_validation.sh` runs the validation end to end in a headless
+sway against `tobiifreed --no-device --fake-gaze` (nothing real touched).
 
 Exit status: 0 done, 1 cancelled or error, 2 bad arguments / unknown output.

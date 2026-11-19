@@ -126,6 +126,11 @@ order TL.xyz, TR.xyz, BL.xyz.
 | `cal_apply` | 0x23 | calibration blob | empty |
 | `get_calibration_stimulus` | 0x24 | — | points of the active calibration: u32 n, n×8 f64 (x, y, status_L, a_L, b_L, status_R, a_R, b_R), then the raw TTP payload of op 0x460 |
 | `cancel_calibration` | 0x25 | — | empty; ends a started session (CALIBRATE_STOP) without computing/applying |
+| `set_correction` | 0x30 | correction.json text | empty; `err` mismatch (0x0A) if made for another calibration blob / display area |
+| `get_correction` | 0x31 | — | u8 state (0 none, 1 active, 2 stored but inactive) + correction.json text |
+| `clear_correction` | 0x32 | — | empty; deletes the stored map |
+| `set_correction_enabled` | 0x33 | u8 0/1 | empty; all clients, runtime only (not persisted) |
+| `set_gaze_raw` | 0x34 | u8 0/1 | empty; this client gets uncorrected samples |
 | `disconnect` | 0xFF | — | — |
 
 Every command except `subscribe`/`disconnect` gets exactly one reply: a
@@ -156,7 +161,8 @@ Error codes (`daemon_protocol.Err`): 0x01 failed, 0x02 too large for the
 transport (WS frames are capped at ~8 KB, so no blobs over WS), 0x03 busy
 (calibration job running), 0x04 device timeout (5 s), 0x05 bad payload,
 0x06 unknown command, 0x07 USB send failed, 0x08 disconnected (client-side,
-SocketSource), 0x09 no device (tracker unplugged; the daemon reconnects). Any other value is the device's non-zero TTP status, passed
+SocketSource), 0x09 no device (tracker unplugged; the daemon reconnects),
+0x0A mismatch (correction map for another calibration / display area). Any other value is the device's non-zero TTP status, passed
 through.
 
 ### Calibration stimulus (op 0x460)
@@ -243,19 +249,54 @@ client-requested calibration state machines.
   `--no-restore-calibration` skips it. Note the file is only written by
   tobiifreed's `finish_calibration`; a calibration made another way is
   overwritten at the next daemon start while the file exists.
+- **Correction map** — `$XDG_STATE_HOME/tobiifree/correction.json`, see below.
+
+### Correction map
+
+The device calibration leaves a systematic on-screen drift (on the BenQ some
+regions are 10–20 mm off on every validation). `driver/src/correction.zig`
+models it as a residual field r(g) = gaze − target (mm), measured by the
+setup tool's validation (median gaze of each fixation, raw), interpolated by
+a smoothing thin-plate spline fitted at the measured gaze positions (λ by
+leave-one-out cross-validation, floor 3e-3 in 100 mm units), capped at 30 mm
+and faded to zero within 60 mm outside the convex hull of the dots. The
+corrected gaze is g − r(g).
+
+- **File**: control points (target + median gaze + sample count), λ, cap,
+  fade, the SHA-256 of the calibration blob and the display area they were
+  measured with, stats. Both the daemon and the tool refit the model from it.
+- **Daemon**: loads it at startup and keeps it only if the stored
+  calibration blob and the configured display area still match (else
+  deletes it). It is *active* while the device runs that blob (SHA of the
+  last blob restored / applied / finished) on that area and it is enabled.
+  While active, every sample's `gaze_point_2d_norm`, per-eye 2D points and
+  `gaze_point_2d_unfiltered` (valid eyes only) are corrected through a
+  72×48 grid (bilinear, precomputed at load) and `present_mask` gets
+  `GAZE_BIT_CORRECTED` (1 << 22); 3D fields are untouched. Clients that sent
+  `set_gaze_raw` 1 get the uncorrected sample. A new `finish_calibration` or
+  a set of another display area deletes the map; a client `cal_apply` of
+  another blob only deactivates it.
+- **Tool**: `tobiifree-setup`'s validation (4×4 dots) proposes a map only if
+  its leave-one-out error beats no map (and the current map); see its README.
+- **Tests**: `zig build test` (model, in tobiifreed and tobiifree-setup),
+  `just test-correction` (daemon commands and invalidation with
+  `--no-device --fake-gaze`, isolated dirs),
+  `applications/tobiifree-setup/tests/headless_validation.sh` (whole flow in
+  a headless sway with `--simulate-gaze`).
 
 ### tobiifree-ctl
 
 `applications/tobiifreed` also builds `tobiifree-ctl`, a CLI over the Zig
 `SocketSource` (`get-area`, `set-area`, `stimulus`, `start-calibration`,
-`add-point`, `finish-calibration`, `apply`).
+`add-point`, `finish-calibration`, `apply`, `correction`, `correction-set`,
+`correction-clear`, `correction-enable`).
 
 ### tobiifree-setup
 
 `applications/tobiifree-setup` is the configurator (GTK4 + layer-shell,
 fullscreen on the tracker's output): display area from two lines placed over
 the ET5's marks, position guide, calibration (cancel + re-apply of the stored
-blob on abort), validation. It drives a `SocketSource` from the GLib main
+blob on abort), validation that also builds the correction map. It drives a `SocketSource` from the GLib main
 loop (`g_unix_fd_add`) and stores the chosen output as `"output"` in
 `~/.config/tobii.json`. See its README.
 
