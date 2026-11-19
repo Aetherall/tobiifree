@@ -42,22 +42,27 @@ confirmed.
 2. **Position** — both eyes in the track box (mirror view, from
    `trackbox_eye_pos`), distance from `eye_origin` z (50–85 cm is green),
    hints. SPACE continues.
-3. **Calibration** — `start_calibration`, then 3 dots ▽ (0.1,0.1) (0.9,0.1)
-   (0.5,0.9) and 3 dots △ (0.1,0.9) (0.9,0.9) (0.5,0.1). Gaze-contingent: the
-   active dot stays big (pulsing) until the person fixates near it (within
-   12°: uncalibrated offsets of 3.6–11.2° were measured), then shrinks over
-   0.7 s while the fixation holds (it grows back when it breaks), then
-   `add_calibration_point`. After 5 s without such a fixation any stable
-   fixation counts and a "look at the centre of the dot" hint is shown. A dot
+3. **Calibration** — `start_calibration`, then 9 dots, 3×3 inset from the
+   edges: (0.2,0.1) (0.5,0.08) (0.8,0.1), (0.15,0.5) (0.5,0.5) (0.85,0.5),
+   (0.15,0.85) (0.5,0.85) (0.85,0.85). Each dot is added
+   (`add_calibration_point`) as soon as the eyes land on it: the first
+   fixation that lies entirely after the dot appeared and has moved at least
+   half the way from where the eyes were towards the dot. There is no
+   distance-to-dot gate, because the uncalibrated gaze is 5–10° off (more at
+   the top of tall screens): a radius either waits forever or, with a
+   fallback, records points the person was not looking at. After 1.2 s
+   without a landing the point is added anyway. The dots avoid the corners:
+   before calibration the tracker loses the eyes there on large screens, and
+   one bad point degrades the whole calibration. About 1 s per dot. A dot
    the device refuses (no usable gaze) is shown again, twice at most. Then
    `finish_calibration`: the daemon stores and applies the blob. On ESC or failure: `cancel_calibration`, then
    `cal_apply` of the stored blob (`$XDG_STATE_HOME/tobiifree/calibration.bin`),
    because starting a calibration clears the device's points.
 4. **Validation and correction map** — 16 dots (4×4 at 0.1, 0.3667, 0.6333,
    0.9), gaze-contingent too: samples are collected only while the person
-   fixates within 5° of the dot, until 1 s of them (after 5 s any stable
+   fixates within 5° of the dot, until 0.5 s of them (after 5 s any stable
    fixation counts and the dot is flagged `*`; after 12 s the dot keeps what
-   it has if ≥ 0.3 s, else "no fixation"). Gaze is collected raw
+   it has if ≥ 0.2 s, else "no fixation"). About 1–1.4 s per dot. Gaze is collected raw
    (`set_gaze_raw`: the daemon's correction map is not applied), and each
    dot's gaze is the median of its samples. Errors in degrees (atan of the
    on-screen error over the eye distance `eye_origin` z) and mm, computed
@@ -96,13 +101,25 @@ Dots are orange while waiting for the gaze and blue while the gaze is on them
 (shrinking / collecting); they turn orange again when the fixation breaks. The
 colour fades over 0.1 s (`DOT_FADE_S`) both ways.
 
-A fixation is 0.3 s of valid gaze with a dispersion (x range + y range) under
+A fixation is 0.15 s of valid gaze with a dispersion (x range + y range) under
 1°; all thresholds are constants at the top of `src/main.zig`, the detector is
 `src/fixation.zig`. Fixation times per dot are logged.
 
 Tested on an ET5 under a BenQ XL2430T (1920×1080): lines 667 px apart give a
 531 mm wide area (EDID 530 mm); validation after calibration 0.56–0.68° mean
 over several runs, last run 0.58° mean / 0.91° max at 71 cm.
+
+On an ET5 under an Acer X34 (34" 3440×1440, 1900R curved, 801×335 mm area
+from the marks, eyes at 70–75 cm level with the screen centre): calibration
+in about 13 s, validation 0.82–1.04° uncorrected and 0.54–0.70°
+leave-one-out with the correction map (0.49° with two pooled runs). Two
+limits seen there:
+- With the eyes below the screen centre, the gaze saturates near the top
+  centre (targets 3 cm apart read the same). Lowering the screen until the
+  eyes are level with its centre fixed most of it.
+- `start_calibration` appears to reset the device's gaze model, not just its
+  point list: a quick calibration made before it does not help to detect
+  fixations on the dots that follow.
 
 `--simulate-gaze` (testing) replaces the tracker's gaze by a synthetic
 viewer who looks at the active dot with a fixed drift field;
