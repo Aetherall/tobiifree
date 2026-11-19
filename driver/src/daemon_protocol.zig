@@ -40,6 +40,13 @@ pub const Cmd = enum(u8) {
     cal_apply = 0x23,
     get_calibration_stimulus = 0x24,
     cancel_calibration = 0x25,
+    // Correction map (host-side, see correction.zig). Not device commands:
+    // answered by the daemon itself, also while the tracker is away.
+    set_correction = 0x30, // payload: correction.json text; reply empty
+    get_correction = 0x31, // reply: u8 state (0 none, 1 active, 2 inactive) + json
+    clear_correction = 0x32, // reply empty; deletes the stored map
+    set_correction_enabled = 0x33, // payload u8 (0/1), global, not persisted; reply empty
+    set_gaze_raw = 0x34, // payload u8 (0/1): this client gets uncorrected gaze; reply empty
     disconnect = 0xFF,
 };
 
@@ -59,6 +66,7 @@ pub const Err = struct {
     pub const usb: u32 = 0x07; // USB send failed
     pub const disconnected: u32 = 0x08; // client-side: daemon connection lost with the request outstanding
     pub const no_device: u32 = 0x09; // tracker unplugged; the daemon reconnects when it returns
+    pub const mismatch: u32 = 0x0A; // correction map made for another calibration blob / display area
 };
 
 /// 9×f64 LE display area: TL.xyz, TR.xyz, BL.xyz (mm, tracker frame).

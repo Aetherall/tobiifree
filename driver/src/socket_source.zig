@@ -203,6 +203,34 @@ pub const SocketSource = struct {
         try self.request(.get_calibration_stimulus, &.{}, cb, ctx);
     }
 
+    // ── Correction map (daemon-side, see correction.zig) ───────────
+
+    /// Install a correction map (correction.json text). Err.mismatch if it was
+    /// made for another calibration blob or display area.
+    pub fn setCorrection(self: *SocketSource, json: []const u8, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.set_correction, json, cb, ctx);
+    }
+
+    /// Reply: u8 state (0 none, 1 active, 2 stored but inactive) + json.
+    pub fn getCorrection(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.get_correction, &.{}, cb, ctx);
+    }
+
+    /// Delete the stored map.
+    pub fn clearCorrection(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.clear_correction, &.{}, cb, ctx);
+    }
+
+    /// Enable/disable the map for every client (runtime only).
+    pub fn setCorrectionEnabled(self: *SocketSource, on: bool, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.set_correction_enabled, &.{@intFromBool(on)}, cb, ctx);
+    }
+
+    /// Raw (uncorrected) gaze for this connection only.
+    pub fn setGazeRaw(self: *SocketSource, raw: bool, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.set_gaze_raw, &.{@intFromBool(raw)}, cb, ctx);
+    }
+
     /// Send any command; `cb` gets its reply from poll().
     pub fn request(self: *SocketSource, cmd: proto.Cmd, payload: []const u8, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
         if (!self.connected) return error.Disconnected;

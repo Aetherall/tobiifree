@@ -1263,6 +1263,9 @@ pub const GAZE_BIT_TRACKBOX_R_DISP: u32      = 1 << 18;
 pub const GAZE_BIT_EYE_ORIGIN_RAW_L: u32     = 1 << 19;
 pub const GAZE_BIT_EYE_ORIGIN_RAW_R: u32     = 1 << 20;
 pub const GAZE_BIT_GAZE_2D_UNFILTERED: u32   = 1 << 21;
+/// Set by tobiifreed when its correction map was applied to the 2D gaze
+/// fields (gaze_point_2d_norm, the per-eye 2D, gaze_point_2d_unfiltered).
+pub const GAZE_BIT_CORRECTED: u32            = 1 << 22;
 
 /// Decoded gaze frame — extern layout read directly from JS via gaze_view.ts.
 /// Field offsets MUST be kept in sync with the TS reader.
