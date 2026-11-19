@@ -93,6 +93,18 @@ overlay-dev:
     done
 
 # -------------------------------------------------------------------
+# Setup tool (Zig + GTK4, needs tobiifreed running)
+# -------------------------------------------------------------------
+
+# Build and run the configurator (e.g. just setup --output DP-1)
+setup *ARGS:
+    cd applications/tobiifree-setup && zig build run -- {{ARGS}}
+
+# Build the configurator binary
+build-setup:
+    cd applications/tobiifree-setup && zig build -Doptimize=ReleaseSafe
+
+# -------------------------------------------------------------------
 # Daemon (tobiifreed)
 # -------------------------------------------------------------------
 

@@ -54,6 +54,12 @@
       buildInputs = [pkgs.libusb1 pkgs.gtk4 pkgs.gtk4-layer-shell];
     };
 
+    tobiifree-setup = mkZigApp {
+      name = "tobiifree-setup";
+      dir = "applications/tobiifree-setup";
+      buildInputs = [pkgs.libusb1 pkgs.gtk4 pkgs.gtk4-layer-shell];
+    };
+
     # Static SPA: wasm build → bundle → npm install → vite build.
     tobiifree-demo = pkgs.buildNpmPackage {
       pname = "tobiifree-demo";
@@ -92,7 +98,7 @@
     };
   in {
     packages.${system} = {
-      inherit tobiifreed tobiifree-overlay tobiifree-demo;
+      inherit tobiifreed tobiifree-overlay tobiifree-setup tobiifree-demo;
       default = tobiifreed;
     };
 
