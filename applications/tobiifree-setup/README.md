@@ -37,12 +37,12 @@ confirmed.
 3. **Calibration** — `start_calibration`, then 3 dots ▽ (0.1,0.1) (0.9,0.1)
    (0.5,0.9) and 3 dots △ (0.1,0.9) (0.9,0.9) (0.5,0.1). Gaze-contingent: the
    active dot stays big (pulsing) until the person fixates near it (within
-   12°: uncalibrated offsets of 3.6–10.2° were measured), then shrinks over 0.7 s while
-   the fixation holds (it grows back when it breaks), then
+   12°: uncalibrated offsets of 3.6–11.2° were measured), then shrinks over
+   0.7 s while the fixation holds (it grows back when it breaks), then
    `add_calibration_point`. After 5 s without such a fixation any stable
    fixation counts and a "look at the centre of the dot" hint is shown. A dot
-   the device refuses (no usable gaze) is shown again, twice at most. Then `finish_calibration`: the daemon
-   stores and applies the blob. On ESC or failure: `cancel_calibration`, then
+   the device refuses (no usable gaze) is shown again, twice at most. Then
+   `finish_calibration`: the daemon stores and applies the blob. On ESC or failure: `cancel_calibration`, then
    `cal_apply` of the stored blob (`$XDG_STATE_HOME/tobiifree/calibration.bin`),
    because starting a calibration clears the device's points.
 4. **Validation** — 9 dots, gaze-contingent too: samples are collected only
@@ -54,11 +54,15 @@ confirmed.
    dot, ENTER done.
 
 Dots are orange while waiting for the gaze and blue while the gaze is on them
-(shrinking / collecting); they turn orange again when the fixation breaks. The colour fades over 0.1 s
-(`DOT_FADE_S`) both ways.
+(shrinking / collecting); they turn orange again when the fixation breaks. The
+colour fades over 0.1 s (`DOT_FADE_S`) both ways.
 
 A fixation is 0.3 s of valid gaze with a dispersion (x range + y range) under
 1°; all thresholds are constants at the top of `src/main.zig`, the detector is
 `src/fixation.zig`. Fixation times per dot are logged.
+
+Tested on an ET5 under a BenQ XL2430T (1920×1080): lines 667 px apart give a
+531 mm wide area (EDID 530 mm); validation after calibration 0.56–0.68° mean
+over several runs, last run 0.58° mean / 0.91° max at 71 cm.
 
 Exit status: 0 done, 1 cancelled or error, 2 bad arguments / unknown output.
