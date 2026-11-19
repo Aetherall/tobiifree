@@ -79,6 +79,13 @@ pub fn build(b: *std.Build) void {
     usb_source.addImport("gaze_source", gaze_source);
     socket_source.addImport("gaze_source", gaze_source);
 
+    // Correction map (shared with tobiifreed).
+    const correction = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/correction.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tobiifree-setup",
         .root_module = b.createModule(.{
@@ -89,6 +96,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tobiifree_core", .module = tobiifree_core },
                 .{ .name = "daemon_protocol", .module = daemon_protocol },
                 .{ .name = "socket_source", .module = socket_source },
+                .{ .name = "correction", .module = correction },
             },
         }),
     });
@@ -118,4 +126,18 @@ pub fn build(b: *std.Build) void {
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    // The nested leave-one-out fits are ~400× slower in Debug: test them
+    // optimised.
+    const correction_opt = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/correction.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const refine_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/refine.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "correction", .module = correction_opt }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(refine_tests).step);
 }

@@ -28,6 +28,8 @@ const Reply = @import("socket_source").Reply;
 const geo = @import("geometry.zig");
 const config = @import("config.zig");
 const fixation = @import("fixation.zig");
+const refine = @import("refine.zig");
+const corr = @import("correction");
 
 const c = @cImport({
     @cInclude("gtk/gtk.h");
@@ -54,6 +56,9 @@ const usage =
     \\                  Saved there when step 1 is confirmed.
     \\  --step STEP     run one step only: display | calibrate | validate
     \\                  (calibrate includes the position guide)
+    \\  --simulate-gaze testing: ignore the tracker's gaze and synthesise a
+    \\                  viewer who looks at the active dot (with a fixed drift
+    \\                  field and noise); never use for a real calibration
     \\  -h, --help      this help
     \\
 ;
@@ -67,6 +72,7 @@ var opt_gap: ?f64 = null; // --gap
 /// Gap in use: --gap, else "gap_mm" of tobii.json, else the default.
 var gap_mm: f64 = geo.DEFAULT_GAP_MM;
 var opt_only: Only = .all;
+var opt_simulate = false;
 
 // ─── Gaze-contingent dots (tune here) ───────────────────────────────
 //
@@ -268,6 +274,13 @@ fn onAreaSet(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
     redraw();
 }
 
+fn onGazeRaw(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
+    switch (reply) {
+        .ok => log.info("raw gaze (daemon correction map not applied to this client)", .{}),
+        .err => |e| log.warn("set_gaze_raw: {s} (daemon without correction support: gaze is raw anyway)", .{errName(e)}),
+    }
+}
+
 fn onAreaGot(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
     switch (reply) {
         .ok => |p| if (SocketSource.decodeDisplayArea(p)) |a| {
@@ -293,6 +306,7 @@ fn errName(code: u32) []const u8 {
         proto.Err.usb => "USB error",
         proto.Err.disconnected => "daemon disconnected",
         proto.Err.no_device => "no tracker connected",
+        proto.Err.mismatch => "mismatch",
         else => "device status error",
     };
 }
@@ -848,25 +862,45 @@ fn drawCalibrate(cr: *c.cairo_t, w: f64, h: f64) void {
     }
 }
 
-// ─── Step 4: validation ─────────────────────────────────────────────
+// ─── Step 4: validation + correction map ────────────────────────────
+//
+// 4×4 gaze-contingent dots. Samples are collected raw (set_gaze_raw: the
+// daemon's correction map, if any, is not applied), so from the same data
+// the tool computes: the uncorrected error, the error after the current map
+// (if the daemon holds an active one), and the leave-one-out error of a new
+// map fitted on these dots (refine.zig). ENTER applies the decision (save the
+// new map / remove a map that hurts / nothing); ESC leaves everything as is.
 
+const VAL_GRID = [_]f64{ 0.1, 0.3667, 0.6333, 0.9 };
+const VAL_N = VAL_GRID.len * VAL_GRID.len;
 const VAL_POINTS = blk: {
-    var pts: [9][2]f64 = undefined;
-    for ([_]f64{ 0.1, 0.5, 0.9 }, 0..) |yv, j| {
-        for ([_]f64{ 0.1, 0.5, 0.9 }, 0..) |xv, i| pts[j * 3 + i] = .{ xv, yv };
+    var pts: [VAL_N][2]f64 = undefined;
+    for (VAL_GRID, 0..) |yv, j| {
+        for (VAL_GRID, 0..) |xv, i| pts[j * VAL_GRID.len + i] = .{ xv, yv };
     }
     break :blk pts;
 };
-const ValPhase = enum { intro, dot, results };
+const VAL_MAX_SAMPLES = 256;
+
+const ValPhase = enum { intro, dot, analysing, results };
 var val_phase: ValPhase = .intro;
 var val_idx: usize = 0;
 var val_t0: i64 = 0;
-var val_results: [9]?geo.PointError = .{null} ** 9;
-var val_sum: struct { gx: f64 = 0, gy: f64 = 0, n: u32 = 0, z: f64 = 0, zn: u32 = 0 } = .{};
-var val_fallback: [9]bool = .{false} ** 9; // measured on a fixation away from the dot
+var val_dots: [VAL_N]?refine.Dot = .{null} ** VAL_N;
+var val_sx: [VAL_MAX_SAMPLES]f64 = undefined;
+var val_sy: [VAL_MAX_SAMPLES]f64 = undefined;
+var val_sum: struct { n: u32 = 0, z: f64 = 0, zn: u32 = 0 } = .{};
+var val_fallback: [VAL_N]bool = .{false} ** VAL_N; // measured on a fixation away from the dot
 var val_collected_s: f64 = 0;
 var val_last_acc: i64 = 0; // last accepted sample
 var val_fix_t: i64 = 0; // first accepted sample of the dot
+var val_analysis: ?refine.Analysis = null;
+var val_saving = false;
+
+// Map the daemon holds (get_correction at the start of the validation).
+var active_file: ?std.json.Parsed(corr.File) = null;
+var active_map: ?corr.Map = null;
+var active_state: u8 = 0; // 0 none, 1 active, 2 stored but inactive
 
 fn startValDot() void {
     val_phase = .dot;
@@ -881,13 +915,48 @@ var val_live = false;
 
 fn enterValidate() void {
     val_idx = 0;
-    val_results = .{null} ** 9;
-    val_fallback = .{false} ** 9;
+    val_dots = .{null} ** VAL_N;
+    val_fallback = .{false} ** VAL_N;
+    val_analysis = null;
+    val_saving = false;
     val_t0 = now();
     val_phase = .intro;
     setCursorHidden(true);
-    // Fresh area (the errors are converted to mm with it).
+    // Fresh area (the errors are converted to mm with it) and the current map.
     src.getDisplayArea(onAreaGot, null) catch {};
+    src.getCorrection(onCorrectionGot, null) catch {};
+}
+
+fn onCorrectionGot(_: ?*anyopaque, _: proto.Cmd, reply: Reply) void {
+    if (active_file) |*f| f.deinit();
+    active_file = null;
+    active_map = null;
+    active_state = 0;
+    const p = switch (reply) {
+        .ok => |p| p,
+        .err => |e| {
+            log.warn("get_correction: {s} (daemon without correction support?)", .{errName(e)});
+            return;
+        },
+    };
+    if (p.len == 0) return;
+    active_state = p[0];
+    if (active_state == 0) {
+        log.info("no correction map in the daemon", .{});
+        return;
+    }
+    const parsed = corr.parseFile(gpa, p[1..]) catch |err| {
+        log.warn("correction map from the daemon unreadable: {}", .{err});
+        return;
+    };
+    if (active_state != 1) {
+        log.info("the daemon holds an inactive correction map (other calibration/area, or disabled)", .{});
+        parsed.deinit();
+        return;
+    }
+    active_map = parsed.value.map() catch null;
+    active_file = parsed;
+    log.info("active correction map: {d} points, lambda {d}", .{ parsed.value.points.len, parsed.value.lambda });
 }
 
 /// Collect the sample if it belongs to a fixation on the dot (or anywhere
@@ -901,12 +970,13 @@ fn valAccumulate(s: *const core.GazeSample) void {
     const f = currentFixation() orelse return;
     const t = VAL_POINTS[val_idx];
     if (!val_fallback[val_idx] and fixOffsetDeg(f, t[0], t[1]) > VAL_RADIUS_DEG) return;
+    if (val_sum.n == VAL_MAX_SAMPLES) return;
     const tn = now();
     if (val_fix_t == 0) val_fix_t = tn;
     if (val_last_acc != 0 and tn - val_last_acc < 100_000) val_collected_s += @as(f64, @floatFromInt(tn - val_last_acc)) / 1e6;
     val_last_acc = tn;
-    val_sum.gx += s.gaze_point_2d_norm[0];
-    val_sum.gy += s.gaze_point_2d_norm[1];
+    val_sx[val_sum.n] = s.gaze_point_2d_norm[0];
+    val_sy[val_sum.n] = s.gaze_point_2d_norm[1];
     val_sum.n += 1;
     if (l) {
         val_sum.z += s.eye_origin_L_mm[2];
@@ -916,6 +986,53 @@ fn valAccumulate(s: *const core.GazeSample) void {
         val_sum.z += s.eye_origin_R_mm[2];
         val_sum.zn += 1;
     }
+}
+
+fn finishValDot(el: f64) void {
+    const t = VAL_POINTS[val_idx];
+    const enough = val_collected_s >= VAL_MIN_COLLECT_S;
+    if (val_fix_t != 0) {
+        const fix_after = @as(f64, @floatFromInt(val_fix_t - val_t0)) / 1e6;
+        const fb: []const u8 = if (val_fallback[val_idx]) ", fallback (not near the dot)" else "";
+        log.info("validation dot {d}: fixation after {d:.2}s, {d:.2}s of fixation ({d} samples) in {d:.2}s{s}", .{ val_idx, fix_after, val_collected_s, val_sum.n, el, fb });
+    }
+    if (enough and val_sum.n > 0 and val_sum.zn > 0) {
+        const n = val_sum.n;
+        const d = refine.Dot{
+            .tx = t[0],
+            .ty = t[1],
+            .gx = refine.median(val_sx[0..n]),
+            .gy = refine.median(val_sy[0..n]),
+            .z_mm = val_sum.z / @as(f64, @floatFromInt(val_sum.zn)),
+            .n = n,
+            .fallback = val_fallback[val_idx],
+        };
+        val_dots[val_idx] = d;
+        if (device_area) |a| {
+            const e = geo.pointError(d.tx, d.ty, d.gx, d.gy, d.z_mm, a, n);
+            log.info("validation dot {d} ({d:.2},{d:.2}): {d:.2} deg, {d:.1} mm (dx {d:.1} dy {d:.1}), eye z {d:.0} mm, {d} samples (raw, median)", .{ val_idx, t[0], t[1], e.err_deg, e.err_mm, e.dx_mm, e.dy_mm, e.eye_z_mm, n });
+        }
+    } else {
+        log.warn("validation dot {d}: no fixation ({d:.2}s collected in {d:.1}s)", .{ val_idx, val_collected_s, el });
+    }
+}
+
+fn analyseValidation() void {
+    const area = device_area orelse {
+        log.err("validation: no display area, cannot compute errors", .{});
+        val_phase = .results;
+        return;
+    };
+    const t0 = now();
+    const am: ?*const corr.Map = if (active_map) |*m| m else null;
+    val_analysis = refine.analyse(&val_dots, area, am);
+    const an = &val_analysis.?;
+    log.info("validation: {d}/{d} dots used, uncorrected mean {d:.2} deg max {d:.2} deg ({d:.1} mm mean)", .{ an.n_fit, VAL_N, an.raw.mean_deg, an.raw.max_deg, an.raw.mean_mm });
+    if (an.active) |a| log.info("validation: current map mean {d:.2} deg max {d:.2} deg", .{ a.mean_deg, a.max_deg });
+    if (an.loo) |l| log.info("validation: new map, leave-one-out mean {d:.2} deg max {d:.2} deg (lambda {d})", .{ l.mean_deg, l.max_deg, an.map.?.params.lambda });
+    log.info("validation: decision {s} (analysis {d:.0} ms)", .{ @tagName(an.decision), @as(f64, @floatFromInt(now() - t0)) / 1e3 });
+    val_phase = .results;
+    setCursorHidden(false);
 }
 
 fn tickValidate() void {
@@ -928,32 +1045,74 @@ fn tickValidate() void {
                 log.warn("validation dot {d}: no fixation within {d:.0} deg after {d:.0}s, measuring on any stable fixation", .{ val_idx, VAL_RADIUS_DEG, VAL_FALLBACK_S });
             }
             if (val_collected_s < VAL_COLLECT_S and el < VAL_TIMEOUT_S) return;
-            const t = VAL_POINTS[val_idx];
-            const enough = val_collected_s >= VAL_MIN_COLLECT_S;
-            if (val_fix_t != 0) {
-                const fix_after = @as(f64, @floatFromInt(val_fix_t - val_t0)) / 1e6;
-                const fb: []const u8 = if (val_fallback[val_idx]) ", fallback (not near the dot)" else "";
-                log.info("validation dot {d}: fixation after {d:.2}s, {d:.2}s of fixation ({d} samples) in {d:.2}s{s}", .{ val_idx, fix_after, val_collected_s, val_sum.n, el, fb });
-            }
-            if (enough and val_sum.n > 0 and val_sum.zn > 0 and device_area != null) {
-                const n: f64 = @floatFromInt(val_sum.n);
-                const e = geo.pointError(t[0], t[1], val_sum.gx / n, val_sum.gy / n, val_sum.z / @as(f64, @floatFromInt(val_sum.zn)), device_area.?, val_sum.n);
-                val_results[val_idx] = e;
-                log.info("validation dot {d} ({d:.1},{d:.1}): {d:.2} deg, {d:.1} mm (dx {d:.1} dy {d:.1}), eye z {d:.0} mm, {d} samples", .{ val_idx, t[0], t[1], e.err_deg, e.err_mm, e.dx_mm, e.dy_mm, e.eye_z_mm, e.samples });
-            } else {
-                log.warn("validation dot {d}: no fixation ({d:.2}s collected in {d:.1}s)", .{ val_idx, val_collected_s, el });
-            }
+            finishValDot(el);
             val_idx += 1;
             val_t0 = now();
             if (val_idx == VAL_POINTS.len) {
-                val_phase = .results;
-                setCursorHidden(false);
-                const s = geo.summarize(&val_results);
-                log.info("validation: {d}/9 dots, mean {d:.2} deg ({d:.1} mm), max {d:.2} deg ({d:.1} mm), eye distance {d:.0} mm", .{ s.n, s.mean_deg, s.mean_mm, s.max_deg, s.max_mm, s.mean_eye_z_mm });
+                // One frame of "computing" before the (synchronous) analysis.
+                val_phase = .analysing;
             } else startValDot();
         },
-        else => {},
+        .analysing => if (secsSince(val_t0) >= 0.05) analyseValidation(),
+        .results => {},
     }
+}
+
+/// ENTER on the results: apply the decision, then quit.
+fn applyDecision() void {
+    if (val_saving) return;
+    const an = if (val_analysis) |*a| a else return quit(0);
+    switch (an.decision) {
+        .keep_new => {
+            var pbuf: [512]u8 = undefined;
+            const path = calibrationPath(&pbuf) orelse "";
+            const blob = std.fs.cwd().readFileAlloc(gpa, path, 4 << 20) catch {
+                setMsg(true, "No stored calibration ({s}): map not saved", .{path});
+                an.decision = .none;
+                return;
+            };
+            const sha = corr.sha256Hex(blob);
+            gpa.free(blob);
+            const json = refine.fileJson(gpa, an, &val_dots, device_area.?, &sha, std.time.timestamp()) catch |err| {
+                setMsg(true, "Could not build the map: {}", .{err});
+                an.decision = .none;
+                return;
+            };
+            defer gpa.free(json);
+            src.setCorrection(json, onDecisionApplied, null) catch |err| {
+                setMsg(true, "Could not send the map: {}", .{err});
+                an.decision = .none;
+                return;
+            };
+            val_saving = true;
+            setMsg(false, "Saving the correction map…", .{});
+        },
+        .clear_active => {
+            src.clearCorrection(onDecisionApplied, null) catch |err| {
+                setMsg(true, "Could not remove the map: {}", .{err});
+                an.decision = .none;
+                return;
+            };
+            val_saving = true;
+            setMsg(false, "Removing the correction map…", .{});
+        },
+        .keep_active, .none => quit(0),
+    }
+}
+
+fn onDecisionApplied(_: ?*anyopaque, cmd: proto.Cmd, reply: Reply) void {
+    val_saving = false;
+    switch (reply) {
+        .ok => {
+            log.info("{s}: done", .{@tagName(cmd)});
+            quit(0);
+        },
+        .err => |e| {
+            setMsg(true, "The daemon refused: {s}{s}", .{ errName(e), if (e == proto.Err.mismatch) " (map made for another calibration or display area)" else "" });
+            if (val_analysis) |*a| a.decision = .none; // ENTER again quits
+        },
+    }
+    redraw();
 }
 
 fn keyValidate(keyval: c_uint) void {
@@ -962,7 +1121,7 @@ fn keyValidate(keyval: c_uint) void {
         c.GDK_KEY_r, c.GDK_KEY_R => enterStep(.position),
         c.GDK_KEY_v, c.GDK_KEY_V => enterValidate(),
         c.GDK_KEY_g, c.GDK_KEY_G => val_live = !val_live,
-        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter, c.GDK_KEY_space => quit(0),
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter, c.GDK_KEY_space => applyDecision(),
         else => {},
     }
 }
@@ -970,8 +1129,8 @@ fn keyValidate(keyval: c_uint) void {
 fn drawValidate(cr: *c.cairo_t, w: f64, h: f64) void {
     switch (val_phase) {
         .intro => {
-            _ = text(cr, w / 2, h * 0.45, 28, .center, FG, "Validation: look at each dot until it shrinks away", .{});
-            _ = text(cr, w / 2, h * 0.45 + 44 * ui, 18, .center, DIM, "ESC quits (the calibration is already saved)", .{});
+            _ = text(cr, w / 2, h * 0.47, 28, .center, FG, "Validation: look at each dot until it shrinks away", .{});
+            _ = text(cr, w / 2, h * 0.47 + 44 * ui, 18, .center, DIM, "16 dots · ESC quits (the calibration is already saved)", .{});
             const t = VAL_POINTS[0];
             drawTarget(cr, t[0] * w, t[1] * h, 8 * ui, ACC_DIM);
         },
@@ -984,6 +1143,7 @@ fn drawValidate(cr: *c.cairo_t, w: f64, h: f64) void {
             drawDotHint(cr, w, h, val_fallback[val_idx]);
             drawTarget(cr, t[0] * w, t[1] * h, r * ui, dotColour());
         },
+        .analysing => _ = text(cr, w / 2, h * 0.47, 28, .center, FG, "Computing the correction map…", .{}),
         .results => drawResults(cr, w, h),
     }
 }
@@ -992,9 +1152,24 @@ fn qualityColour(deg: f64) Rgb {
     return if (deg < 1.0) GOOD else if (deg < 2.0) ACC else WARN;
 }
 
+fn arrow(cr: *c.cairo_t, x0: f64, y0: f64, x1: f64, y1: f64, col: Rgb, width: f64) void {
+    c.cairo_set_source_rgb(cr, col[0], col[1], col[2]);
+    c.cairo_set_line_width(cr, width * ui);
+    c.cairo_new_path(cr);
+    c.cairo_move_to(cr, x0, y0);
+    c.cairo_line_to(cr, x1, y1);
+    c.cairo_stroke(cr);
+    c.cairo_new_path(cr);
+    c.cairo_arc(cr, x1, y1, (width + 2) * ui, 0, 2 * std.math.pi);
+    c.cairo_fill(cr);
+}
+
 fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
+    const an_opt: ?*const refine.Analysis = if (val_analysis) |*a| a else null;
     var any_fallback = false;
-    for (VAL_POINTS, val_results, val_fallback) |t, r, fb| {
+    // Per dot: target ring, grey arrow to the raw gaze, coloured arrow to the
+    // leave-one-out corrected gaze.
+    for (VAL_POINTS, 0..) |t, i| {
         const tx = t[0] * w;
         const ty = t[1] * h;
         c.cairo_set_line_width(cr, 2 * ui);
@@ -1002,40 +1177,68 @@ fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
         c.cairo_new_path(cr);
         c.cairo_arc(cr, tx, ty, 10 * ui, 0, 2 * std.math.pi);
         c.cairo_stroke(cr);
-        if (r) |e| {
-            const col = qualityColour(e.err_deg);
-            const gx = e.gx * w;
-            const gy = e.gy * h;
-            c.cairo_set_source_rgb(cr, col[0], col[1], col[2]);
-            c.cairo_new_path(cr);
-            c.cairo_move_to(cr, tx, ty);
-            c.cairo_line_to(cr, gx, gy);
-            c.cairo_stroke(cr);
-            c.cairo_new_path(cr);
-            c.cairo_arc(cr, gx, gy, 5 * ui, 0, 2 * std.math.pi);
-            c.cairo_fill(cr);
-            const below = t[1] < 0.5;
-            _ = text(cr, tx, ty + @as(f64, if (below) 22 else -48) * ui, 18, .center, col, "{d:.2}° · {d:.1} mm{s}", .{ e.err_deg, e.err_mm, if (fb) " *" else "" });
-            any_fallback = any_fallback or fb;
+        const below = t[1] < 0.5;
+        const ly = ty + @as(f64, if (below) 20 else -40) * ui;
+        const res = if (an_opt) |an| an.results[i] else null;
+        const r = res orelse {
+            _ = text(cr, tx, ly, 16, .center, WARN, "no fixation", .{});
+            continue;
+        };
+        const fb = val_fallback[i];
+        any_fallback = any_fallback or fb;
+        arrow(cr, tx, ty, r.raw.gx * w, r.raw.gy * h, .{ 0.5, 0.5, 0.55 }, 1.5);
+        if (r.loo) |l| {
+            arrow(cr, tx, ty, l.gx * w, l.gy * h, qualityColour(l.err_deg), 2);
+            _ = text(cr, tx, ly, 16, .center, qualityColour(l.err_deg), "{d:.2}° → {d:.2}°{s}", .{ r.raw.err_deg, l.err_deg, if (fb) " *" else "" });
         } else {
-            _ = text(cr, tx, ty + 22 * ui, 18, .center, WARN, "no fixation", .{});
+            _ = text(cr, tx, ly, 16, .center, qualityColour(r.raw.err_deg), "{d:.2}°{s}", .{ r.raw.err_deg, if (fb) " *" else "" });
         }
     }
 
-    const s = geo.summarize(&val_results);
-    var y = h * 0.3;
-    y += text(cr, w / 2, y, 34, .center, FG, "Step 4 · Validation", .{});
-    y += 10 * ui;
-    if (s.n == 0) {
-        y += text(cr, w / 2, y, 24, .center, WARN, "No gaze was recorded: were your eyes in front of the tracker?", .{});
+    var y = h * 0.415;
+    y += text(cr, w / 2, y, 28, .center, FG, "Step 4 · Validation", .{});
+    const an = an_opt orelse {
+        _ = text(cr, w / 2, y, 20, .center, WARN, "No display area: errors cannot be computed. ESC quits.", .{});
+        return;
+    };
+    if (an.n_fit == 0) {
+        y += text(cr, w / 2, y, 20, .center, WARN, "No gaze was recorded: were your eyes in front of the tracker?", .{});
     } else {
-        y += text(cr, w / 2, y, 26, .center, qualityColour(s.mean_deg), "mean error {d:.2}° ({d:.1} mm) · max {d:.2}° ({d:.1} mm)", .{ s.mean_deg, s.mean_mm, s.max_deg, s.max_mm });
-        y += text(cr, w / 2, y, 18, .center, DIM, "{d}/9 dots · eyes at {d:.0} cm · below 1° is good, above 2° redo the calibration", .{ s.n, s.mean_eye_z_mm / 10 });
-        if (any_fallback) y += text(cr, w / 2, y, 18, .center, ACC, "* no fixation within {d:.0}° of the dot: measured on the fixation found, the error may be larger", .{VAL_RADIUS_DEG});
+        y += text(cr, w / 2, y, 20, .center, qualityColour(an.raw.mean_deg), "uncorrected: {d:.2}° mean · {d:.2}° max", .{ an.raw.mean_deg, an.raw.max_deg });
+        if (an.active) |a| y += text(cr, w / 2, y, 20, .center, qualityColour(a.mean_deg), "current map: {d:.2}° mean · {d:.2}° max", .{ a.mean_deg, a.max_deg });
+        if (an.loo) |l| {
+            y += text(cr, w / 2, y, 20, .center, qualityColour(l.mean_deg), "new map (leave-one-out): {d:.2}° mean · {d:.2}° max", .{ l.mean_deg, l.max_deg });
+        } else {
+            y += text(cr, w / 2, y, 16, .center, DIM, "too few dots for a correction map", .{});
+        }
+        const dcol: Rgb = switch (an.decision) {
+            .keep_new => GOOD,
+            .clear_active => ACC,
+            else => DIM,
+        };
+        const dtext: []const u8 = switch (an.decision) {
+            .keep_new => "ENTER saves the new correction map",
+            .keep_active => "the current map stays (the new one would not do better)",
+            .clear_active => "the current map does not help: ENTER removes it",
+            .none => "no improvement: no correction map",
+        };
+        y += text(cr, w / 2, y, 18, .center, dcol, "{s}", .{dtext});
+        if (any_fallback) y += text(cr, w / 2, y, 14, .center, ACC, "* no fixation within {d:.0}° of the dot: not used for the map", .{VAL_RADIUS_DEG});
     }
-    y += 16 * ui;
-    _ = text(cr, w / 2, y, 20, .center, FG, "R redo calibration · V validate again · G live gaze {s} · ENTER done", .{if (val_live) "off" else "on"});
-    if (val_live) drawGazeDot(cr, w, h);
+    y += 6 * ui;
+    y += text(cr, w / 2, y, 16, .center, FG, "ENTER done · V again · R recalibrate · G gaze {s} · ESC quit, change nothing", .{if (val_live) "off" else "on"});
+    drawMsg(cr, w, y + 4 * ui);
+    if (val_live) {
+        drawGazeDot(cr, w, h);
+        // Same gaze through the new map (blue).
+        if (an.map) |*m| if (gazeFresh() and (eyeValid(gaze.validity_L) or eyeValid(gaze.validity_R))) {
+            const cg = m.correct(gaze.gaze_point_2d_norm[0], gaze.gaze_point_2d_norm[1]);
+            c.cairo_set_source_rgba(cr, ON_GAZE[0], ON_GAZE[1], ON_GAZE[2], 0.7);
+            c.cairo_new_path(cr);
+            c.cairo_arc(cr, cg[0] * w, cg[1] * h, 10 * ui, 0, 2 * std.math.pi);
+            c.cairo_fill(cr);
+        };
+    }
 }
 
 // ─── Steps ──────────────────────────────────────────────────────────
@@ -1155,6 +1358,58 @@ fn onDragUpdate(_: ?*c.GtkGestureDrag, ox: f64, _: f64, _: ?*anyopaque) callconv
 
 fn onDragEnd(_: ?*c.GtkGestureDrag, _: f64, _: f64, _: ?*anyopaque) callconv(.c) void {
     drag_line = null;
+}
+
+// ─── Simulated viewer (--simulate-gaze, tests) ──────────────────────
+//
+// Looks at the active calibration/validation dot (screen centre otherwise)
+// after a 250 ms saccade latency, with a fixed drift field like the one
+// measured on the BenQ (upper right ~19 mm low) and 1.5 mm noise.
+
+var sim_target: [2]f64 = .{ 0.5, 0.5 };
+var sim_pending: [2]f64 = .{ 0.5, 0.5 };
+var sim_switch_t: i64 = 0;
+var sim_prng = std.Random.DefaultPrng.init(42);
+
+fn simTarget() [2]f64 {
+    return switch (step) {
+        .calibrate => if (cal_phase == .gazing or cal_phase == .adding) CAL_POINTS[cal_idx] else .{ 0.5, 0.5 },
+        .validate => if (val_phase == .dot) VAL_POINTS[val_idx] else .{ 0.5, 0.5 },
+        else => .{ 0.5, 0.5 },
+    };
+}
+
+fn simDrift(x: f64, y: f64) [2]f64 {
+    const dx = (x - 0.9) / 0.3;
+    const dy = (y - 0.1) / 0.3;
+    const b = @exp(-(dx * dx + dy * dy));
+    return .{ 3 - 4 * b, 2 + 17 * b };
+}
+
+fn simulateGaze(_: ?*anyopaque) callconv(.c) c.gboolean {
+    const t = simTarget();
+    if (t[0] != sim_pending[0] or t[1] != sim_pending[1]) {
+        sim_pending = t;
+        sim_switch_t = now();
+    }
+    if (now() - sim_switch_t > 250_000) sim_target = sim_pending;
+    const mm = screenSizeMm();
+    const rnd = sim_prng.random();
+    const d = simDrift(sim_target[0], sim_target[1]);
+    const g = [2]f64{
+        sim_target[0] + (d[0] + 1.5 * rnd.floatNorm(f64)) / mm[0],
+        sim_target[1] + (d[1] + 1.5 * rnd.floatNorm(f64)) / mm[1],
+    };
+    var s = std.mem.zeroes(core.GazeSample);
+    s.present_mask = core.GAZE_BIT_GAZE_2D;
+    s.gaze_point_2d_norm = g;
+    s.gaze_point_2d_unfiltered = g;
+    s.eye_origin_L_mm = .{ -32, -50, 720 };
+    s.eye_origin_R_mm = .{ 32, -50, 720 };
+    s.trackbox_eye_pos_L = .{ 0.55, 0.55, 0.6 };
+    s.trackbox_eye_pos_R = .{ 0.45, 0.55, 0.6 };
+    onGaze(&s);
+    return 1;
 }
 
 // ─── Main loop hooks ────────────────────────────────────────────────
@@ -1421,7 +1676,11 @@ fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_add_controller(da, @ptrCast(drag));
 
     _ = c.gtk_widget_add_tick_callback(da, onTick, null, null);
+    if (opt_simulate) _ = c.g_timeout_add(33, simulateGaze, null);
     _ = c.g_unix_fd_add(src.fd, c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR, onReadable, null);
+    // Raw gaze for this tool: the daemon's correction map must not be applied
+    // to what we measure (the validation computes corrected numbers itself).
+    src.setGazeRaw(true, onGazeRaw, null) catch {};
     _ = c.g_unix_signal_add(std.posix.SIG.INT, onSignal, null);
     _ = c.g_unix_signal_add(std.posix.SIG.TERM, onSignal, null);
 
@@ -1451,6 +1710,8 @@ fn parseArgs() !void {
             const v = args.next() orelse return error.MissingValue;
             opt_gap = try std.fmt.parseFloat(f64, v);
             if (!(opt_gap.? >= 0 and opt_gap.? < 500)) return error.BadGap;
+        } else if (std.mem.eql(u8, a, "--simulate-gaze")) {
+            opt_simulate = true;
         } else if (std.mem.eql(u8, a, "--step")) {
             const v = args.next() orelse return error.MissingValue;
             opt_only = std.meta.stringToEnum(Only, v) orelse return error.BadStep;
@@ -1476,7 +1737,7 @@ pub fn main() u8 {
         return 1;
     };
     defer src.deinit();
-    src.onGaze(onGaze);
+    if (!opt_simulate) src.onGaze(onGaze) else log.warn("--simulate-gaze: synthetic gaze, the tracker's is ignored", .{});
 
     const app = c.gtk_application_new("dev.tobiifree.setup", c.G_APPLICATION_NON_UNIQUE);
     gtk_app = @ptrCast(app);
