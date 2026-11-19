@@ -13,6 +13,19 @@
 //   tobiifreed --no-device               # testing: never open the tracker (daemon-side commands only)
 //   tobiifreed --no-device --fake-gaze X,Y  # testing: + 30 Hz synthetic samples at (X, Y), and the
 //                                        #   stored calibration counts as applied
+//   tobiifreed --user NAME               # system daemon (root): NAME's files and command socket
+//
+// Sockets, in $XDG_RUNTIME_DIR/tobiifreed/:
+//   gaze.sock   gaze + commands (daemon protocol). With --user: NAME's, 0600.
+//   image.sock  IR camera frames (Srv.stream_data, TTP stream 0x501) for
+//               peers with the daemon's own uid only (root for a system
+//               daemon). The tracker is asked for the stream when the first
+//               image client connects; frames go to a small ring that drops
+//               them when full, so image clients never hold up gaze.
+// A system daemon runs as root with XDG_RUNTIME_DIR=/run (sockets in
+// /run/tobiifreed/, where clients look when no per-user daemon answers) and
+// --user NAME: HOME is NAME's, and tobii.json and the state files are read
+// and written with NAME's filesystem ids (see config.zig).
 //
 // Threads:
 //   USB thread  — tracker.poll(): feeds USB data to the core, which calls
@@ -62,6 +75,7 @@ const Tracker = @import("tracker").Tracker;
 const LibusbTransport = @import("libusb_transport").LibusbTransport;
 const Server = @import("server").Server;
 const WsServer = @import("ws_server").WsServer;
+const image_server = @import("image_server.zig");
 const config = @import("config.zig");
 const proto = @import("daemon_protocol");
 const corr_mod = @import("correction");
@@ -90,6 +104,7 @@ var transport: LibusbTransport = undefined;
 var tracker: Tracker = undefined;
 var server: Server = undefined;
 var ws: ?WsServer = null;
+var image: image_server.ImageServer = undefined;
 var quit: bool = false;
 var notify_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
@@ -130,6 +145,62 @@ fn drainGaze() void {
         if (ws) |*w_| w_.broadcastGaze(sample, cs);
         gaze_read +%= 1;
     }
+}
+
+// ── IR images: USB thread → main thread ─────────────────────────────
+//
+// The tracker is asked for the image stream when the first image client
+// connects (once per device connection: no unsubscribe is known, so it then
+// flows until the next reconnect). The USB thread copies frames only while
+// a client is connected, and drops them while the ring is full.
+
+const IMAGE_RING = 4;
+const ImageFrame = struct { len: u32, data: [image_server.FRAME_MAX]u8 };
+var image_ring: [IMAGE_RING]ImageFrame = undefined;
+var image_write = std.atomic.Value(u32).init(0);
+var image_read = std.atomic.Value(u32).init(0);
+var image_wanted = std.atomic.Value(bool).init(false);
+var image_subscribed = false; // main thread; reset when the tracker is lost
+var image_subscribe_ms: i64 = 0;
+
+fn onImage(payload: []const u8) void {
+    if (!image_wanted.load(.acquire) or payload.len > image_server.FRAME_MAX) return;
+    const w = image_write.load(.monotonic);
+    if (w -% image_read.load(.acquire) >= IMAGE_RING) return;
+    const f = &image_ring[w % IMAGE_RING];
+    f.len = @intCast(payload.len);
+    @memcpy(f.data[0..payload.len], payload);
+    image_write.store(w +% 1, .release);
+    notifyMain();
+}
+
+fn serviceImages() void {
+    const had_clients = image.n_clients > 0;
+    image.acceptClients();
+    image.service();
+    // A first client must not get frames left from an earlier one.
+    if (!had_clients) image_read.store(image_write.load(.acquire), .release);
+    const w = image_write.load(.acquire);
+    var r = image_read.load(.monotonic);
+    while (r != w) : (r +%= 1) {
+        const f = &image_ring[r % IMAGE_RING];
+        image.broadcast(proto.IMAGE_STREAM, f.data[0..f.len]);
+        image_read.store(r +% 1, .release);
+    }
+    image_wanted.store(image.n_clients > 0, .release);
+    if (image.n_clients == 0 or image_subscribed) return;
+    if (dev_state.load(.acquire) != .up or deviceBusy()) return;
+    const now = std.time.milliTimestamp();
+    if (now - image_subscribe_ms < 1000) return;
+    image_subscribe_ms = now;
+    _ = core.request_subscribe(proto.IMAGE_STREAM);
+    const n = core.session_out_len_();
+    if (n == 0 or !transport.send(core.session_out_ptr()[0..n])) {
+        log.warn("could not subscribe to the image stream; retrying", .{});
+        return;
+    }
+    image_subscribed = true;
+    log.info("subscribed to the image stream", .{});
 }
 
 // ── Client replies ──────────────────────────────────────────────────
@@ -655,7 +726,7 @@ fn installCorrection(c: Correction) void {
 fn deleteHistory(reason: []const u8) void {
     var pbuf: [512]u8 = undefined;
     const path = config.correctionRunsPath(&pbuf) orelse return;
-    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+    config.deleteFile(path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => {
             log.warn("could not delete {s}: {}", .{ path, err });
@@ -685,7 +756,7 @@ fn checkHistory() void {
 fn deleteCorrection(reason: []const u8) void {
     var pbuf: [512]u8 = undefined;
     if (config.correctionPath(&pbuf)) |path| {
-        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        config.deleteFile(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => log.warn("could not delete {s}: {}", .{ path, err }),
         };
@@ -970,6 +1041,7 @@ fn setState(st: DevState) void {
 /// Main thread: on loss, fail what's in flight, then let the USB thread go.
 fn serviceDeviceState() void {
     if (dev_state.load(.acquire) != .lost or lost_ack.load(.acquire)) return;
+    image_subscribed = false;
     var dropped: [MAX_PENDING]PendingEntry = undefined;
     var n: usize = 0;
     {
@@ -1141,8 +1213,10 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
-/// Debug: log every TTP response frame (magic 0x52) with its status word.
+/// IR image notifications go to the image ring. Debug: log every TTP
+/// response frame (magic 0x52) with its status word.
 fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_len: u32) void {
+    if (magic == core.TTP_MAGIC_NOTIFY and op == proto.IMAGE_STREAM) return onImage(payload_ptr[0..payload_len]);
     if (magic != core.TTP_MAGIC_RSP) return;
     const n = @min(payload_len, 32);
     log.debug("ttp rsp seq={d} op=0x{x} status=0x{x} plen={d} head={x}", .{ seq, op, core.response_status(), payload_len, payload_ptr[0..n] });
@@ -1152,7 +1226,7 @@ fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_l
 
 fn usage() void {
     std.debug.print(
-        \\usage: tobiifreed [--ws [addr:]port] [--keep-device-area] [--no-restore-calibration] [--init-config] [--no-device]
+        \\usage: tobiifreed [--ws [addr:]port] [--keep-device-area] [--no-restore-calibration] [--init-config] [--no-device] [--user NAME]
         \\
     , .{});
 }
@@ -1187,6 +1261,16 @@ pub fn main() void {
             restore_calibration = false;
         } else if (std.mem.eql(u8, arg, "--no-device")) {
             opt_no_device = true;
+        } else if (std.mem.eql(u8, arg, "--user")) {
+            const name = args.next() orelse {
+                usage();
+                return;
+            };
+            config.user = config.lookupUser(gpa, name) orelse {
+                log.err("--user {s}: no such user", .{name});
+                return;
+            };
+            log.info("serving {s}: files in {s}", .{ name, config.user.?.home });
         } else if (std.mem.eql(u8, arg, "--fake-gaze")) {
             const v = args.next() orelse "";
             var it = std.mem.splitScalar(u8, v, ',');
@@ -1268,11 +1352,18 @@ pub fn main() void {
     // queries, which use their own capture hook).
     core.set_hooks(onTtpFrame, null, onResponse, null, null);
 
-    server.init(&forwardCommand) catch |err| {
+    const owner: ?Server.Owner = if (config.user) |u| .{ .uid = u.uid, .gid = u.gid } else null;
+    server.init(&forwardCommand, owner) catch |err| {
         log.err("failed to start server: {}", .{err});
         return;
     };
     defer server.deinit();
+
+    image.init() catch |err| {
+        log.err("failed to start the image socket: {}", .{err});
+        return;
+    };
+    defer image.deinit();
 
     if (ws_enabled) {
         ws = WsServer.init(ws_addr, ws_port, &forwardCommand) catch |err| {
@@ -1310,6 +1401,7 @@ pub fn main() void {
         sweepPending();
         server.acceptClients();
         server.readCommands();
+        serviceImages();
         if (ws) |*w| {
             w.acceptClients();
             w.readClients();

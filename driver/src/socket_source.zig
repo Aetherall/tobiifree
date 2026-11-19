@@ -95,13 +95,28 @@ pub const SocketSource = struct {
         return initWithAllocator(std.heap.page_allocator);
     }
 
+    /// Connect to the per-user daemon ($XDG_RUNTIME_DIR/tobiifreed/gaze.sock),
+    /// else to the system one (proto.SYSTEM_SOCKET_PATH).
     pub fn initWithAllocator(allocator: std.mem.Allocator) !SocketSource {
         var path_buf: [512]u8 = undefined;
-        const path = proto.socketPath(&path_buf) orelse {
-            log.warn("no socket path (XDG_RUNTIME_DIR not set?)", .{});
-            return error.NoSocketPath;
+        const fd = blk: {
+            if (proto.socketPath(&path_buf)) |path| {
+                if (connectPath(path)) |fd| break :blk fd else |err| if (err != error.NoDaemon) return err;
+            }
+            break :blk try connectPath(proto.SYSTEM_SOCKET_PATH);
         };
+        errdefer std.posix.close(fd);
 
+        var self = try fromFd(allocator, fd);
+        // Subscribe to gaze immediately.
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, 0x500, .little); // STREAM_GAZE
+        self.sendRaw(.subscribe, &payload) catch {};
+        log.info("connected to tobiifreed", .{});
+        return self;
+    }
+
+    fn connectPath(path: []const u8) !std.posix.fd_t {
         const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
         errdefer std.posix.close(fd);
 
@@ -120,14 +135,7 @@ pub const SocketSource = struct {
                 else => err,
             };
         };
-
-        var self = try fromFd(allocator, fd);
-        // Subscribe to gaze immediately.
-        var payload: [4]u8 = undefined;
-        std.mem.writeInt(u32, &payload, 0x500, .little); // STREAM_GAZE
-        self.sendRaw(.subscribe, &payload) catch {};
-        log.info("connected to tobiifreed", .{});
-        return self;
+        return fd;
     }
 
     /// Wrap an already connected, non-blocking stream fd (tests, custom paths).

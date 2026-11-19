@@ -52,6 +52,11 @@ just bundle   # build wasm + embed in SDK
 just demo
 ```
 
+A daemon run as root for the whole machine (USB access without the udev
+rule, the IR image socket for root-only consumers such as face
+authentication) is `tobiifreed --user NAME` with `XDG_RUNTIME_DIR=/run`; see
+ARCHITECTURE.md, "System daemon".
+
 ### Nix packages
 
 ```sh

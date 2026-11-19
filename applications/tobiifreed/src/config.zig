@@ -204,10 +204,50 @@ pub fn render(gpa: std.mem.Allocator, existing: ?[]const u8, c: Corners) ![]u8 {
     return out.toOwnedSlice();
 }
 
+// ── Whose files ─────────────────────────────────────────────────────
+//
+// A per-user daemon uses its own HOME. A system daemon (root) started with
+// `--user NAME` serves NAME's files instead: HOME is NAME's home directory,
+// and every file access below runs with NAME's filesystem uid/gid
+// (setfsuid/setfsgid, per thread). Root then never follows a link NAME
+// planted in its own directories, and the files it writes belong to NAME.
+
+pub const User = struct { uid: u32, gid: u32, home: []const u8 };
+
+pub var user: ?User = null;
+
+/// NAME's uid, gid and home from the passwd database (home is allocated).
+pub fn lookupUser(gpa: std.mem.Allocator, name: [:0]const u8) ?User {
+    const pw = std.c.getpwnam(name) orelse return null;
+    const home = gpa.dupe(u8, std.mem.span(pw.dir orelse return null)) catch return null;
+    return .{ .uid = pw.uid, .gid = pw.gid, .home = home };
+}
+
+fn homeDir() ?[]const u8 {
+    if (user) |u| return u.home;
+    return std.posix.getenv("HOME");
+}
+
+const FsIds = struct { uid: usize, gid: usize };
+
+/// Switch this thread's filesystem ids to `user`'s; returns the previous ones.
+fn enterUser() ?FsIds {
+    const u = user orelse return null;
+    const linux = std.os.linux;
+    const gid = linux.syscall1(.setfsgid, u.gid);
+    return .{ .uid = linux.syscall1(.setfsuid, u.uid), .gid = gid };
+}
+
+fn leaveUser(prev: ?FsIds) void {
+    const p = prev orelse return;
+    _ = std.os.linux.syscall1(.setfsuid, p.uid);
+    _ = std.os.linux.syscall1(.setfsgid, p.gid);
+}
+
 // ── File I/O ────────────────────────────────────────────────────────
 
 pub fn configPath(buf: []u8) ?[]const u8 {
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = homeDir() orelse return null;
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, CONFIG_REL_PATH }) catch null;
 }
 
@@ -216,7 +256,7 @@ pub fn calibrationPath(buf: []u8) ?[]const u8 {
     if (std.posix.getenv("XDG_STATE_HOME")) |s| if (s.len > 0) {
         return std.fmt.bufPrint(buf, "{s}/tobiifree/calibration.bin", .{s}) catch null;
     };
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = homeDir() orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/calibration.bin", .{home}) catch null;
 }
 
@@ -225,7 +265,7 @@ pub fn correctionPath(buf: []u8) ?[]const u8 {
     if (std.posix.getenv("XDG_STATE_HOME")) |s| if (s.len > 0) {
         return std.fmt.bufPrint(buf, "{s}/tobiifree/correction.json", .{s}) catch null;
     };
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = homeDir() orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/correction.json", .{home}) catch null;
 }
 
@@ -235,17 +275,27 @@ pub fn correctionRunsPath(buf: []u8) ?[]const u8 {
     if (std.posix.getenv("XDG_STATE_HOME")) |s| if (s.len > 0) {
         return std.fmt.bufPrint(buf, "{s}/tobiifree/correction_runs.json", .{s}) catch null;
     };
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = homeDir() orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/correction_runs.json", .{home}) catch null;
 }
 
 /// Read a whole file (caller frees). Null if missing/unreadable.
 pub fn readFile(gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
+    const prev = enterUser();
+    defer leaveUser(prev);
     return std.fs.cwd().readFileAlloc(gpa, path, max) catch null;
+}
+
+pub fn deleteFile(path: []const u8) !void {
+    const prev = enterUser();
+    defer leaveUser(prev);
+    try std.fs.cwd().deleteFile(path);
 }
 
 /// Write `data` to `path` atomically (tmp file + rename), creating parent dirs.
 pub fn writeFileAtomic(path: []const u8, data: []const u8) !void {
+    const prev = enterUser();
+    defer leaveUser(prev);
     if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
     var tmp_buf: [600]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});

@@ -13,10 +13,27 @@ pub const HEADER_SIZE = 5; // 1 byte type + 4 bytes length
 
 // ── Socket path ─────────────────────────────────────────────────────
 
+/// Where the daemon listens and clients connect first:
+/// $XDG_RUNTIME_DIR/tobiifreed/gaze.sock.
 pub fn socketPath(buf: *[512]u8) ?[]const u8 {
     const runtime_dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse "/tmp";
     return std.fmt.bufPrint(buf, "{s}/tobiifreed/gaze.sock", .{runtime_dir}) catch null;
 }
+
+/// Socket of a system-wide daemon (run with XDG_RUNTIME_DIR=/run). Clients
+/// fall back to it when no per-user daemon answers.
+pub const SYSTEM_SOCKET_PATH = "/run/tobiifreed/gaze.sock";
+
+/// IR image socket, next to the command socket: $XDG_RUNTIME_DIR/tobiifreed/image.sock.
+/// Only the daemon's own uid may connect (root for a system daemon). Every
+/// client gets every frame as a Srv.stream_data message.
+pub fn imageSocketPath(buf: *[512]u8) ?[]const u8 {
+    const runtime_dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse "/tmp";
+    return std.fmt.bufPrint(buf, "{s}/tobiifreed/image.sock", .{runtime_dir}) catch null;
+}
+
+/// TTP stream of the 280×280 8-bit IR camera image (~78 KB per frame, 33 Hz).
+pub const IMAGE_STREAM: u16 = 0x501;
 
 // ── Daemon → Client message types ───────────────────────────────────
 
@@ -24,6 +41,9 @@ pub const Srv = enum(u8) {
     gaze = 0x01,
     response = 0x02,
     display_area = 0x03,
+    /// Raw TTP notification of a device stream (image socket only):
+    /// [u16 LE stream_id] [TTP payload].
+    stream_data = 0x04,
     err = 0xFF,
 };
 
@@ -92,6 +112,14 @@ pub fn encodeHeader(buf: *[HEADER_SIZE]u8, msg_type: u8, payload_len: u32) void 
 pub fn encodeGaze(buf: *[HEADER_SIZE + @sizeOf(GazeSample)]u8, sample: *const GazeSample) void {
     encodeHeader(buf[0..HEADER_SIZE], @intFromEnum(Srv.gaze), @sizeOf(GazeSample));
     @memcpy(buf[HEADER_SIZE..], std.mem.asBytes(sample));
+}
+
+/// Header + stream id of a Srv.stream_data message; the payload follows.
+pub const STREAM_DATA_HEADER_SIZE = HEADER_SIZE + 2;
+
+pub fn encodeStreamDataHeader(buf: *[STREAM_DATA_HEADER_SIZE]u8, stream_id: u16, payload_len: u32) void {
+    encodeHeader(buf[0..HEADER_SIZE], @intFromEnum(Srv.stream_data), 2 + payload_len);
+    std.mem.writeInt(u16, buf[HEADER_SIZE..][0..2], stream_id, .little);
 }
 
 pub fn encodeCmd(buf: []u8, cmd: Cmd, payload: []const u8) usize {

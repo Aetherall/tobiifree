@@ -155,6 +155,7 @@ pauses, and any device command sent meanwhile gets `err` busy.
 | `gaze` | 0x01 | GazeSample (232 bytes) |
 | `response` | 0x02 | cmd_type (u8) + reply payload |
 | `display_area` | 0x03 | 9×f64 corners (reserved; not sent by tobiifreed today) |
+| `stream_data` | 0x04 | u16 stream id + raw TTP notification payload (image socket only, see below) |
 | `err` | 0xFF | cmd_type (u8) + error code (u32) |
 
 Error codes (`daemon_protocol.Err`): 0x01 failed, 0x02 too large for the
@@ -215,6 +216,50 @@ Threads: the USB thread feeds the core and queues gaze samples / responses,
 and does (re)connection and the area + calibration restore; the main thread
 does all client I/O, request building and persistence; a job thread runs the
 client-requested calibration state machines.
+
+### Sockets
+
+In `$XDG_RUNTIME_DIR/tobiifreed/`:
+
+- `gaze.sock` — the daemon protocol above. Clients (`SocketSource`,
+  tobiifree-mouse) try it first, then the system daemon's
+  `/run/tobiifreed/gaze.sock`.
+- `image.sock` — the tracker's IR camera (TTP stream 0x501: 280×280 8-bit,
+  ~78 KB, 33 Hz). Every client gets every frame as `stream_data`
+  (`[0x04][u32 len][u16 0x501][payload]`); nothing is read from clients. The
+  socket is 0600 and the daemon accepts only peers with its own uid (root
+  for a system daemon), so no other user can read the camera, and nobody can
+  pose as the daemon in its directory. The tracker is asked for the stream
+  when the first image client connects; there is no known unsubscribe, so it
+  then flows until the next reconnect (gaze stays at 33 Hz). The USB thread
+  copies frames into a 4-frame ring only while a client is connected and
+  drops them while the ring is full; the main thread never blocks on an
+  image client (a frame it cannot take whole is finished first, later ones
+  are dropped for it). A first client never gets frames queued before it
+  connected. The image stream is not served over WebSocket.
+
+### System daemon
+
+`tobiifreed --user NAME` run as root with `XDG_RUNTIME_DIR=/run` is one
+daemon for the machine: the face-authentication broker (root) reads
+`/run/tobiifreed/image.sock` while NAME's tools use
+`/run/tobiifreed/gaze.sock`, which is NAME's and 0600 (root can still
+connect). Persistence stays NAME's: HOME is NAME's home from the passwd
+database (`XDG_STATE_HOME` from the environment, else `~/.local/state`), so
+tobiifree-setup, the overlay and tobiifree-warp keep reading and writing the
+same `~/.config/tobii.json` and `~/.local/state/tobiifree/` without sudo.
+Every file access of the daemon runs with NAME's filesystem uid/gid
+(`setfsuid`/`setfsgid` around each access, per thread): root never follows a
+link NAME planted there, and the files it writes belong to NAME. A system
+unit:
+
+```ini
+[Service]
+ExecStart=/path/to/tobiifreed --user NAME
+Environment=XDG_RUNTIME_DIR=/run
+RuntimeDirectory=tobiifreed
+UMask=0077
+```
 
 ### Persistence
 

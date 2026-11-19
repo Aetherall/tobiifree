@@ -215,7 +215,7 @@ pub fn main() !void {
     var socket_buf: [512]u8 = undefined;
     const sock_path = protocol.socketPath(&socket_buf) orelse return error.PathTooLong;
 
-    const stream = try std.net.connectUnixSocket(sock_path);
+    const stream = std.net.connectUnixSocket(sock_path) catch try std.net.connectUnixSocket(protocol.SYSTEM_SOCKET_PATH);
     defer stream.close();
 
     std.log.info("Connected to daemon socket.", .{});

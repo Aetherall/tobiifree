@@ -36,10 +36,13 @@ pub const Server = struct {
     socket_path_len: usize,
     forward_fn: ForwardFn,
 
+    /// Uid/gid the socket is given (0600) when root serves one user's session.
+    pub const Owner = struct { uid: u32, gid: u32 };
+
     /// Initialise the server in-place. The caller must ensure `self` lives in
     /// non-stack memory (e.g. a global variable) because Client.buf is ~700 KB
     /// per slot — putting 16 slots on the call stack would overflow it.
-    pub fn init(self: *Server, forward_fn: ForwardFn) !void {
+    pub fn init(self: *Server, forward_fn: ForwardFn, owner: ?Owner) !void {
         var path_buf: [512]u8 = undefined;
         const path = proto.socketPath(&path_buf) orelse return error.NoSocketPath;
 
@@ -60,6 +63,12 @@ pub const Server = struct {
         @memcpy(addr.path[0..path.len], path);
 
         try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+        if (owner) |o| {
+            const linux = std.os.linux;
+            const rc = linux.syscall5(.fchownat, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(&addr.path), o.uid, o.gid, 0);
+            if (linux.E.init(rc) != .SUCCESS) return error.ChownFailed;
+            try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
+        }
         try std.posix.listen(fd, 8);
 
         // Initialise fields individually — no large struct temporary on the stack.
@@ -70,7 +79,7 @@ pub const Server = struct {
         @memcpy(self.socket_path[0..path.len], path);
         for (&self.clients) |*slot| slot.* = null;
 
-        log.info("listening on {s}", .{path});
+        if (owner) |o| log.info("listening on {s} (uid {d} only)", .{ path, o.uid }) else log.info("listening on {s}", .{path});
     }
 
     /// Accept new clients (non-blocking).
