@@ -165,7 +165,7 @@ var gaze_last_valid_us: i64 = 0;
 var fix_det: fixation.Detector = .{};
 var eye_z_mm: f64 = 650; // latest eye distance (eye_origin z)
 
-const Step = enum { display, position, calibrate, validate };
+const Step = enum { screen, display, position, calibrate, validate };
 var step: Step = .display;
 
 var msg_buf: [256]u8 = undefined;
@@ -1344,7 +1344,7 @@ fn enterStep(s: Step) void {
     clearMsg();
     log.info("step: {s}", .{@tagName(s)});
     switch (s) {
-        .display => setCursorHidden(false),
+        .screen, .display => setCursorHidden(false),
         .position => setCursorHidden(false),
         .calibrate => enterCalibrate(),
         .validate => enterValidate(),
@@ -1408,6 +1408,7 @@ fn draw(_: [*c]c.GtkDrawingArea, cr_opt: ?*c.cairo_t, width: c_int, height: c_in
     c.cairo_set_source_rgb(cr, BG[0], BG[1], BG[2]);
     c.cairo_paint(cr);
     switch (step) {
+        .screen => drawScreen(cr, w, h),
         .display => drawDisplay(cr, w, h),
         .position => drawPosition(cr, w, h),
         .calibrate => drawCalibrate(cr, w, h),
@@ -1419,12 +1420,14 @@ fn draw(_: [*c]c.GtkDrawingArea, cr_opt: ?*c.cairo_t, width: c_int, height: c_in
 // ─── Input ──────────────────────────────────────────────────────────
 
 fn onKey(_: ?*c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, _: ?*anyopaque) callconv(.c) c.gboolean {
+    if (step == .screen and keyval != c.GDK_KEY_Escape) return @intFromBool(keyScreen(keyval));
     if (keyval == c.GDK_KEY_Escape) {
         onEscape();
         return 1;
     }
     const shift = (state & c.GDK_SHIFT_MASK) != 0;
     switch (step) {
+        .screen => {},
         .display => keyDisplay(keyval, shift),
         .position => if (keyval == c.GDK_KEY_space and !daemon_lost) enterStep(.calibrate),
         .calibrate => if (cal_phase == .failed and (keyval == c.GDK_KEY_r or keyval == c.GDK_KEY_R) and !daemon_lost) enterStep(.position),
@@ -1730,6 +1733,148 @@ fn useMonitor(m: *c.GdkMonitor) void {
     log.info("output {s}: {d}x{d} logical, scale {d:.3} -> {d}x{d} px, {d}x{d} mm", .{ mon_name, g.width, g.height, mon_scale, width_px, height_px, mon_mm[0], mon_mm[1] });
 }
 
+// ─── Screen picker (before step 1) ──────────────────────────────────
+//
+// A drop-down of the outputs (connector, model, logical size, scale),
+// preselected with the saved output (tobii.json), else the focused one, else
+// the first. It is shown on the output the person is looking at (focused),
+// which may not be the tracker's; ENTER moves the surface to the chosen
+// output and step 1 continues there. The choice is saved with step 1.
+
+const MAX_MONS = 16;
+var pick_mons: [MAX_MONS]*c.GdkMonitor = undefined;
+var pick_labels: [MAX_MONS][200:0]u8 = undefined;
+var pick_ptrs: [MAX_MONS + 1]?[*:0]const u8 = .{null} ** (MAX_MONS + 1);
+var pick_n: usize = 0;
+var pick_dropdown: ?*c.GtkWidget = null;
+var pick_box: ?*c.GtkWidget = null;
+var pick_here: ?[]const u8 = null; // connector of the output showing the picker
+
+fn focusedMonitor() ?*c.GdkMonitor {
+    const name = hyprFocusedOutput() orelse return null;
+    defer gpa.free(name);
+    const len = @min(name.len, pick_here_buf.len);
+    @memcpy(pick_here_buf[0..len], name[0..len]);
+    pick_here = pick_here_buf[0..len];
+    return findMonitor(name);
+}
+var pick_here_buf: [64]u8 = undefined;
+
+fn monitorLabel(buf: *[200:0]u8, m: *c.GdkMonitor, saved: bool, here: bool) void {
+    const conn = if (c.gdk_monitor_get_connector(m)) |x| std.mem.span(x) else "?";
+    const desc = if (c.gdk_monitor_get_description(m)) |x| std.mem.span(x) else if (c.gdk_monitor_get_model(m)) |x| std.mem.span(x) else "";
+    var g: c.GdkRectangle = undefined;
+    c.gdk_monitor_get_geometry(m, &g);
+    const sc = c.gdk_monitor_get_scale(m);
+    const out = std.fmt.bufPrintZ(buf, "{s}  ·  {s}  ·  {d}×{d}  ·  scale {d:.2}{s}{s}", .{
+        conn,                          if (desc.len > 0) desc else "unknown model", g.width, g.height, sc,
+        if (saved) "  ·  saved" else "", if (here) "  ·  this screen" else "",
+    }) catch {
+        buf[0] = 0;
+        return;
+    };
+    _ = out;
+}
+
+fn buildPicker(ov: *c.GtkOverlay, preselect: *c.GdkMonitor) void {
+    const mons = c.gdk_display_get_monitors(c.gdk_display_get_default());
+    const n = @min(c.g_list_model_get_n_items(mons), MAX_MONS);
+    const saved = config.loadOutput(gpa);
+    defer if (saved) |x| gpa.free(x);
+    var pre: u32 = 0;
+    pick_n = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
+        const conn = if (c.gdk_monitor_get_connector(m)) |x| std.mem.span(x) else "";
+        const is_saved = saved != null and std.mem.eql(u8, saved.?, conn);
+        const is_here = pick_here != null and std.mem.eql(u8, pick_here.?, conn);
+        monitorLabel(&pick_labels[pick_n], m, is_saved, is_here);
+        pick_ptrs[pick_n] = &pick_labels[pick_n];
+        pick_mons[pick_n] = m;
+        if (m == preselect) pre = @intCast(pick_n);
+        pick_n += 1;
+    }
+    pick_ptrs[pick_n] = null;
+
+    const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 18);
+    c.gtk_widget_set_halign(box, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_valign(box, c.GTK_ALIGN_CENTER);
+    const dd = c.gtk_drop_down_new_from_strings(@ptrCast(&pick_ptrs));
+    c.gtk_drop_down_set_selected(@ptrCast(dd), pre);
+    c.gtk_widget_set_size_request(dd, 720, -1);
+    c.gtk_widget_add_css_class(dd, "picker");
+    c.gtk_box_append(@ptrCast(box), dd);
+    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 12);
+    c.gtk_widget_set_halign(row, c.GTK_ALIGN_END);
+    const cancel = c.gtk_button_new_with_label("Cancel");
+    const ok = c.gtk_button_new_with_label("Use this screen");
+    c.gtk_widget_add_css_class(ok, "suggested-action");
+    c.gtk_widget_add_css_class(ok, "picker");
+    c.gtk_widget_add_css_class(cancel, "picker");
+    _ = c.g_signal_connect_data(@ptrCast(ok), "clicked", @ptrCast(&onPickOk), null, null, 0);
+    _ = c.g_signal_connect_data(@ptrCast(cancel), "clicked", @ptrCast(&onPickCancel), null, null, 0);
+    c.gtk_box_append(@ptrCast(row), cancel);
+    c.gtk_box_append(@ptrCast(row), ok);
+    c.gtk_box_append(@ptrCast(box), row);
+    c.gtk_overlay_add_overlay(ov, box);
+    pick_dropdown = dd;
+    pick_box = box;
+
+    const css = c.gtk_css_provider_new();
+    c.gtk_css_provider_load_from_string(css, ".picker, .picker * { font-size: 18px; } dropdown.picker > button { padding: 10px 14px; }");
+    c.gtk_style_context_add_provider_for_display(c.gdk_display_get_default(), @ptrCast(css), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
+fn keyScreen(keyval: c_uint) bool {
+    const dd: *c.GtkDropDown = @ptrCast(pick_dropdown orelse return false);
+    const cur = c.gtk_drop_down_get_selected(dd);
+    switch (keyval) {
+        c.GDK_KEY_Up, c.GDK_KEY_KP_Up => if (cur > 0) c.gtk_drop_down_set_selected(dd, cur - 1),
+        c.GDK_KEY_Down, c.GDK_KEY_KP_Down => if (cur + 1 < pick_n) c.gtk_drop_down_set_selected(dd, cur + 1),
+        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => confirmScreen(),
+        else => return false, // let the widgets have the rest (mouse users)
+    }
+    return true;
+}
+
+fn onPickOk(_: ?*c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    confirmScreen();
+}
+
+fn onPickCancel(_: ?*c.GtkButton, _: ?*anyopaque) callconv(.c) void {
+    onEscape();
+}
+
+fn confirmScreen() void {
+    const dd: *c.GtkDropDown = @ptrCast(pick_dropdown orelse return);
+    const i = c.gtk_drop_down_get_selected(dd);
+    if (i >= pick_n) return;
+    const m = pick_mons[i];
+    useMonitor(m);
+    log.info("screen picked: {s}", .{mon_name});
+    // Re-target the surface: unmap, set the output, map again.
+    if (window) |w| {
+        c.gtk_widget_set_visible(w, 0);
+        c.gtk_layer_set_monitor(@ptrCast(w), m);
+        c.gtk_widget_set_visible(w, 1);
+    }
+    if (pick_box) |b| c.gtk_widget_set_visible(b, 0);
+    marks_init = false;
+    marks_touched = false;
+    initMarks();
+    enterStep(.display);
+}
+
+fn drawScreen(cr: *c.cairo_t, w: f64, h: f64) void {
+    ui = @max(1.0, draw_scale);
+    var y = h * 0.22;
+    y += text(cr, w / 2, y, 34, .center, FG, "Which screen is the eye tracker mounted on?", .{});
+    y += 12 * ui;
+    y += text(cr, w / 2, y, 20, .center, DIM, "Choose it in the list (↑ ↓ or the mouse) · ENTER continues on that screen · ESC cancels", .{});
+    _ = text(cr, w / 2, h * 0.66, 16, .center, DIM, "The setup then opens full screen on the chosen output; nothing is changed until step 1 is confirmed.", .{});
+}
+
 // ─── GTK setup ──────────────────────────────────────────────────────
 
 fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
@@ -1737,6 +1882,8 @@ fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         exit_code = 2;
         return;
     };
+    // Step 1 without --output starts with the screen picker.
+    const picking = opt_output == null and (opt_only == .all or opt_only == .display);
     useMonitor(m);
     initMarks();
 
@@ -1751,7 +1898,12 @@ fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_layer_set_exclusive_zone(gw, -1); // cover bars too
     c.gtk_layer_set_keyboard_mode(gw, c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
     c.gtk_layer_set_namespace(gw, "tobiifree-setup");
-    c.gtk_layer_set_monitor(gw, m);
+    // The picker shows where the person is (focused output: Hyprland tells
+    // us; elsewhere no monitor = the compositor's choice, the focused one);
+    // the setup steps on the tracker's output.
+    if (picking) {
+        if (focusedMonitor()) |fm| c.gtk_layer_set_monitor(gw, fm);
+    } else c.gtk_layer_set_monitor(gw, m);
     c.gtk_window_set_decorated(gw, 0);
 
     const da = c.gtk_drawing_area_new();
@@ -1759,9 +1911,14 @@ fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     c.gtk_drawing_area_set_draw_func(@ptrCast(da), draw, null, null);
     c.gtk_widget_set_hexpand(da, 1);
     c.gtk_widget_set_vexpand(da, 1);
-    c.gtk_window_set_child(gw, da);
+    const ov = c.gtk_overlay_new();
+    c.gtk_overlay_set_child(@ptrCast(ov), da);
+    c.gtk_window_set_child(gw, ov);
+    if (picking) buildPicker(@ptrCast(ov), m);
 
     const keys = c.gtk_event_controller_key_new();
+    // Capture: the picker's keys (arrows, ENTER) before the drop-down's.
+    c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     _ = c.g_signal_connect_data(@ptrCast(keys), "key-pressed", @ptrCast(&onKey), null, null, 0);
     c.gtk_widget_add_controller(win, keys);
 
@@ -1784,7 +1941,7 @@ fn activate(app: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     if (opt_only != .validate) src.getDisplayArea(onAreaGot, null) catch |err| log.warn("get_display_area: {}", .{err});
 
     enterStep(switch (opt_only) {
-        .all, .display => .display,
+        .all, .display => if (picking) .screen else .display,
         .calibrate => .position,
         .validate => .validate,
     });
