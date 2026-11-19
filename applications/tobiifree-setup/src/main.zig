@@ -107,6 +107,9 @@ const DOT_BIG = 28.0;
 const DOT_PULSE = 4.0;
 const DOT_SMALL = 9.0;
 const PULSE_PERIOD_S = 1.2;
+/// Orange <-> blue fade of the active dot (gaze on it or not), both ways;
+/// a reversal mid-fade continues from the current colour.
+const DOT_FADE_S = 0.1;
 
 // ─── Colours ────────────────────────────────────────────────────────
 
@@ -569,6 +572,7 @@ fn startDot() void {
     cal_holding = false;
     cal_breaks = 0;
     cal_fallback = false;
+    resetDotColour();
 }
 /// The device refuses a point when it has no usable gaze for it (eyes lost,
 /// blink, looking away: status 0x20000502). Re-show the dot this many times.
@@ -820,8 +824,7 @@ fn drawCalibrate(cr: *c.cairo_t, w: f64, h: f64) void {
                         pulseRadius()
                     else
                         DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(cal_progress, 0, 1);
-                    const on = cal_phase == .adding or cal_holding;
-                    drawTarget(cr, x, y, r * ui, if (on) ON_GAZE else ACC);
+                    drawTarget(cr, x, y, r * ui, dotColour());
                 } else {
                     drawTarget(cr, x, y, 8 * ui, ACC_DIM);
                 }
@@ -868,6 +871,7 @@ fn startValDot() void {
     val_collected_s = 0;
     val_last_acc = 0;
     val_fix_t = 0;
+    resetDotColour();
 }
 var val_live = false;
 
@@ -974,9 +978,7 @@ fn drawValidate(cr: *c.cairo_t, w: f64, h: f64) void {
             else
                 DOT_BIG + (DOT_SMALL - DOT_BIG) * std.math.clamp(val_collected_s / VAL_COLLECT_S, 0, 1);
             drawDotHint(cr, w, h, val_fallback[val_idx]);
-            // Collecting: an accepted sample in the last 150 ms.
-            const on = val_last_acc != 0 and now() - val_last_acc < 150_000;
-            drawTarget(cr, t[0] * w, t[1] * h, r * ui, if (on) ON_GAZE else ACC);
+            drawTarget(cr, t[0] * w, t[1] * h, r * ui, dotColour());
         },
         .results => drawResults(cr, w, h),
     }
@@ -1224,12 +1226,48 @@ fn onReadable(_: c_int, _: c.GIOCondition, _: ?*anyopaque) callconv(.c) c.gboole
     return 1;
 }
 
+// Active dot colour: 0 = orange (waiting), 1 = blue (gaze on it).
+var dot_blend: f64 = 0;
+var dot_blend_t: i64 = 0;
+
+/// Is the gaze on the active dot right now (fixation accepted)?
+fn gazeOnDot() bool {
+    return switch (step) {
+        .calibrate => cal_phase == .adding or (cal_phase == .gazing and cal_holding),
+        // Collecting: an accepted sample in the last 150 ms.
+        .validate => val_phase == .dot and val_last_acc != 0 and now() - val_last_acc < 150_000,
+        else => false,
+    };
+}
+
+/// A new dot starts orange.
+fn resetDotColour() void {
+    dot_blend = 0;
+    dot_blend_t = now();
+}
+
+fn updateDotColour() void {
+    const t = now();
+    const dt = if (dot_blend_t == 0) 0 else @as(f64, @floatFromInt(t - dot_blend_t)) / 1e6;
+    dot_blend_t = t;
+    const target: f64 = if (gazeOnDot()) 1 else 0;
+    const stepv = dt / DOT_FADE_S;
+    dot_blend = if (target > dot_blend) @min(target, dot_blend + stepv) else @max(target, dot_blend - stepv);
+}
+
+fn dotColour() Rgb {
+    var col: Rgb = undefined;
+    for (&col, ACC, ON_GAZE) |*o, a, b| o.* = a + (b - a) * dot_blend;
+    return col;
+}
+
 fn onTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, _: ?*anyopaque) callconv(.c) c.gboolean {
     switch (step) {
         .calibrate => tickCalibrate(),
         .validate => tickValidate(),
         else => {},
     }
+    updateDotColour();
     redraw();
     return 1;
 }

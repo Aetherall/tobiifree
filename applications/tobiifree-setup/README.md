@@ -54,7 +54,8 @@ confirmed.
    dot, ENTER done.
 
 Dots are orange while waiting for the gaze and blue while the gaze is on them
-(shrinking / collecting); they turn orange again when the fixation breaks.
+(shrinking / collecting); they turn orange again when the fixation breaks. The colour fades over 0.1 s
+(`DOT_FADE_S`) both ways.
 
 A fixation is 0.3 s of valid gaze with a dispersion (x range + y range) under
 1°; all thresholds are constants at the top of `src/main.zig`, the detector is
