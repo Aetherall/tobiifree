@@ -89,6 +89,51 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run tobiifreed");
     run_step.dependOn(&run.step);
 
+    // tobiifree-ctl: CLI over the Zig SocketSource.
+    const gaze_source = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/gaze_source.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const socket_source = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/socket_source.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "daemon_protocol", .module = daemon_protocol },
+            .{ .name = "gaze_source", .module = gaze_source },
+        },
+    });
+    const usb_source = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/usb_source.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tracker", .module = tracker },
+            .{ .name = "libusb_transport", .module = libusb_transport },
+            .{ .name = "gaze_source", .module = gaze_source },
+        },
+    });
+    gaze_source.addImport("tobiifree_core", tobiifree_core);
+    gaze_source.addImport("usb_source", usb_source);
+    gaze_source.addImport("socket_source", socket_source);
+
+    const ctl = b.addExecutable(.{
+        .name = "tobiifree-ctl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ctl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "daemon_protocol", .module = daemon_protocol },
+                .{ .name = "socket_source", .module = socket_source },
+            },
+        }),
+    });
+    ctl.linkLibC();
+    ctl.linkSystemLibrary("libusb-1.0");
+    b.installArtifact(ctl);
+
     // Unit tests (config parsing/rendering).
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
