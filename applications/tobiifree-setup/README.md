@@ -65,18 +65,31 @@ confirmed.
    - **uncorrected** (the device calibration alone);
    - **current map**, if the daemon holds an active one;
    - **new map, leave-one-out**: each dot corrected by a map fitted on the
-     15 others (λ chosen inside each fold), an honest estimate on gaze the
-     map was not fitted on.
+     other positions (λ chosen inside each fold), an honest estimate on gaze
+     the map was not fitted on.
 
-   The new map (fitted on all non-fallback dots, see `driver/src/correction.zig`)
+   **Runs are pooled.** Each run's per-dot raw medians are added to
+   `$XDG_STATE_HOME/tobiifree/correction_runs.json` as soon as its results
+   are computed (so V or ESC don't lose it), for the calibration in use (blob
+   SHA-256 + display area; a history for another one is replaced, at most 20
+   runs). The new map is fitted on the per-position pool of all runs (mean,
+   or median from 3 runs on), and the leave-one-out leaves a dot's *position*
+   out of every run; the numbers shown are for the run just made. The results
+   show "runs pooled: N"; X resets the history to the current run.
+   tobiifreed deletes the history with the map when the calibration blob or
+   the display area changes.
+
+   The new map (fitted on the pool, fallback dots excluded, see `driver/src/correction.zig`)
    is proposed only if its leave-one-out mean beats both the uncorrected and
    the current-map mean by at least 0.02°; a current map that does worse than
    no map is proposed for removal. The results show, per dot, a grey arrow to
    the raw gaze and a coloured one to the leave-one-out corrected gaze
    ("raw° → corrected°"), the three summaries and the decision. ENTER
    applies it (saves the map / removes it / nothing) and finishes, V
-   validates again, R redoes the calibration, G shows the live gaze (green
-   raw, blue through the new map), ESC quits changing nothing. The analysis
+   validates again (this run stays in the history), X resets the history,
+   R redoes the calibration, G shows the live gaze (green raw, blue through
+   the new map), ESC quits without touching the map (the run stays in the
+   history). The analysis
    takes ~10 ms in release builds (a few seconds in Debug).
 
 Dots are orange while waiting for the gaze and blue while the gaze is on them

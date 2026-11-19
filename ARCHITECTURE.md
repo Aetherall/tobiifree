@@ -276,8 +276,15 @@ corrected gaze is g − r(g).
   `set_gaze_raw` 1 get the uncorrected sample. A new `finish_calibration` or
   a set of another display area deletes the map; a client `cal_apply` of
   another blob only deactivates it.
+- **Validation history**: `correction_runs.json` next to it, written by
+  `tobiifree-setup`: the per-dot raw medians of every validation run on one
+  calibration blob + display area. The map is fitted on the per-position
+  pool of the runs. tobiifreed deletes the history when it no longer matches
+  the stored blob / configured area (startup, area set) and on a new
+  `finish_calibration`; `clear_correction` keeps it.
 - **Tool**: `tobiifree-setup`'s validation (4×4 dots) proposes a map only if
-  its leave-one-out error beats no map (and the current map); see its README.
+  its leave-one-out error (a position left out of every pooled run) beats no
+  map (and the current map); see its README.
 - **Tests**: `zig build test` (model, in tobiifreed and tobiifree-setup),
   `just test-correction` (daemon commands and invalidation with
   `--no-device --fake-gaze`, isolated dirs),
