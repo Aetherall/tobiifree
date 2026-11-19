@@ -156,6 +156,14 @@ fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void 
     log.debug("routed response for cmd=0x{x:0>2} to fd={}", .{ entry.cmd_type, entry.client_fd });
 }
 
+/// Debug: log every TTP response frame (magic 0x52), routed or not.
+fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_len: u32) void {
+    if (magic != core.TTP_MAGIC_RSP) return;
+    const n = @min(payload_len, 48);
+    const hdr = (payload_ptr - core.TTP_HDR_SIZE)[0..core.TTP_HDR_SIZE];
+    log.debug("ttp rsp seq={d} op=0x{x} plen={d} hdr={x} head={x}", .{ seq, op, payload_len, hdr, payload_ptr[0..n] });
+}
+
 /// Write all bytes to a (possibly non-blocking) socket fd.
 /// Client sockets are accepted with SOCK_NONBLOCK, so write() may return EAGAIN
 /// when the kernel send buffer is full. We use poll(POLLOUT) to wait until space
@@ -484,7 +492,7 @@ pub fn main() void {
     tracker.onGaze(onGaze);
 
     // Install response hook for command forwarding.
-    core.set_hooks(null, null, onResponse, null, null);
+    core.set_hooks(onTtpFrame, null, onResponse, null, null);
 
     // Start socket server.
     server.init(&forwardCommand) catch |err| {

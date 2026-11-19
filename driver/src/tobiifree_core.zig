@@ -845,6 +845,7 @@ fn drainFrame() ?usize {
     const magic = getBe32(ttp + 0);
     const seq = getBe32(ttp + 4);
     const op = getBe32(ttp + 12);
+    last_response_status = getBe32(ttp + 16);
     const plen = getBe32(ttp + 20);
     // True frame size = envelope + TTP header + payload.
     // For normal frames, env_len == frame_size. For large/fragmented
@@ -924,6 +925,17 @@ pub export fn feed_usb_in(src: [*]const u8, len: usize) void {
         while (j < acc_len - off) : (j += 1) acc_buf[j] = acc_buf[off + j];
         acc_len -= off;
     }
+}
+
+// Status word of the most recently dispatched TTP frame (header bytes 16..19,
+// big-endian). 0 = success. Observed non-zero on rejected requests, e.g.
+// set_display_area with a degenerate (all-zero) area answers status
+// 0x20000502 with an empty payload, and the device area is left unchanged.
+// Valid while inside on_response / on_ttp_frame for that frame.
+var last_response_status: u32 = 0;
+
+pub export fn response_status() u32 {
+    return last_response_status;
 }
 
 // Reset the accumulator (e.g. after reconnect).
@@ -1443,24 +1455,30 @@ pub export fn request_get_display_area() u32 {
     return req_id;
 }
 
-/// Set display_area (fire-and-forget; no response). Returns 0.
+/// Set display_area. Returns request_id. The device answers op 0x5a0 with an
+/// empty payload; success/failure is in the TTP status word (response_status()).
 pub export fn request_set_display_area(w_mm: f64, h_mm: f64, ox_mm: f64, oy_mm: f64, z_mm: f64) u32 {
+    const req_id = takeReqId();
     const seq = takeSeq();
     session_out_len = build_set_display_area(seq, w_mm, h_mm, ox_mm, oy_mm, z_mm, &session_out);
-    return 0;
+    pendingInsert(seq, req_id);
+    return req_id;
 }
 
-/// Set display_area from 9 corner coordinates (tl/tr/bl × xyz). Returns 0.
+/// Set display_area from 9 corner coordinates (tl/tr/bl × xyz). Returns request_id
+/// (see request_set_display_area for the response).
 pub export fn request_set_display_area_corners(
     tl_x: f64, tl_y: f64, tl_z: f64,
     tr_x: f64, tr_y: f64, tr_z: f64,
     bl_x: f64, bl_y: f64, bl_z: f64,
 ) u32 {
+    const req_id = takeReqId();
     const seq = takeSeq();
     session_out_len = build_set_display_area_corners(
         seq, tl_x, tl_y, tl_z, tr_x, tr_y, tr_z, bl_x, bl_y, bl_z, &session_out,
     );
-    return 0;
+    pendingInsert(seq, req_id);
+    return req_id;
 }
 
 // ---------- Calibration / realm session API ----------
@@ -2340,6 +2358,39 @@ fn fakeInbound(out: [*]u8, magic: u32, seq: u32, op: u32, payload: []const u8) u
     i = 0;
     while (i < payload.len) : (i += 1) out[ENVELOPE_SIZE + TTP_HDR_SIZE + i] = payload[i];
     return total;
+}
+
+var test_resp_id: u32 = 0;
+var test_resp_status: u32 = 0;
+fn testHook_response(request_id: u32, _: [*]const u8, _: u32) void {
+    test_resp_id = request_id;
+    test_resp_status = response_status();
+}
+
+test "set_display_area_corners is acked with status" {
+    resetTestState();
+    session_reset();
+    set_hooks(null, null, testHook_response, null, null);
+    defer set_hooks(null, null, noop_response, null, null);
+    const req_id = request_set_display_area_corners(-265, 308, 0, 265, 308, 0, -265, 10, 0);
+    try std.testing.expect(req_id != 0);
+    const seq = getBe32(@ptrCast(&session_out[ENVELOPE_SIZE + 4]));
+
+    var buf: [64]u8 = undefined;
+    const n = fakeInbound(&buf, TTP_MAGIC_RSP, seq, TTP_OP_SET_DISPLAY_AREA, &.{});
+    putBe32(@ptrCast(&buf[ENVELOPE_SIZE + 16]), 0x20000502); // rejected
+    test_resp_id = 0;
+    feed_usb_in(&buf, n);
+    try std.testing.expectEqual(req_id, test_resp_id);
+    try std.testing.expectEqual(@as(u32, 0x20000502), test_resp_status);
+
+    // Successful ack: status 0.
+    const req2 = request_set_display_area(400, 300, -200, 10, 0);
+    const seq2 = getBe32(@ptrCast(&session_out[ENVELOPE_SIZE + 4]));
+    const n2 = fakeInbound(&buf, TTP_MAGIC_RSP, seq2, TTP_OP_SET_DISPLAY_AREA, &.{});
+    feed_usb_in(&buf, n2);
+    try std.testing.expectEqual(req2, test_resp_id);
+    try std.testing.expectEqual(@as(u32, 0), test_resp_status);
 }
 
 test "parse single complete frame" {
