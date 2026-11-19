@@ -1,11 +1,38 @@
 // tobiifreed — eye tracker daemon.
 //
-// Owns the USB connection to the Tobii ET5 and exposes gaze data
-// over a unix socket. Multiple clients can connect simultaneously.
+// Owns the USB connection to the Tobii ET5 and exposes gaze data and the
+// tracker's commands over a unix socket (and optionally WebSocket). Multiple
+// clients can connect simultaneously.
 //
 // Usage:
-//   tobiifreed                   # run with defaults or ~/.config/tobii.json
-//   tobiifreed --init-config     # create default config file
+//   tobiifreed                           # run with ~/.config/tobii.json
+//   tobiifreed --ws [addr:]port          # also serve WebSocket clients
+//   tobiifreed --keep-device-area        # don't push the config's display area at startup
+//   tobiifreed --no-restore-calibration  # don't cal_apply the stored calibration at startup
+//   tobiifreed --init-config             # create default config file
+//
+// Threads:
+//   USB thread  — tracker.poll(): feeds USB data to the core, which calls
+//                 onGaze / onResponse. Both only copy into queues and poke
+//                 the notify pipe; no client I/O happens on this thread.
+//   main thread — client sockets, request building/sending, response routing,
+//                 config/calibration persistence.
+//   job thread  — one at a time: start/finish calibration, cal_apply (incl.
+//                 the startup restore). These own the USB transport while they
+//                 run (gaze pauses); meanwhile device commands get Err.busy.
+//
+// Persistence:
+//   display area — every successful set_display_area[_corners] from a client
+//     is written to ~/.config/tobii.json as explicit corners (+ the legacy
+//     w/h/cx/cy fields). At startup the config's area is pushed to the device
+//     whenever it differs from what the device reports (config = source of
+//     truth); --keep-device-area restores the old "only when reset" rule.
+//   calibration — a successful finish_calibration stores the blob at
+//     $XDG_STATE_HOME/tobiifree/calibration.bin (~/.local/state/…). At startup,
+//     if the file exists, it is cal_apply'd on the job thread *after* the
+//     sockets are up: clients can connect at once, gaze starts flowing only
+//     when the apply finishes (or fails / times out after 120 s), and device
+//     commands sent meanwhile get Err.busy.
 
 const std = @import("std");
 const core = @import("tobiifree_core");
@@ -13,6 +40,8 @@ const Tracker = @import("tracker").Tracker;
 const LibusbTransport = @import("libusb_transport").LibusbTransport;
 const Server = @import("server").Server;
 const WsServer = @import("ws_server").WsServer;
+const config = @import("config.zig");
+const proto = @import("daemon_protocol");
 
 const log = std.log.scoped(.tobiifreed);
 
@@ -20,14 +49,17 @@ pub const std_options: std.Options = .{
     .log_level = .debug,
 };
 
-const CONFIG_PATH = ".config/tobii.json";
-
-const proto = @import("daemon_protocol");
+const gpa = std.heap.c_allocator;
 
 // WsServer.sendToClient frames data into a fixed `[4 + 8192]u8` buffer, and the
 // data it receives is `HEADER_SIZE + 1 (cmd_type) + payload`. Bound payloads
 // sent over WS accordingly so encodeWsFrame never writes past that buffer.
 const WS_MAX_RESPONSE_PAYLOAD = 8192 - proto.HEADER_SIZE - 1;
+
+/// Max TTP response payload routed back to a client (display area: 164 B).
+const RESP_MAX = 8192;
+/// Device request timeout before the client gets Err.timeout.
+const REQUEST_TIMEOUT_MS = 5000;
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -36,36 +68,28 @@ var tracker: Tracker = undefined;
 var server: Server = undefined;
 var ws: ?WsServer = null;
 var quit: bool = false;
+var notify_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
+fn notifyMain() void {
+    _ = std.posix.write(notify_pipe[1], &.{1}) catch {};
+}
 
 // ── Gaze ring buffer: USB thread → main thread ─────────────────────
-//
-// The USB thread calls onGaze which stores samples in a ring buffer.
-// The main thread drains the ring and broadcasts to clients.
-// A pipe notifies the main thread that new data is available so it
-// can block on poll() instead of busy-spinning.
 
 const GAZE_RING_SIZE = 64;
 var gaze_ring: [GAZE_RING_SIZE]core.GazeSample = undefined;
 var gaze_write: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 var gaze_read: u32 = 0; // only touched by main thread
 var gaze_count: u64 = 0;
-var notify_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 
 fn onGaze(sample: *const core.GazeSample) void {
-    // Called from USB thread. Store sample in ring, notify main thread.
     const w = gaze_write.load(.monotonic);
     gaze_ring[w % GAZE_RING_SIZE] = sample.*;
     gaze_write.store(w +% 1, .release);
-    // Wake main thread (non-blocking write, ok if pipe buffer is full).
-    _ = std.posix.write(notify_pipe[1], &.{1}) catch {};
+    notifyMain();
 }
 
-/// Drain the ring buffer and broadcast (called from main thread).
 fn drainGaze() void {
-    // Drain notification pipe.
-    var drain_buf: [64]u8 = undefined;
-    _ = std.posix.read(notify_pipe[0], &drain_buf) catch {};
-
     const w = gaze_write.load(.acquire);
     while (gaze_read != w) {
         const sample = &gaze_ring[gaze_read % GAZE_RING_SIZE];
@@ -82,87 +106,7 @@ fn drainGaze() void {
     }
 }
 
-// ── Command forwarding: client → USB tracker ────────────────────────
-//
-// When a client (socket or WS) sends a command that needs to go to the
-// tracker, we build the TTP frame via tobiifree_core, send it over USB,
-// and register a pending entry so the response hook can route the
-// reply back to the right client fd.
-
-const MAX_PENDING = 64;
-
-const PendingEntry = struct {
-    request_id: u32,
-    client_fd: std.posix.fd_t,
-    cmd_type: u8,
-    is_ws: bool,
-};
-
-var pending: [MAX_PENDING]?PendingEntry = [_]?PendingEntry{null} ** MAX_PENDING;
-
-fn addPending(request_id: u32, client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool) void {
-    for (&pending) |*slot| {
-        if (slot.* == null) {
-            slot.* = .{
-                .request_id = request_id,
-                .client_fd = client_fd,
-                .cmd_type = cmd_type,
-                .is_ws = is_ws,
-            };
-            return;
-        }
-    }
-    log.warn("pending table full, dropping request_id={}", .{request_id});
-}
-
-fn takePending(request_id: u32) ?PendingEntry {
-    for (&pending) |*slot| {
-        if (slot.*) |entry| {
-            if (entry.request_id == request_id) {
-                const result = entry;
-                slot.* = null;
-                return result;
-            }
-        }
-    }
-    return null;
-}
-
-/// Response hook: called by tobiifree_core when a TTP response arrives.
-/// Routes the response payload back to the client that sent the command.
-fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
-    const entry = takePending(request_id) orelse {
-        log.debug("response for unknown request_id={}, ignoring", .{request_id});
-        return;
-    };
-
-    const payload = payload_ptr[0..payload_len];
-    const max_payload: usize = if (entry.is_ws) WS_MAX_RESPONSE_PAYLOAD else 8192;
-    if (payload.len > max_payload) {
-        log.warn("onResponse: payload too large ({} bytes) for fd={}, dropping", .{ payload.len, entry.client_fd });
-        return;
-    }
-    var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
-    const msg_len = proto.encodeResponse(&buf, entry.cmd_type, payload);
-
-    if (entry.is_ws) {
-        if (ws) |*w| {
-            w.sendToClient(entry.client_fd, buf[0..msg_len]);
-        }
-    } else {
-        writeAll(entry.client_fd, buf[0..msg_len]);
-    }
-
-    log.debug("routed response for cmd=0x{x:0>2} to fd={}", .{ entry.cmd_type, entry.client_fd });
-}
-
-/// Debug: log every TTP response frame (magic 0x52), routed or not.
-fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_len: u32) void {
-    if (magic != core.TTP_MAGIC_RSP) return;
-    const n = @min(payload_len, 48);
-    const hdr = (payload_ptr - core.TTP_HDR_SIZE)[0..core.TTP_HDR_SIZE];
-    log.debug("ttp rsp seq={d} op=0x{x} plen={d} hdr={x} head={x}", .{ seq, op, payload_len, hdr, payload_ptr[0..n] });
-}
+// ── Client replies ──────────────────────────────────────────────────
 
 /// Write all bytes to a (possibly non-blocking) socket fd.
 /// Client sockets are accepted with SOCK_NONBLOCK, so write() may return EAGAIN
@@ -173,10 +117,8 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
     while (remaining.len > 0) {
         const n = std.posix.write(fd, remaining) catch |err| {
             if (err == error.WouldBlock) {
-                // Buffer full — wait until the fd is writable (up to 5 s).
                 var pfd = [1]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
                 const nready = std.posix.poll(&pfd, 5000) catch return;
-                // Timeout, or error/hangup on the fd — give up instead of spinning forever.
                 if (nready == 0) return;
                 const bad = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
                 if (pfd[0].revents & bad != 0) return;
@@ -189,227 +131,612 @@ fn writeAll(fd: std.posix.fd_t, data: []const u8) void {
     }
 }
 
-/// Forward a daemon-protocol command to the USB tracker.
-/// Called by server.zig and ws_server.zig when they receive a forwardable command.
-fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, is_ws: bool) void {
-    const cmd = std.meta.intToEnum(proto.Cmd, cmd_type) catch {
-        log.warn("unknown cmd 0x{x:0>2} from fd={}", .{ cmd_type, client_fd });
-        return;
-    };
+const Client = struct {
+    fd: std.posix.fd_t,
+    is_ws: bool,
+};
 
-    switch (cmd) {
-        .subscribe, .disconnect => return, // handled locally, not forwarded
-
-        // State machine commands — driven synchronously, response sent when done.
-        .start_calibration => {
-            const ok = tracker.startCalibration();
-            sendResult(client_fd, cmd_type, is_ws, ok, &.{});
-        },
-        .finish_calibration => {
-            const ok = tracker.finishCalibration();
-            if (ok) {
-                const blob_ptr = core.cal_finish_blob_ptr();
-                const blob_len = core.cal_finish_blob_len();
-                sendResult(client_fd, cmd_type, is_ws, true, blob_ptr[0..blob_len]);
-            } else {
-                sendResult(client_fd, cmd_type, is_ws, false, &.{});
-            }
-        },
-        .cal_apply => {
-            log.debug("cal_apply: received payload_len={d} from fd={d}", .{ payload.len, client_fd });
-            if (payload.len == 0) {
-                log.warn("cal_apply: empty payload, sending error", .{});
-                sendResult(client_fd, cmd_type, is_ws, false, &.{});
-                return;
-            }
-            log.debug("cal_apply: calling tracker.calApply", .{});
-            const ok = tracker.calApply(payload);
-            log.debug("cal_apply: tracker.calApply returned ok={}", .{ok});
-            sendResult(client_fd, cmd_type, is_ws, ok, &.{});
-        },
-
-        // Single request/response commands — forwarded to USB, response routed back.
-        .get_display_area, .set_display_area, .set_display_area_corners,
-        .add_calibration_point => {
-            const request_id = buildRequest(cmd, payload) orelse {
-                log.warn("failed to build request for cmd=0x{x:0>2} (bad payload len={})", .{ cmd_type, payload.len });
-                return;
-            };
-            const out_len = core.session_out_len_();
-            if (out_len > 0) {
-                if (transport.send(core.session_out_ptr()[0..out_len])) {
-                    if (request_id != 0) {
-                        addPending(request_id, client_fd, cmd_type, is_ws);
-                        log.debug("forwarded cmd=0x{x:0>2} request_id={} for fd={}", .{ cmd_type, request_id, client_fd });
-                    } else {
-                        log.debug("sent fire-and-forget cmd=0x{x:0>2} for fd={}", .{ cmd_type, client_fd });
-                    }
-                } else {
-                    log.err("USB send failed for cmd=0x{x:0>2}", .{cmd_type});
-                }
-            }
-        },
+fn sendError(c: Client, cmd_type: u8, code: u32) void {
+    var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
+    proto.encodeError(&err_buf, cmd_type, code);
+    if (c.is_ws) {
+        if (ws) |*w| w.sendToClient(c.fd, &err_buf);
+    } else {
+        writeAll(c.fd, &err_buf);
     }
+    log.debug("error 0x{x} for cmd=0x{x:0>2} to fd={}", .{ code, cmd_type, c.fd });
 }
 
-fn buildRequest(cmd: proto.Cmd, payload: []const u8) ?u32 {
-    return switch (cmd) {
-        .get_display_area => core.request_get_display_area(),
-        .set_display_area => blk: {
-            if (payload.len < 40) break :blk null;
-            var f: [5]f64 = undefined;
-            @memcpy(std.mem.asBytes(&f), payload[0..40]);
-            break :blk core.request_set_display_area(f[0], f[1], f[2], f[3], f[4]);
-        },
-        .set_display_area_corners => blk: {
-            if (payload.len < 72) break :blk null;
-            var f: [9]f64 = undefined;
-            @memcpy(std.mem.asBytes(&f), payload[0..72]);
-            break :blk core.request_set_display_area_corners(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
-        },
-        .add_calibration_point => blk: {
-            if (payload.len < 16) break :blk null; // x(f64) + y(f64) = 16
-            var f: [2]f64 = undefined;
-            @memcpy(std.mem.asBytes(&f), payload[0..16]);
-            break :blk core.request_cal_point_add2d(f[0], f[1], 3); // eye_mask=3: both eyes
-        },
-        .subscribe, .disconnect, .start_calibration, .finish_calibration, .cal_apply => null,
-    };
-}
-
-fn sendResult(client_fd: std.posix.fd_t, cmd_type: u8, is_ws: bool, ok: bool, payload: []const u8) void {
-    if (!ok) {
-        var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
-        proto.encodeError(&err_buf, cmd_type, 0x01);
-        if (is_ws) {
-            if (ws) |*w| w.sendToClient(client_fd, &err_buf);
-        } else {
-            _ = std.posix.write(client_fd, &err_buf) catch {};
-        }
-        return;
-    }
-    if (is_ws) {
+/// Send a Srv.response with `payload` (any size on the unix socket).
+fn sendReply(c: Client, cmd_type: u8, payload: []const u8) void {
+    if (c.is_ws) {
         // WS framing requires a contiguous buffer. Calibration blobs are too
         // large to fit; reply with an explicit error so the client doesn't
         // hang waiting for a response that will never arrive.
         if (payload.len > WS_MAX_RESPONSE_PAYLOAD) {
-            log.warn("sendResult: WS payload too large ({} bytes), sending error", .{payload.len});
-            var err_buf: [proto.HEADER_SIZE + 1 + 4]u8 = undefined;
-            proto.encodeError(&err_buf, cmd_type, 0x02);
-            if (ws) |*w| w.sendToClient(client_fd, &err_buf);
+            log.warn("WS payload too large ({} bytes), sending error", .{payload.len});
+            sendError(c, cmd_type, proto.Err.too_large);
             return;
         }
         var buf: [proto.HEADER_SIZE + 1 + 8192]u8 = undefined;
         const msg_len = proto.encodeResponse(&buf, cmd_type, payload);
-        if (ws) |*w| w.sendToClient(client_fd, buf[0..msg_len]);
+        if (ws) |*w| w.sendToClient(c.fd, buf[0..msg_len]);
         return;
     }
-    // Unix socket path: write framing header + cmd_type first, then the payload.
-    // Two writes on a SOCK_STREAM socket are ordered and contiguous from the
-    // reader's perspective, so this is safe for arbitrarily large payloads
-    // (e.g. calibration blobs of hundreds of kilobytes).
+    // Unix socket: header + cmd_type, then the payload. Two writes on a
+    // SOCK_STREAM socket are ordered and contiguous for the reader.
     var hdr: [proto.HEADER_SIZE + 1]u8 = undefined;
     proto.encodeHeader(hdr[0..proto.HEADER_SIZE], @intFromEnum(proto.Srv.response), @intCast(1 + payload.len));
     hdr[proto.HEADER_SIZE] = cmd_type;
-    writeAll(client_fd, &hdr);
-    if (payload.len > 0) writeAll(client_fd, payload);
+    writeAll(c.fd, &hdr);
+    if (payload.len > 0) writeAll(c.fd, payload);
 }
 
-// ── Config loading (same as overlay) ────────────────────────────────
+// ── Pending device requests ─────────────────────────────────────────
+//
+// Single request/response commands are sent from the main thread and
+// registered here; the USB thread's onResponse takes the entry and queues
+// the payload for the main thread, which builds the client reply.
 
-fn loadDisplayArea() Tracker.DisplayArea {
-    const home = std.posix.getenv("HOME") orelse return .{};
-    var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, CONFIG_PATH }) catch return .{};
+const Kind = enum {
+    /// get_display_area: reply 9×f64.
+    get_area,
+    /// 0x5a0 ack of a set: non-zero status → error to client; else silent
+    /// (the paired readback carries the reply).
+    set_ack,
+    /// get_display_area sent right after a set: reply 9×f64 (the area the
+    /// device actually holds) under the set's cmd_type, and persist it.
+    set_readback,
+    /// Reply with the raw TTP payload.
+    raw,
+    /// Stimulus points: reply decoded points + raw payload.
+    stimulus,
+};
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return .{};
-    defer file.close();
+const PendingEntry = struct {
+    request_id: u32,
+    client: Client,
+    cmd_type: u8,
+    kind: Kind,
+    deadline_ms: i64,
+    /// For set_ack: request_id of the paired readback.
+    pair_id: u32 = 0,
+};
 
-    var buf: [4096]u8 = undefined;
-    const n = file.readAll(&buf) catch return .{};
+const MAX_PENDING = 64;
+var pending: [MAX_PENDING]?PendingEntry = [_]?PendingEntry{null} ** MAX_PENDING;
+var pending_mutex: std.Thread.Mutex = .{};
 
-    const Config = struct { display_area: ?std.json.Value = null };
-    const parsed = std.json.parseFromSlice(Config, std.heap.page_allocator, buf[0..n], .{
-        .ignore_unknown_fields = true,
-    }) catch return .{};
-
-    const da_val = parsed.value.display_area orelse return .{};
-    const obj = switch (da_val) {
-        .object => |o| o,
-        else => return .{},
-    };
-
-    var area = Tracker.DisplayArea{};
-    if (getFloat(obj, "w_mm")) |v| area.w_mm = v;
-    if (getFloat(obj, "h_mm")) |v| area.h_mm = v;
-    if (getFloat(obj, "z_mm")) |v| area.z_mm = v;
-    if (getFloat(obj, "tilt")) |v| area.tilt_deg = v;
-
-    // cx/cy: same logic as overlay.
-    const half_w = area.w_mm / 2.0;
-    const half_h = area.h_mm / 2.0;
-
-    if (obj.get("cx")) |cx_val| {
-        if (parsePositionExpr(cx_val, half_w, false)) |cx| {
-            area.ox_mm = -cx - half_w;
+fn addPending(e: PendingEntry) bool {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
+    for (&pending) |*slot| {
+        if (slot.* == null) {
+            slot.* = e;
+            return true;
         }
     }
-    if (obj.get("cy")) |cy_val| {
-        if (parsePositionExpr(cy_val, half_h, true)) |cy| {
-            area.oy_mm = -cy - half_h;
+    log.warn("pending table full, dropping request_id={}", .{e.request_id});
+    return false;
+}
+
+fn takePending(request_id: u32) ?PendingEntry {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
+    for (&pending) |*slot| {
+        if (slot.*) |entry| {
+            if (entry.request_id == request_id) {
+                slot.* = null;
+                return entry;
+            }
         }
     }
-    return area;
+    return null;
 }
 
-fn getFloat(obj: std.json.ObjectMap, key: []const u8) ?f64 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .float => |f| f,
-        .integer => |i| @as(f64, @floatFromInt(i)),
-        else => null,
-    };
+fn pendingCount() usize {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
+    var n: usize = 0;
+    for (pending) |slot| {
+        if (slot != null) n += 1;
+    }
+    return n;
 }
 
-fn parsePositionExpr(val: std.json.Value, half: f64, is_vertical: bool) ?f64 {
-    switch (val) {
-        .float => |f| return f,
-        .integer => |i| return @floatFromInt(i),
-        .string => |s| return evalAnchorExpr(s, half, is_vertical),
-        else => return null,
+// Readbacks whose set was rejected: their reply is suppressed (main thread only).
+var suppressed: [8]u32 = [_]u32{0} ** 8;
+var suppressed_next: usize = 0;
+
+fn suppress(id: u32) void {
+    suppressed[suppressed_next % suppressed.len] = id;
+    suppressed_next += 1;
+}
+
+fn takeSuppressed(id: u32) bool {
+    for (&suppressed) |*s| {
+        if (s.* == id and id != 0) {
+            s.* = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Expire requests the device never answered (main thread).
+fn sweepPending() void {
+    const now = std.time.milliTimestamp();
+    var expired: [MAX_PENDING]PendingEntry = undefined;
+    var n: usize = 0;
+    {
+        pending_mutex.lock();
+        defer pending_mutex.unlock();
+        for (&pending) |*slot| {
+            if (slot.*) |e| {
+                if (now > e.deadline_ms) {
+                    expired[n] = e;
+                    n += 1;
+                    slot.* = null;
+                }
+            }
+        }
+    }
+    for (expired[0..n]) |e| {
+        log.warn("request_id={} (cmd=0x{x:0>2}, {s}) timed out", .{ e.request_id, e.cmd_type, @tagName(e.kind) });
+        if (e.kind == .set_ack) continue; // the readback reports
+        if (takeSuppressed(e.request_id)) continue;
+        sendError(e.client, e.cmd_type, proto.Err.timeout);
     }
 }
 
-fn evalAnchorExpr(expr: []const u8, half: f64, is_vertical: bool) ?f64 {
-    var pos: usize = 0;
-    while (pos < expr.len and expr[pos] == ' ') pos += 1;
-    if (pos >= expr.len) return null;
+// ── Response queue: USB thread → main thread ────────────────────────
 
-    const anchor: f64 = switch (expr[pos]) {
-        't' => if (is_vertical) half else return null,
-        'b' => if (is_vertical) -half else return null,
-        'l' => if (!is_vertical) -half else return null,
-        'r' => if (!is_vertical) half else return null,
-        'c' => 0,
-        else => return null,
+const RespMsg = struct {
+    entry: PendingEntry,
+    status: u32,
+    len: u32,
+    truncated: bool,
+    data: [RESP_MAX]u8,
+};
+
+const RESP_QUEUE = 16;
+var resp_queue: [RESP_QUEUE]RespMsg = undefined;
+var resp_head: usize = 0; // next to pop
+var resp_count: usize = 0;
+var resp_mutex: std.Thread.Mutex = .{};
+
+/// Response hook (USB thread, or a job thread's state machine restoring it).
+fn onResponse(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
+    const status = core.response_status();
+    const entry = takePending(request_id) orelse {
+        log.debug("response for unknown request_id={}, ignoring", .{request_id});
+        return;
     };
-    pos += 1;
+    resp_mutex.lock();
+    defer resp_mutex.unlock();
+    if (resp_count == RESP_QUEUE) {
+        log.warn("response queue full, dropping request_id={}", .{request_id});
+        return; // client times out
+    }
+    const m = &resp_queue[(resp_head + resp_count) % RESP_QUEUE];
+    const n = @min(payload_len, RESP_MAX);
+    m.entry = entry;
+    m.status = status;
+    m.len = n;
+    m.truncated = n < payload_len;
+    @memcpy(m.data[0..n], payload_ptr[0..n]);
+    resp_count += 1;
+    notifyMain();
+}
 
-    while (pos < expr.len and expr[pos] == ' ') pos += 1;
-    if (pos >= expr.len) return anchor;
+fn popResponse(out: *RespMsg) bool {
+    resp_mutex.lock();
+    defer resp_mutex.unlock();
+    if (resp_count == 0) return false;
+    out.* = resp_queue[resp_head];
+    resp_head = (resp_head + 1) % RESP_QUEUE;
+    resp_count -= 1;
+    return true;
+}
 
-    const sign: f64 = switch (expr[pos]) {
-        '+' => 1,
-        '-' => -1,
-        else => return null,
+var resp_scratch: RespMsg = undefined; // main thread only
+
+fn drainResponses() void {
+    while (popResponse(&resp_scratch)) handleResponse(&resp_scratch);
+}
+
+fn decodeArea(payload: []const u8) ?config.Corners {
+    var out: [9]f64 align(8) = undefined;
+    if (core.decode_display_area(payload.ptr, payload.len, @ptrCast(&out)) == 0) return null;
+    return out;
+}
+
+fn handleResponse(m: *const RespMsg) void {
+    const e = m.entry;
+    const payload = m.data[0..m.len];
+    log.debug("response cmd=0x{x:0>2} kind={s} status=0x{x} len={} fd={}", .{
+        e.cmd_type, @tagName(e.kind), m.status, m.len, e.client.fd,
+    });
+
+    if (m.status != 0) {
+        log.warn("device rejected cmd=0x{x:0>2} ({s}): status 0x{x}", .{ e.cmd_type, @tagName(e.kind), m.status });
+        if (e.kind == .set_ack) suppress(e.pair_id);
+        if (e.kind == .set_readback and takeSuppressed(e.request_id)) return;
+        sendError(e.client, e.cmd_type, m.status);
+        return;
+    }
+    if (m.truncated) {
+        sendError(e.client, e.cmd_type, proto.Err.too_large);
+        return;
+    }
+
+    switch (e.kind) {
+        .set_ack => {},
+        .get_area, .set_readback => {
+            if (e.kind == .set_readback and takeSuppressed(e.request_id)) return;
+            const c = decodeArea(payload) orelse {
+                log.warn("display area decode failed (len={})", .{payload.len});
+                sendError(e.client, e.cmd_type, proto.Err.failed);
+                return;
+            };
+            var out: [proto.DISPLAY_AREA_SIZE]u8 = undefined;
+            proto.encodeDisplayArea(&out, c);
+            sendReply(e.client, e.cmd_type, &out);
+            if (e.kind == .set_readback) {
+                log.info("display area set: TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+                    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8],
+                });
+                config.saveDisplayArea(gpa, c) catch |err| {
+                    log.err("failed to save display area to ~/{s}: {}", .{ config.CONFIG_REL_PATH, err });
+                    return;
+                };
+                log.info("display area saved to ~/{s}", .{config.CONFIG_REL_PATH});
+            }
+        },
+        .raw => sendReply(e.client, e.cmd_type, payload),
+        .stimulus => sendStimulus(e.client, e.cmd_type, payload),
+    }
+}
+
+// Stimulus reply: [u32 LE n][n × (x f64, y f64) LE][raw TTP payload].
+fn sendStimulus(c: Client, cmd_type: u8, payload: []const u8) void {
+    var pts: [2 * 32]f64 align(8) = undefined;
+    const n = core.decode_cal_stimulus(payload.ptr, payload.len, @ptrCast(&pts), 32);
+    log.info("calibration stimulus: {} points, {} raw bytes", .{ n, payload.len });
+    var i: u32 = 0;
+    while (i < n) : (i += 1) log.info("  stimulus[{}] = ({d:.4}, {d:.4})", .{ i, pts[2 * i], pts[2 * i + 1] });
+
+    var buf: [4 + 2 * 32 * 8 + RESP_MAX]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], n, .little);
+    var off: usize = 4;
+    for (pts[0 .. 2 * n]) |v| {
+        std.mem.writeInt(u64, buf[off..][0..8], @bitCast(v), .little);
+        off += 8;
+    }
+    @memcpy(buf[off..][0..payload.len], payload);
+    off += payload.len;
+    sendReply(c, cmd_type, buf[0..off]);
+}
+
+// ── Calibration jobs (job thread) ───────────────────────────────────
+//
+// start/finish/apply drive multi-step state machines that own the USB
+// transport (Tracker.beginCalibrating). They run one at a time on a job
+// thread so the main loop keeps serving sockets. A queued job starts only
+// once no single request is in flight (the state machines' response hooks
+// don't filter by request_id).
+
+const JobKind = enum { start_cal, finish_cal, apply, startup_apply };
+
+const Job = struct {
+    kind: JobKind,
+    client: Client = .{ .fd = -1, .is_ws = false },
+    cmd_type: u8 = 0,
+    /// apply / startup_apply: owned copy of the blob (freed on completion).
+    blob: ?[]u8 = null,
+};
+
+var job_queued: ?Job = null; // main thread only
+var job_current: Job = undefined; // owned by job thread while job_running
+var job_running: bool = false; // main thread only
+var job_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var job_ok: bool = false;
+var job_started_ms: i64 = 0;
+var job_queued_ms: i64 = 0;
+
+fn deviceBusy() bool {
+    return job_queued != null or job_running;
+}
+
+fn queueJob(j: Job) void {
+    std.debug.assert(!deviceBusy());
+    job_queued = j;
+    job_queued_ms = std.time.milliTimestamp();
+}
+
+fn jobThreadFn() void {
+    const j = job_current;
+    job_ok = switch (j.kind) {
+        .start_cal => tracker.startCalibration(),
+        .finish_cal => tracker.finishCalibration(),
+        .apply, .startup_apply => tracker.calApply(j.blob.?),
     };
-    pos += 1;
+    job_done.store(true, .release);
+    notifyMain();
+}
 
-    while (pos < expr.len and expr[pos] == ' ') pos += 1;
-    if (pos >= expr.len) return null;
+/// Start a queued job / complete a finished one (main thread, each loop).
+fn serviceJobs() void {
+    if (job_running and job_done.load(.acquire)) {
+        job_running = false;
+        job_done.store(false, .monotonic);
+        completeJob(job_current, job_ok, std.time.milliTimestamp() - job_started_ms);
+    }
+    if (!job_running) {
+        if (job_queued) |j| {
+            // Wait for in-flight single requests to drain (they expire after
+            // REQUEST_TIMEOUT_MS, so this can't stall forever).
+            if (pendingCount() > 0 and std.time.milliTimestamp() - job_queued_ms < REQUEST_TIMEOUT_MS + 1000) return;
+            job_queued = null;
+            job_current = j;
+            job_running = true;
+            job_started_ms = std.time.milliTimestamp();
+            log.info("job {s} started", .{@tagName(j.kind)});
+            const t = std.Thread.spawn(.{}, jobThreadFn, .{}) catch |err| {
+                log.err("failed to spawn job thread: {}", .{err});
+                job_running = false;
+                completeJob(j, false, 0);
+                return;
+            };
+            t.detach();
+        }
+    }
+}
 
-    const num = std.fmt.parseFloat(f64, expr[pos..]) catch return null;
-    return anchor + sign * num;
+fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
+    defer if (j.blob) |b| gpa.free(b);
+    log.info("job {s} {s} in {d} ms", .{ @tagName(j.kind), if (ok) "succeeded" else "FAILED", elapsed_ms });
+
+    switch (j.kind) {
+        .startup_apply => {
+            if (ok) {
+                log.info("stored calibration applied ({} bytes, {d} ms)", .{ j.blob.?.len, elapsed_ms });
+            } else {
+                log.warn("stored calibration could not be applied ({d} ms); device keeps its current calibration", .{elapsed_ms});
+            }
+        },
+        .start_cal, .apply => {
+            if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, proto.Err.failed);
+        },
+        .finish_cal => {
+            if (!ok) {
+                sendError(j.client, j.cmd_type, proto.Err.failed);
+                return;
+            }
+            const blob = core.cal_finish_blob_ptr()[0..core.cal_finish_blob_len()];
+            sendReply(j.client, j.cmd_type, blob);
+            if (blob.len == 0 or core.had_truncation() != 0) {
+                log.warn("finish_calibration: blob empty or truncated ({} bytes), not saving", .{blob.len});
+                return;
+            }
+            var pbuf: [512]u8 = undefined;
+            const path = config.calibrationPath(&pbuf) orelse return;
+            config.writeFileAtomic(path, blob) catch |err| {
+                log.err("failed to save calibration to {s}: {}", .{ path, err });
+                return;
+            };
+            log.info("calibration saved to {s} ({} bytes)", .{ path, blob.len });
+        },
+    }
+}
+
+/// Queue the stored calibration for cal_apply (startup).
+fn queueStartupCalibration() void {
+    var pbuf: [512]u8 = undefined;
+    const path = config.calibrationPath(&pbuf) orelse return;
+    const blob = config.readFile(gpa, path, core.scratch_size() + 1) orelse {
+        log.info("no stored calibration at {s}", .{path});
+        return;
+    };
+    if (blob.len == 0 or blob.len > core.scratch_size()) {
+        log.warn("stored calibration {s} has bad size {}, ignoring", .{ path, blob.len });
+        gpa.free(blob);
+        return;
+    }
+    log.info("applying stored calibration {s} ({} bytes); device commands answer busy until done", .{ path, blob.len });
+    queueJob(.{ .kind = .startup_apply, .blob = blob });
+}
+
+// ── Command forwarding: client → tracker ────────────────────────────
+
+/// Called by server.zig and ws_server.zig for every command except
+/// subscribe/disconnect.
+fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, is_ws: bool) void {
+    const c = Client{ .fd = client_fd, .is_ws = is_ws };
+    const cmd = std.meta.intToEnum(proto.Cmd, cmd_type) catch {
+        log.warn("unknown cmd 0x{x:0>2} from fd={}", .{ cmd_type, client_fd });
+        sendError(c, cmd_type, proto.Err.unknown_cmd);
+        return;
+    };
+    if (cmd == .subscribe or cmd == .disconnect) return; // handled by the servers
+
+    if (deviceBusy()) {
+        log.info("cmd=0x{x:0>2} from fd={} rejected: busy ({s})", .{
+            cmd_type, client_fd, @tagName((job_queued orelse job_current).kind),
+        });
+        sendError(c, cmd_type, proto.Err.busy);
+        return;
+    }
+
+    switch (cmd) {
+        .subscribe, .disconnect => unreachable,
+
+        .start_calibration => queueJob(.{ .kind = .start_cal, .client = c, .cmd_type = cmd_type }),
+        .finish_calibration => queueJob(.{ .kind = .finish_cal, .client = c, .cmd_type = cmd_type }),
+        .cal_apply => {
+            log.debug("cal_apply: received payload_len={d} from fd={d}", .{ payload.len, client_fd });
+            if (payload.len == 0 or payload.len > core.scratch_size()) {
+                sendError(c, cmd_type, proto.Err.bad_payload);
+                return;
+            }
+            const blob = gpa.dupe(u8, payload) catch {
+                sendError(c, cmd_type, proto.Err.failed);
+                return;
+            };
+            queueJob(.{ .kind = .apply, .client = c, .cmd_type = cmd_type, .blob = blob });
+        },
+
+        .get_display_area => {
+            _ = sendRequest(c, cmd_type, .get_area, core.request_get_display_area(), 0);
+        },
+        .set_display_area, .set_display_area_corners => {
+            const corners: ?config.Corners = if (cmd == .set_display_area) blk: {
+                if (payload.len < 40) break :blk null;
+                var f: [5]f64 = undefined;
+                @memcpy(std.mem.asBytes(&f), payload[0..40]);
+                break :blk config.rectToCorners(.{ .w_mm = f[0], .h_mm = f[1], .ox_mm = f[2], .oy_mm = f[3], .z_mm = f[4] });
+            } else blk: {
+                if (payload.len < proto.DISPLAY_AREA_SIZE) break :blk null;
+                break :blk proto.decodeDisplayArea(payload[0..proto.DISPLAY_AREA_SIZE]);
+            };
+            setDisplayArea(c, cmd_type, corners orelse {
+                sendError(c, cmd_type, proto.Err.bad_payload);
+                return;
+            });
+        },
+        .add_calibration_point => {
+            if (payload.len < 16) {
+                sendError(c, cmd_type, proto.Err.bad_payload);
+                return;
+            }
+            var f: [2]f64 = undefined;
+            @memcpy(std.mem.asBytes(&f), payload[0..16]);
+            _ = sendRequest(c, cmd_type, .raw, core.request_cal_point_add2d(f[0], f[1], 3), 0); // eye_mask=3: both eyes
+        },
+        .get_calibration_stimulus => {
+            _ = sendRequest(c, cmd_type, .stimulus, core.request_cal_stimulus(), 0);
+        },
+    }
+}
+
+/// Register + send the request the core just built into session_out.
+fn sendRequest(c: Client, cmd_type: u8, kind: Kind, request_id: u32, pair_id: u32) bool {
+    const out_len = core.session_out_len_();
+    if (out_len == 0 or request_id == 0) {
+        sendError(c, cmd_type, proto.Err.failed);
+        return false;
+    }
+    // Register before sending: the response can arrive on the USB thread
+    // before transport.send returns.
+    if (!addPending(.{
+        .request_id = request_id,
+        .client = c,
+        .cmd_type = cmd_type,
+        .kind = kind,
+        .deadline_ms = std.time.milliTimestamp() + REQUEST_TIMEOUT_MS,
+        .pair_id = pair_id,
+    })) {
+        sendError(c, cmd_type, proto.Err.busy);
+        return false;
+    }
+    if (!transport.send(core.session_out_ptr()[0..out_len])) {
+        log.err("USB send failed for cmd=0x{x:0>2}", .{cmd_type});
+        _ = takePending(request_id);
+        if (kind != .set_ack) sendError(c, cmd_type, proto.Err.usb);
+        return false;
+    }
+    log.debug("forwarded cmd=0x{x:0>2} ({s}) request_id={} for fd={}", .{ cmd_type, @tagName(kind), request_id, c.fd });
+    return true;
+}
+
+/// set → ack (status checked), then get → reply with what the device holds.
+/// The device handles requests in order, so the readback sees the new area.
+fn setDisplayArea(c: Client, cmd_type: u8, a: config.Corners) void {
+    log.info("set display area from fd={}: TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+        c.fd, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
+    });
+    const set_id = core.request_set_display_area_corners(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    // Pair id = the readback's request_id, which the core hands out next.
+    // Build the readback only after the set frame went out (session_out is reused).
+    const set_len = core.session_out_len_();
+    var set_frame: [512]u8 = undefined;
+    @memcpy(set_frame[0..set_len], core.session_out_ptr()[0..set_len]);
+
+    const get_id = core.request_get_display_area();
+    const get_len = core.session_out_len_();
+    var get_frame: [64]u8 = undefined;
+    @memcpy(get_frame[0..get_len], core.session_out_ptr()[0..get_len]);
+
+    const now = std.time.milliTimestamp();
+    _ = addPending(.{ .request_id = set_id, .client = c, .cmd_type = cmd_type, .kind = .set_ack, .deadline_ms = now + REQUEST_TIMEOUT_MS, .pair_id = get_id });
+    if (!addPending(.{ .request_id = get_id, .client = c, .cmd_type = cmd_type, .kind = .set_readback, .deadline_ms = now + REQUEST_TIMEOUT_MS })) {
+        _ = takePending(set_id);
+        sendError(c, cmd_type, proto.Err.busy);
+        return;
+    }
+    if (!transport.send(set_frame[0..set_len]) or !transport.send(get_frame[0..get_len])) {
+        log.err("USB send failed for cmd=0x{x:0>2}", .{cmd_type});
+        _ = takePending(set_id);
+        _ = takePending(get_id);
+        sendError(c, cmd_type, proto.Err.usb);
+    }
+}
+
+// ── Startup display area ────────────────────────────────────────────
+
+fn cornersOf(d: Tracker.DisplayCorners) config.Corners {
+    return .{ d.tl_x, d.tl_y, d.tl_z, d.tr_x, d.tr_y, d.tr_z, d.bl_x, d.bl_y, d.bl_z };
+}
+
+fn trackerCorners(c: config.Corners) Tracker.DisplayCorners {
+    return .{
+        .tl_x = c[0], .tl_y = c[1], .tl_z = c[2],
+        .tr_x = c[3], .tr_y = c[4], .tr_z = c[5],
+        .bl_x = c[6], .bl_y = c[7], .bl_z = c[8],
+    };
+}
+
+fn maxDiff(a: config.Corners, b: config.Corners) f64 {
+    var m: f64 = 0;
+    for (a, b) |x, y| m = @max(m, @abs(x - y));
+    return m;
+}
+
+/// Before the USB thread starts: push the config's area if it differs from
+/// the device's (or, with keep_device_area, only if the device looks reset).
+fn applyStartupDisplayArea(cfg: ?config.Corners, keep_device_area: bool) void {
+    const dev = cornersOf(tracker.display);
+    const reset = tracker.display.isReset();
+    const want: config.Corners = cfg orelse blk: {
+        if (!reset) {
+            log.info("no display area in ~/{s}; keeping the device's", .{config.CONFIG_REL_PATH});
+            return;
+        }
+        log.info("no display area in ~/{s} and device looks reset; applying built-in default", .{config.CONFIG_REL_PATH});
+        break :blk config.rectToCorners(.{});
+    };
+    if (keep_device_area and !reset) {
+        log.info("--keep-device-area: device display area preserved", .{});
+        return;
+    }
+    const d = maxDiff(want, dev);
+    if (d < 0.01) {
+        log.info("device display area matches config", .{});
+        return;
+    }
+    log.info("applying config display area (differs from device by up to {d:.2} mm): TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+        d, want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7], want[8],
+    });
+    if (!tracker.setDisplayAreaCorners(trackerCorners(want))) {
+        log.warn("failed to set display area from config", .{});
+        return;
+    }
+    const got = cornersOf(tracker.display);
+    if (maxDiff(want, got) > 0.01) {
+        log.warn("device holds TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2}) after set (rejected?)", .{
+            got[0], got[1], got[2], got[3], got[4], got[5], got[6], got[7], got[8],
+        });
+    }
 }
 
 // ── Signal handling ─────────────────────────────────────────────────
@@ -428,48 +755,73 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
+/// Debug: log every TTP response frame (magic 0x52) with its status word.
+fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_len: u32) void {
+    if (magic != core.TTP_MAGIC_RSP) return;
+    const n = @min(payload_len, 32);
+    log.debug("ttp rsp seq={d} op=0x{x} status=0x{x} plen={d} head={x}", .{ seq, op, core.response_status(), payload_len, payload_ptr[0..n] });
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
+fn usage() void {
+    std.debug.print(
+        \\usage: tobiifreed [--ws [addr:]port] [--keep-device-area] [--no-restore-calibration] [--init-config]
+        \\
+    , .{});
+}
+
 pub fn main() void {
-    // Parse arguments.
     var ws_addr: u32 = std.mem.nativeToBig(u32, 0x7f000001); // 127.0.0.1
     var ws_port: u16 = 7081;
-    var ws_enabled: bool = false;
+    var ws_enabled = false;
+    var keep_device_area = false;
+    var restore_calibration = true;
 
     var args = std.process.args();
     _ = args.next();
-    while (args.next()) |arg| {
+    var pending_arg: ?[]const u8 = null;
+    while (pending_arg orelse args.next()) |arg| {
+        pending_arg = null;
         if (std.mem.eql(u8, arg, "--init-config")) {
             initConfig();
             return;
         } else if (std.mem.eql(u8, arg, "--ws")) {
             ws_enabled = true;
-            // Peek at next arg for optional address.
             if (args.next()) |ws_arg| {
                 if (ws_arg.len > 0 and ws_arg[0] == '-') {
-                    // Not a WS argument, it's another flag — rewind not possible,
-                    // but we only have --ws and --init-config so this won't happen.
-                    continue;
+                    pending_arg = ws_arg; // another flag, not a WS address
+                } else {
+                    parseWsArg(ws_arg, &ws_addr, &ws_port);
                 }
-                parseWsArg(ws_arg, &ws_addr, &ws_port);
             }
+        } else if (std.mem.eql(u8, arg, "--keep-device-area")) {
+            keep_device_area = true;
+        } else if (std.mem.eql(u8, arg, "--no-restore-calibration")) {
+            restore_calibration = false;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            usage();
+            return;
+        } else {
+            log.err("unknown argument: {s}", .{arg});
+            usage();
+            return;
         }
     }
 
-    // Load config.
-    const display = loadDisplayArea();
-    log.info("display_area {d:.0}x{d:.0}mm  origin=({d:.0},{d:.0})  z={d:.0}  tilt={d:.2}", .{
-        display.w_mm, display.h_mm, display.ox_mm, display.oy_mm, display.z_mm, display.tilt_deg,
-    });
+    const cfg_area = config.loadDisplayArea(gpa);
+    if (cfg_area) |a| {
+        log.info("config display area: TL=({d:.2},{d:.2},{d:.2}) TR=({d:.2},{d:.2},{d:.2}) BL=({d:.2},{d:.2},{d:.2})", .{
+            a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
+        });
+    }
 
-    // Open USB transport.
     transport = LibusbTransport.init() catch |err| {
         log.err("failed to open USB: {}", .{err});
         return;
     };
     defer transport.deinit();
 
-    // Connect tracker via transport.
     tracker = Tracker.init(.{
         .send_fn = &transportSend,
         .recv_fn = &transportRecv,
@@ -480,28 +832,19 @@ pub fn main() void {
     };
     defer tracker.deinit();
 
-    // Apply display area from config only if device was power-cycled (reset to tiny default).
-    if (tracker.display.isReset()) {
-        log.info("device display area looks reset, applying config", .{});
-        if (!tracker.setDisplayArea(display)) {
-            log.warn("failed to set display area from config", .{});
-        }
-    } else {
-        log.info("device display area preserved from previous session", .{});
-    }
+    applyStartupDisplayArea(cfg_area, keep_device_area);
     tracker.onGaze(onGaze);
 
-    // Install response hook for command forwarding.
+    // Install hooks for command forwarding (after the synchronous startup
+    // queries, which use their own capture hook).
     core.set_hooks(onTtpFrame, null, onResponse, null, null);
 
-    // Start socket server.
     server.init(&forwardCommand) catch |err| {
         log.err("failed to start server: {}", .{err});
         return;
     };
     defer server.deinit();
 
-    // Start WebSocket server (if enabled).
     if (ws_enabled) {
         ws = WsServer.init(ws_addr, ws_port, &forwardCommand) catch |err| {
             log.err("failed to start WebSocket server: {}", .{err});
@@ -510,7 +853,6 @@ pub fn main() void {
     }
     defer if (ws) |*w| w.deinit();
 
-    // Set up notification pipe (non-blocking read end).
     notify_pipe = std.posix.pipe2(.{ .NONBLOCK = true }) catch |err| {
         log.err("failed to create pipe: {}", .{err});
         return;
@@ -522,69 +864,66 @@ pub fn main() void {
 
     installSignalHandlers();
 
-    // Spawn USB thread — blocks on recv(), device-paced.
     const usb_thread = std.Thread.spawn(.{}, usbThreadFn, .{}) catch |err| {
         log.err("failed to spawn USB thread: {}", .{err});
         return;
     };
 
+    if (restore_calibration) queueStartupCalibration() else log.info("--no-restore-calibration: not applying stored calibration", .{});
+
     log.info("running", .{});
 
-    // Main loop — poll on notification pipe + short timeout for socket I/O.
     while (!quit) {
-        // Check for gaze data from USB thread.
+        var drain_buf: [64]u8 = undefined;
+        _ = std.posix.read(notify_pipe[0], &drain_buf) catch {};
         drainGaze();
-        // Service client connections.
+        drainResponses();
+        serviceJobs();
+        sweepPending();
         server.acceptClients();
         server.readCommands();
         if (ws) |*w| {
             w.acceptClients();
             w.readClients();
         }
-        // Sleep briefly to avoid busy-spinning on socket I/O.
-        // The pipe notification + this short sleep gives ~1ms latency.
         std.Thread.sleep(1_000_000); // 1ms
     }
 
     log.info("shutting down", .{});
+    if (job_running) log.warn("a calibration job is still running; waiting for it", .{});
+    while (job_running and !job_done.load(.acquire)) std.Thread.sleep(10_000_000);
     usb_thread.join();
 }
 
 // ── --init-config ──────────────────────────────────────────────────
 
 fn initConfig() void {
-    const home = std.posix.getenv("HOME") orelse {
+    var path_buf: [512]u8 = undefined;
+    const path = config.configPath(&path_buf) orelse {
         log.err("$HOME not set", .{});
         return;
     };
-    var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ home, CONFIG_PATH }) catch return;
     if (std.fs.cwd().access(path, .{})) |_| {
         log.info("{s} already exists", .{path});
-    } else |_| {
-        var dir_buf: [512]u8 = undefined;
-        const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.config", .{home}) catch return;
-        std.fs.cwd().makePath(dir_path) catch {};
-        const file = std.fs.cwd().createFile(path, .{}) catch |err| {
-            log.err("create config: {}", .{err});
-            return;
-        };
-        defer file.close();
-        file.writeAll(
-            \\{
-            \\  "display_area": {
-            \\    "w_mm": 800,
-            \\    "h_mm": 340,
-            \\    "z_mm": 0,
-            \\    "tilt": 0,
-            \\    "cx": 0,
-            \\    "cy": "b - 10"
-            \\  }
-            \\}
-            \\
-        ) catch return;
-        log.info("created {s}", .{path});
-    }
+        return;
+    } else |_| {}
+    config.writeFileAtomic(path,
+        \\{
+        \\  "display_area": {
+        \\    "w_mm": 800,
+        \\    "h_mm": 340,
+        \\    "z_mm": 0,
+        \\    "tilt": 0,
+        \\    "cx": 0,
+        \\    "cy": "b - 10"
+        \\  }
+        \\}
+        \\
+    ) catch |err| {
+        log.err("create config: {}", .{err});
+        return;
+    };
+    log.info("created {s}", .{path});
 }
 
 // ── --ws argument parsing ──────────────────────────────────────────
@@ -622,6 +961,12 @@ fn parseIpv4(s: []const u8) ?u32 {
 fn usbThreadFn() void {
     log.info("USB thread started", .{});
     while (!quit) {
+        // While a calibration job owns the transport poll() returns at once;
+        // don't spin.
+        if (tracker.cal_pending.load(.acquire)) {
+            std.Thread.sleep(2_000_000);
+            continue;
+        }
         tracker.poll();
     }
     log.info("USB thread stopped", .{});
