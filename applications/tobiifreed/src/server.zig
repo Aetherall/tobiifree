@@ -64,10 +64,11 @@ pub const Server = struct {
 
         try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
         if (owner) |o| {
+            // chmod while still root's: chmod of another uid's file needs CAP_FOWNER.
+            try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
             const linux = std.os.linux;
             const rc = linux.syscall5(.fchownat, @bitCast(@as(isize, linux.AT.FDCWD)), @intFromPtr(&addr.path), o.uid, o.gid, 0);
             if (linux.E.init(rc) != .SUCCESS) return error.ChownFailed;
-            try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
         }
         try std.posix.listen(fd, 8);
 
