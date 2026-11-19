@@ -56,6 +56,7 @@ pub const Err = struct {
     pub const bad_payload: u32 = 0x05; // malformed command payload
     pub const unknown_cmd: u32 = 0x06;
     pub const usb: u32 = 0x07; // USB send failed
+    pub const disconnected: u32 = 0x08; // client-side: daemon connection lost with the request outstanding
 };
 
 /// 9×f64 LE display area: TL.xyz, TR.xyz, BL.xyz (mm, tracker frame).
