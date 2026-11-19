@@ -919,6 +919,7 @@ fn enterValidate() void {
     val_fallback = .{false} ** VAL_N;
     val_analysis = null;
     val_saving = false;
+    val_run_saved = false;
     val_t0 = now();
     val_phase = .intro;
     setCursorHidden(true);
@@ -1017,18 +1018,108 @@ fn finishValDot(el: f64) void {
     }
 }
 
-fn analyseValidation() void {
+// ── Validation history: runs pooled into the map ──
+//
+// Every validation on the same calibration (blob SHA-256 + display area)
+// adds its per-dot raw medians to $XDG_STATE_HOME/tobiifree/correction_runs.json
+// as soon as its results are computed (so V or ESC don't lose it); the new
+// map is fitted on the per-target pool of all runs (corr.pool). X resets the
+// history to the current run. tobiifreed deletes the file with the map when
+// the blob or the area changes; a history for another blob/area is replaced.
+
+var hist_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+var hist_runs: []const corr.Run = &.{};
+var val_pool: [corr.MAX_POINTS]corr.Point = undefined;
+var val_pool_n: usize = 0;
+var val_run_saved = false; // this run is in the history file
+
+fn historyPath(buf: []u8) ?[]const u8 {
+    if (std.posix.getenv("XDG_STATE_HOME")) |s| if (s.len > 0) {
+        return std.fmt.bufPrint(buf, "{s}/tobiifree/correction_runs.json", .{s}) catch null;
+    };
+    const home = std.posix.getenv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/correction_runs.json", .{home}) catch null;
+}
+
+/// SHA-256 of the stored calibration blob (the one the device runs), or null.
+fn calibrationSha() ?[64]u8 {
+    var pbuf: [512]u8 = undefined;
+    const path = calibrationPath(&pbuf) orelse return null;
+    const blob = std.fs.cwd().readFileAlloc(gpa, path, 4 << 20) catch return null;
+    defer gpa.free(blob);
+    return corr.sha256Hex(blob);
+}
+
+/// Previous runs of the history file if made with `sha` on `area`.
+fn loadHistory(a: std.mem.Allocator, sha: []const u8, area: [9]f64) []const corr.Run {
+    var pbuf: [512]u8 = undefined;
+    const path = historyPath(&pbuf) orelse return &.{};
+    const json = std.fs.cwd().readFileAlloc(a, path, 4 << 20) catch return &.{};
+    const h = std.json.parseFromSliceLeaky(corr.History, a, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+        log.warn("validation history {s} unreadable: starting a new one", .{path});
+        return &.{};
+    };
+    if (h.version != corr.HISTORY_VERSION or !h.matches(sha, area)) {
+        log.info("validation history made with another calibration or display area: starting a new one", .{});
+        return &.{};
+    }
+    return h.runs;
+}
+
+fn saveHistory(sha: []const u8, area: [9]f64, runs: []const corr.Run) void {
+    var pbuf: [512]u8 = undefined;
+    const path = historyPath(&pbuf) orelse return;
+    const h = corr.History{ .calibration_sha256 = sha, .display_area = area, .runs = runs };
+    const json = h.stringify(gpa) catch return;
+    defer gpa.free(json);
+    if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
+    var tmp_buf: [600]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return;
+    std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = json }) catch |err| {
+        log.err("could not write {s}: {}", .{ tmp, err });
+        return;
+    };
+    std.fs.cwd().rename(tmp, path) catch |err| {
+        log.err("could not write {s}: {}", .{ path, err });
+        return;
+    };
+    log.info("validation history: {d} run(s) in {s}", .{ runs.len, path });
+}
+
+/// Store this run in the history (unless done already; `reset`: drop the
+/// previous runs), pool, analyse.
+fn analyseValidation(reset: bool) void {
     const area = device_area orelse {
         log.err("validation: no display area, cannot compute errors", .{});
         val_phase = .results;
         return;
     };
     const t0 = now();
+    _ = hist_arena.reset(.retain_capacity);
+    const a = hist_arena.allocator();
+    var runs: std.ArrayList(corr.Run) = .empty;
+    const sha_opt = calibrationSha();
+    if (sha_opt) |*sha| {
+        const prev = loadHistory(a, sha, area);
+        // The file already holds this run once it was saved (re-analysis after X).
+        const keep_prev = if (reset) 0 else if (val_run_saved and prev.len > 0) prev.len - 1 else prev.len;
+        const first = keep_prev -| (corr.MAX_RUNS - 1);
+        runs.appendSlice(a, prev[first..keep_prev]) catch {};
+    } else log.warn("no stored calibration: validation history not used", .{});
+    const cur = refine.toRun(a, &val_dots, std.time.timestamp()) catch corr.Run{ .dots = &.{} };
+    if (cur.dots.len > 0) runs.append(a, cur) catch {};
+    hist_runs = runs.items;
+    if (sha_opt) |*sha| if (cur.dots.len > 0) {
+        saveHistory(sha, area, hist_runs);
+        val_run_saved = true;
+    };
+    val_pool_n = corr.pool(hist_runs, &val_pool);
+
     const am: ?*const corr.Map = if (active_map) |*m| m else null;
-    val_analysis = refine.analyse(&val_dots, area, am);
+    val_analysis = refine.analyse(&val_dots, val_pool[0..val_pool_n], hist_runs.len, area, am);
     const an = &val_analysis.?;
-    log.info("validation: {d}/{d} dots used, uncorrected mean {d:.2} deg max {d:.2} deg ({d:.1} mm mean)", .{ an.n_fit, VAL_N, an.raw.mean_deg, an.raw.max_deg, an.raw.mean_mm });
-    if (an.active) |a| log.info("validation: current map mean {d:.2} deg max {d:.2} deg", .{ a.mean_deg, a.max_deg });
+    log.info("validation: {d}/{d} dots used, uncorrected mean {d:.2} deg max {d:.2} deg ({d:.1} mm mean); {d} run(s) pooled, {d} positions", .{ an.n_fit, VAL_N, an.raw.mean_deg, an.raw.max_deg, an.raw.mean_mm, an.runs, an.n_pooled });
+    if (an.active) |s| log.info("validation: current map mean {d:.2} deg max {d:.2} deg", .{ s.mean_deg, s.max_deg });
     if (an.loo) |l| log.info("validation: new map, leave-one-out mean {d:.2} deg max {d:.2} deg (lambda {d})", .{ l.mean_deg, l.max_deg, an.map.?.params.lambda });
     log.info("validation: decision {s} (analysis {d:.0} ms)", .{ @tagName(an.decision), @as(f64, @floatFromInt(now() - t0)) / 1e3 });
     val_phase = .results;
@@ -1053,7 +1144,7 @@ fn tickValidate() void {
                 val_phase = .analysing;
             } else startValDot();
         },
-        .analysing => if (secsSince(val_t0) >= 0.05) analyseValidation(),
+        .analysing => if (secsSince(val_t0) >= 0.05) analyseValidation(false),
         .results => {},
     }
 }
@@ -1073,7 +1164,7 @@ fn applyDecision() void {
             };
             const sha = corr.sha256Hex(blob);
             gpa.free(blob);
-            const json = refine.fileJson(gpa, an, &val_dots, device_area.?, &sha, std.time.timestamp()) catch |err| {
+            const json = refine.fileJson(gpa, an, val_pool[0..val_pool_n], device_area.?, &sha, std.time.timestamp()) catch |err| {
                 setMsg(true, "Could not build the map: {}", .{err});
                 an.decision = .none;
                 return;
@@ -1121,6 +1212,10 @@ fn keyValidate(keyval: c_uint) void {
         c.GDK_KEY_r, c.GDK_KEY_R => enterStep(.position),
         c.GDK_KEY_v, c.GDK_KEY_V => enterValidate(),
         c.GDK_KEY_g, c.GDK_KEY_G => val_live = !val_live,
+        c.GDK_KEY_x, c.GDK_KEY_X => if (!val_saving and val_run_saved) {
+            log.info("validation history reset to this run", .{});
+            analyseValidation(true);
+        },
         c.GDK_KEY_Return, c.GDK_KEY_KP_Enter, c.GDK_KEY_space => applyDecision(),
         else => {},
     }
@@ -1223,10 +1318,11 @@ fn drawResults(cr: *c.cairo_t, w: f64, h: f64) void {
             .none => "no improvement: no correction map",
         };
         y += text(cr, w / 2, y, 18, .center, dcol, "{s}", .{dtext});
+        y += text(cr, w / 2, y, 14, .center, DIM, "runs pooled: {d} ({d} positions) · X resets the history to this run", .{ an.runs, an.n_pooled });
         if (any_fallback) y += text(cr, w / 2, y, 14, .center, ACC, "* no fixation within {d:.0}° of the dot: not used for the map", .{VAL_RADIUS_DEG});
     }
     y += 6 * ui;
-    y += text(cr, w / 2, y, 16, .center, FG, "ENTER done · V again · R recalibrate · G gaze {s} · ESC quit, change nothing", .{if (val_live) "off" else "on"});
+    y += text(cr, w / 2, y, 16, .center, FG, "ENTER done · V again (this run is kept) · R recalibrate · G gaze {s} · ESC quit", .{if (val_live) "off" else "on"});
     drawMsg(cr, w, y + 4 * ui);
     if (val_live) {
         drawGazeDot(cr, w, h);
