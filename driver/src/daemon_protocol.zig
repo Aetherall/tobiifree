@@ -57,6 +57,7 @@ pub const Err = struct {
     pub const unknown_cmd: u32 = 0x06;
     pub const usb: u32 = 0x07; // USB send failed
     pub const disconnected: u32 = 0x08; // client-side: daemon connection lost with the request outstanding
+    pub const no_device: u32 = 0x09; // tracker unplugged; the daemon reconnects when it returns
 };
 
 /// 9×f64 LE display area: TL.xyz, TR.xyz, BL.xyz (mm, tracker frame).

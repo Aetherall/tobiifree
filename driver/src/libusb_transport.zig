@@ -14,6 +14,13 @@ const log = std.log.scoped(.usb);
 pub const LibusbTransport = struct {
     usb_ctx: ?*c.libusb_context,
     usb_handle: ?*c.libusb_device_handle,
+    /// Set once a transfer fails with LIBUSB_ERROR_NO_DEVICE or _IO: the
+    /// device was unplugged / de-authorised. The handle is dead; the owner
+    /// should deinit() and init() again when the device is back.
+    lost: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    const LIBUSB_ERROR_IO: c_int = -1;
+    const LIBUSB_ERROR_NO_DEVICE: c_int = -4;
 
     const VID: u16 = 0x2104;
     const PIDS = [_]u16{ 0x0313, 0x031e, 0x0127 };
@@ -28,6 +35,12 @@ pub const LibusbTransport = struct {
     };
 
     pub fn init() Error!LibusbTransport {
+        return open(false);
+    }
+
+    /// Like init(); `quiet` logs "device not found" at debug level only
+    /// (for reconnect loops).
+    pub fn open(quiet: bool) Error!LibusbTransport {
         var self = LibusbTransport{
             .usb_ctx = null,
             .usb_handle = null,
@@ -47,9 +60,13 @@ pub const LibusbTransport = struct {
             }
         }
         if (self.usb_handle == null) {
-            log.err("no supported tracker PID found for VID {x:0>4}", .{VID});
-            for (PIDS) |pid| {
-                log.err("supported PID: {x:0>4}", .{pid});
+            if (quiet) {
+                log.debug("no tracker found", .{});
+            } else {
+                log.err("no supported tracker PID found for VID {x:0>4}", .{VID});
+                for (PIDS) |pid| {
+                    log.err("supported PID: {x:0>4}", .{pid});
+                }
             }
             c.libusb_exit(self.usb_ctx);
             return error.DeviceNotFound;
@@ -95,6 +112,7 @@ pub const LibusbTransport = struct {
         // sending.  The device learns the total expected payload length from
         // the plen field inside the TTP header (bytes 8-31), not from the
         // USB envelope.
+        if (self.lost.load(.acquire) or self.usb_handle == null) return false;
         const CHUNK: usize = 8192;
         const CONT_HDR: usize = 8;
         const CONT_DATA: usize = CHUNK - CONT_HDR; // 8184
@@ -109,6 +127,7 @@ pub const LibusbTransport = struct {
             );
             if (r != 0 or xfr != @as(c_int, @intCast(data.len))) {
                 log.err("send failed: r={d} transferred={d}/{d}", .{ r, xfr, data.len });
+                self.noteError(r);
                 return false;
             }
             return true;
@@ -131,6 +150,7 @@ pub const LibusbTransport = struct {
             );
             if (r != 0 or xfr != @as(c_int, @intCast(CHUNK))) {
                 log.err("send first chunk failed: r={d} transferred={d}/{d}", .{ r, xfr, CHUNK });
+                self.noteError(r);
                 return false;
             }
         }
@@ -161,6 +181,7 @@ pub const LibusbTransport = struct {
             if (r != 0 or xfr != @as(c_int, @intCast(chunk_total))) {
                 log.err("send continuation at offset={d} failed: r={d} transferred={d}/{d}",
                     .{ offset, r, xfr, chunk_total });
+                self.noteError(r);
                 return false;
             }
             offset = data_end;
@@ -181,21 +202,41 @@ pub const LibusbTransport = struct {
     }
 
     fn recvTimeout(self: *LibusbTransport, buf: []u8, timeout_ms: c_uint) ?usize {
+        if (self.lost.load(.acquire) or self.usb_handle == null) {
+            // Dead handle: behave like a timeout instead of failing instantly,
+            // so read loops don't spin.
+            std.Thread.sleep(@as(u64, timeout_ms) * std.time.ns_per_ms);
+            return null;
+        }
         var transferred: c_int = 0;
         const r = c.libusb_bulk_transfer(self.usb_handle, EP_IN, buf.ptr, @intCast(buf.len), &transferred, timeout_ms);
         if (r == 0 and transferred > 0) return @intCast(transferred);
         // LIBUSB_ERROR_TIMEOUT (-7) is expected, not an error.
         if (r != 0 and r != -7) {
-            log.debug("recv error: {d}", .{r});
+            if (!self.lost.load(.monotonic)) log.debug("recv error: {d}", .{r});
+            self.noteError(r);
         }
         return null;
+    }
+
+    fn noteError(self: *LibusbTransport, r: c_int) void {
+        if ((r == LIBUSB_ERROR_NO_DEVICE or r == LIBUSB_ERROR_IO) and !self.lost.load(.monotonic)) {
+            log.warn("device lost (libusb error {d})", .{r});
+            self.lost.store(true, .release);
+        }
+    }
+
+    pub fn isLost(self: *LibusbTransport) bool {
+        return self.lost.load(.acquire);
     }
 
     pub fn deinit(self: *LibusbTransport) void {
         // Session-close: vendor control 0x42.
         if (self.usb_handle) |h| {
-            _ = c.libusb_control_transfer(h, 0x40 | 0x01, 0x42, 0, 0, null, 0, 500);
-            log.info("session closed", .{});
+            if (!self.lost.load(.acquire)) {
+                _ = c.libusb_control_transfer(h, 0x40 | 0x01, 0x42, 0, 0, null, 0, 500);
+                log.info("session closed", .{});
+            }
         }
         self.releaseAndClose();
     }

@@ -17,9 +17,11 @@
 //                 the notify pipe; no client I/O happens on this thread.
 //   main thread — client sockets, request building/sending, response routing,
 //                 config/calibration persistence.
-//   job thread  — one at a time: start/finish calibration, cal_apply (incl.
-//                 the startup restore). These own the USB transport while they
-//                 run (gaze pauses); meanwhile device commands get Err.busy.
+//   job thread  — one at a time: start/finish calibration, cal_apply. These
+//                 own the USB transport while they run (gaze pauses);
+//                 meanwhile device commands get Err.busy.
+//   The USB thread also does (re)connection and the restore of area +
+//   calibration (startup, reconnect).
 //
 // Persistence:
 //   display area — every successful set_display_area[_corners] from a client
@@ -28,11 +30,18 @@
 //     whenever it differs from what the device reports (config = source of
 //     truth); --keep-device-area restores the old "only when reset" rule.
 //   calibration — a successful finish_calibration stores the blob at
-//     $XDG_STATE_HOME/tobiifree/calibration.bin (~/.local/state/…). At startup,
-//     if the file exists, it is cal_apply'd on the job thread *after* the
-//     sockets are up: clients can connect at once, gaze starts flowing only
-//     when the apply finishes (or fails / times out after 120 s), and device
-//     commands sent meanwhile get Err.busy.
+//     $XDG_STATE_HOME/tobiifree/calibration.bin (~/.local/state/…). At startup
+//     and after every reconnect, if the file exists, the USB thread
+//     cal_apply's it *after* the sockets are up (~0.3 s for a 270 KB blob on
+//     an ET5): clients can connect at once, gaze starts flowing when the apply
+//     ends (or fails / times out after 120 s), and device commands sent
+//     meanwhile get Err.busy.
+//
+// Hotplug: when the tracker disappears (USB error NO_DEVICE/IO) device
+// commands get Err.no_device, the daemon polls for the tracker every second,
+// and on return redoes the handshake, pushes the config's display area and
+// re-applies the stored calibration (a power-cycled ET5 forgets both). The
+// daemon also starts without a tracker and waits for it.
 
 const std = @import("std");
 const core = @import("tobiifree_core");
@@ -400,13 +409,13 @@ fn sendStimulus(c: Client, cmd_type: u8, payload: []const u8) void {
 // once no single request is in flight (the state machines' response hooks
 // don't filter by request_id).
 
-const JobKind = enum { start_cal, finish_cal, apply, startup_apply };
+const JobKind = enum { start_cal, finish_cal, apply };
 
 const Job = struct {
     kind: JobKind,
     client: Client = .{ .fd = -1, .is_ws = false },
     cmd_type: u8 = 0,
-    /// apply / startup_apply: owned copy of the blob (freed on completion).
+    /// apply: owned copy of the blob (freed on completion).
     blob: ?[]u8 = null,
 };
 
@@ -434,7 +443,7 @@ fn jobThreadFn() void {
     job_ok = switch (j.kind) {
         .start_cal => tracker.startCalibration(),
         .finish_cal => tracker.finishCalibration(),
-        .apply, .startup_apply => tracker.calApply(j.blob.?),
+        .apply => tracker.calApply(j.blob.?),
     };
     job_done.store(true, .release);
     notifyMain();
@@ -447,7 +456,7 @@ fn serviceJobs() void {
         job_done.store(false, .monotonic);
         completeJob(job_current, job_ok, std.time.milliTimestamp() - job_started_ms);
     }
-    if (!job_running) {
+    if (!job_running and dev_state.load(.acquire) == .up) {
         if (job_queued) |j| {
             // Wait for in-flight single requests to drain (they expire after
             // REQUEST_TIMEOUT_MS, so this can't stall forever).
@@ -473,13 +482,6 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
     log.info("job {s} {s} in {d} ms", .{ @tagName(j.kind), if (ok) "succeeded" else "FAILED", elapsed_ms });
 
     switch (j.kind) {
-        .startup_apply => {
-            if (ok) {
-                log.info("stored calibration applied ({} bytes, {d} ms)", .{ j.blob.?.len, elapsed_ms });
-            } else {
-                log.warn("stored calibration could not be applied ({d} ms); device keeps its current calibration", .{elapsed_ms});
-            }
-        },
         .start_cal, .apply => {
             if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, proto.Err.failed);
         },
@@ -505,23 +507,6 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
     }
 }
 
-/// Queue the stored calibration for cal_apply (startup).
-fn queueStartupCalibration() void {
-    var pbuf: [512]u8 = undefined;
-    const path = config.calibrationPath(&pbuf) orelse return;
-    const blob = config.readFile(gpa, path, core.scratch_size() + 1) orelse {
-        log.info("no stored calibration at {s}", .{path});
-        return;
-    };
-    if (blob.len == 0 or blob.len > core.scratch_size()) {
-        log.warn("stored calibration {s} has bad size {}, ignoring", .{ path, blob.len });
-        gpa.free(blob);
-        return;
-    }
-    log.info("applying stored calibration {s} ({} bytes); device commands answer busy until done", .{ path, blob.len });
-    queueJob(.{ .kind = .startup_apply, .blob = blob });
-}
-
 // ── Command forwarding: client → tracker ────────────────────────────
 
 /// Called by server.zig and ws_server.zig for every command except
@@ -535,6 +520,18 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
     };
     if (cmd == .subscribe or cmd == .disconnect) return; // handled by the servers
 
+    switch (dev_state.load(.acquire)) {
+        .up => {},
+        .lost => {
+            sendError(c, cmd_type, proto.Err.no_device);
+            return;
+        },
+        .restoring => {
+            log.info("cmd=0x{x:0>2} from fd={} rejected: busy (restoring device state)", .{ cmd_type, client_fd });
+            sendError(c, cmd_type, proto.Err.busy);
+            return;
+        },
+    }
     if (deviceBusy()) {
         log.info("cmd=0x{x:0>2} from fd={} rejected: busy ({s})", .{
             cmd_type, client_fd, @tagName((job_queued orelse job_current).kind),
@@ -631,6 +628,127 @@ fn setDisplayArea(c: Client, cmd_type: u8, a: config.Corners) void {
         c.fd, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8],
     });
     _ = sendRequest(c, cmd_type, .set_ack, core.request_set_display_area_corners(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]));
+}
+
+// ── Device state / hotplug ──────────────────────────────────────────
+//
+// restoring: (re)connected, the USB thread is pushing the display area and
+//            re-applying the stored calibration; device commands get busy.
+// up:        normal operation.
+// lost:      the tracker went away (unplug, power loss, de-authorisation);
+//            device commands get no_device. The main thread fails in-flight
+//            requests and waits for a running job to abort, then acks; the
+//            USB thread then reopens the device every second, re-runs the
+//            handshake and restores area + calibration.
+
+const DevState = enum(u8) { restoring, up, lost };
+var dev_state = std.atomic.Value(DevState).init(.restoring);
+var lost_ack = std.atomic.Value(bool).init(false);
+var opt_keep_device_area = false;
+var opt_restore_calibration = true;
+
+fn setState(st: DevState) void {
+    dev_state.store(st, .release);
+    notifyMain();
+}
+
+/// Main thread: on loss, fail what's in flight, then let the USB thread go.
+fn serviceDeviceState() void {
+    if (dev_state.load(.acquire) != .lost or lost_ack.load(.acquire)) return;
+    var dropped: [MAX_PENDING]PendingEntry = undefined;
+    var n: usize = 0;
+    {
+        pending_mutex.lock();
+        defer pending_mutex.unlock();
+        for (&pending) |*slot| {
+            if (slot.*) |e| {
+                dropped[n] = e;
+                n += 1;
+                slot.* = null;
+            }
+        }
+    }
+    for (dropped[0..n]) |e| sendError(e.client, e.cmd_type, proto.Err.no_device);
+    if (job_queued) |j| {
+        job_queued = null;
+        if (j.blob) |b| gpa.free(b);
+        sendError(j.client, j.cmd_type, proto.Err.no_device);
+    }
+    if (job_running) return; // aborts quickly (tracker.abort); completed by serviceJobs
+    lost_ack.store(true, .release);
+}
+
+/// USB thread: stored calibration → device (startup and every reconnect).
+fn restoreCalibration() void {
+    if (!opt_restore_calibration) {
+        log.info("--no-restore-calibration: not applying stored calibration", .{});
+        return;
+    }
+    var pbuf: [512]u8 = undefined;
+    const path = config.calibrationPath(&pbuf) orelse return;
+    const blob = config.readFile(gpa, path, core.scratch_size() + 1) orelse {
+        log.info("no stored calibration at {s}", .{path});
+        return;
+    };
+    defer gpa.free(blob);
+    if (blob.len == 0 or blob.len > core.scratch_size()) {
+        log.warn("stored calibration {s} has bad size {}, ignoring", .{ path, blob.len });
+        return;
+    }
+    log.info("applying stored calibration {s} ({} bytes); device commands answer busy until done", .{ path, blob.len });
+    const t0 = std.time.milliTimestamp();
+    const ok = tracker.calApply(blob);
+    const dt = std.time.milliTimestamp() - t0;
+    if (ok) {
+        log.info("stored calibration applied in {d} ms", .{dt});
+    } else {
+        log.warn("stored calibration could not be applied ({d} ms); device keeps its current calibration", .{dt});
+    }
+}
+
+/// USB thread: open the tracker, handshake, restore area + calibration.
+/// Returns false if the device could not be brought up (caller retries).
+fn connectDevice() bool {
+    transport = LibusbTransport.open(true) catch return false;
+    setState(.restoring);
+    log.info("tracker found, connecting", .{});
+    tracker = Tracker.init(.{
+        .send_fn = &transportSend,
+        .recv_fn = &transportRecv,
+        .try_recv_fn = &transportTryRecv,
+    }) catch |err| {
+        log.err("handshake failed: {}", .{err});
+        transport.deinit();
+        return false;
+    };
+    tracker.onGaze(onGaze);
+    applyStartupDisplayArea(config.loadDisplayArea(gpa), opt_keep_device_area);
+    // The startup queries install their own capture hook; put ours back.
+    core.set_hooks(onTtpFrame, null, onResponse, null, null);
+    restoreCalibration();
+    if (transport.isLost()) return false;
+    return true;
+}
+
+fn reconnect() void {
+    log.warn("tracker disconnected; waiting for it to come back", .{});
+    tracker.abort.store(true, .release);
+    lost_ack.store(false, .release);
+    setState(.lost);
+    while (!quit and !lost_ack.load(.acquire)) std.Thread.sleep(10_000_000);
+    transport.deinit();
+    const t0 = std.time.milliTimestamp();
+    while (!quit) {
+        std.Thread.sleep(1_000_000_000);
+        if (connectDevice()) {
+            log.info("tracker reconnected after {d} ms", .{std.time.milliTimestamp() - t0});
+            setState(.up);
+            return;
+        }
+        // Not there yet (or lost again mid-restore): back to lost.
+        transport.deinit();
+        dev_state.store(.lost, .release);
+    }
 }
 
 // ── Startup display area ────────────────────────────────────────────
@@ -767,24 +885,47 @@ pub fn main() void {
         });
     }
 
-    transport = LibusbTransport.init() catch |err| {
-        log.err("failed to open USB: {}", .{err});
-        return;
-    };
-    defer transport.deinit();
+    opt_keep_device_area = keep_device_area;
+    opt_restore_calibration = restore_calibration;
 
-    tracker = Tracker.init(.{
-        .send_fn = &transportSend,
-        .recv_fn = &transportRecv,
-        .try_recv_fn = &transportTryRecv,
-    }) catch |err| {
-        log.err("failed to connect: {}", .{err});
-        return;
-    };
+    // Connect now if the tracker is there; otherwise start anyway and let
+    // the USB thread wait for it (hotplug).
+    var start_connected = false;
+    if (LibusbTransport.open(false)) |t| {
+        transport = t;
+        if (Tracker.init(.{
+            .send_fn = &transportSend,
+            .recv_fn = &transportRecv,
+            .try_recv_fn = &transportTryRecv,
+        })) |tr| {
+            tracker = tr;
+            start_connected = true;
+        } else |err| {
+            log.err("failed to connect: {}; will retry", .{err});
+            transport.deinit();
+        }
+    } else |err| {
+        log.warn("tracker not available ({}); waiting for it", .{err});
+    }
+    if (!start_connected) {
+        transport = .{ .usb_ctx = null, .usb_handle = null };
+        transport.lost.store(true, .monotonic);
+        tracker = .{
+            .send_fn = &transportSend,
+            .recv_fn = &transportRecv,
+            .try_recv_fn = &transportTryRecv,
+            .connected = false,
+            .gaze_cb = null,
+            .display = .{},
+        };
+    }
+    defer transport.deinit();
     defer tracker.deinit();
 
-    applyStartupDisplayArea(cfg_area, keep_device_area);
-    tracker.onGaze(onGaze);
+    if (start_connected) {
+        applyStartupDisplayArea(cfg_area, keep_device_area);
+        tracker.onGaze(onGaze);
+    }
 
     // Install hooks for command forwarding (after the synchronous startup
     // queries, which use their own capture hook).
@@ -820,8 +961,6 @@ pub fn main() void {
         return;
     };
 
-    if (restore_calibration) queueStartupCalibration() else log.info("--no-restore-calibration: not applying stored calibration", .{});
-
     log.info("running", .{});
 
     while (!quit) {
@@ -830,6 +969,7 @@ pub fn main() void {
         drainGaze();
         drainResponses();
         serviceJobs();
+        serviceDeviceState();
         sweepPending();
         server.acceptClients();
         server.readCommands();
@@ -911,7 +1051,17 @@ fn parseIpv4(s: []const u8) ?u32 {
 
 fn usbThreadFn() void {
     log.info("USB thread started", .{});
+    if (transport.isLost()) {
+        reconnect(); // started without the tracker
+    } else {
+        restoreCalibration();
+        setState(.up);
+    }
     while (!quit) {
+        if (transport.isLost()) {
+            reconnect();
+            continue;
+        }
         // While a calibration job owns the transport poll() returns at once;
         // don't spin.
         if (tracker.cal_pending.load(.acquire)) {

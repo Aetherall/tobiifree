@@ -155,7 +155,7 @@ Error codes (`daemon_protocol.Err`): 0x01 failed, 0x02 too large for the
 transport (WS frames are capped at ~8 KB, so no blobs over WS), 0x03 busy
 (calibration job running), 0x04 device timeout (5 s), 0x05 bad payload,
 0x06 unknown command, 0x07 USB send failed, 0x08 disconnected (client-side,
-SocketSource). Any other value is the device's non-zero TTP status, passed
+SocketSource), 0x09 no device (tracker unplugged; the daemon reconnects). Any other value is the device's non-zero TTP status, passed
 through.
 
 ### Calibration stimulus (op 0x460)
@@ -174,14 +174,15 @@ The daemon owns the USB device and its Tracker. It:
 1. Opens USB, runs the TTP handshake (hello → realm → display area → subscribe)
 2. Pushes the configured display area (see Persistence)
 3. Listens on Unix socket + optionally WebSocket (`--ws`)
-4. Re-applies the stored calibration, if any, on the job thread
+4. Re-applies the stored calibration, if any
 5. Accepts client connections, forwards their commands over TTP and routes
    the replies back
 6. Broadcasts gaze samples to subscribed clients
 
-Threads: the USB thread only feeds the core and queues gaze samples /
-responses; the main thread does all client I/O, request building and
-persistence; a job thread runs the calibration state machines.
+Threads: the USB thread feeds the core and queues gaze samples / responses,
+and does (re)connection and the area + calibration restore; the main thread
+does all client I/O, request building and persistence; a job thread runs the
+client-requested calibration state machines.
 
 ### Persistence
 
@@ -197,13 +198,22 @@ persistence; a job thread runs the calibration state machines.
   `--keep-device-area` restores the old rule (only push when the device looks
   reset). Without a config area, the built-in default is pushed only when the
   device looks reset.
+- **Hotplug** — when the tracker goes away (libusb NO_DEVICE / IO error) the
+  daemon keeps running: in-flight requests and new device commands get `err`
+  0x09, it looks for the tracker every second, and when it is back it redoes
+  the handshake, pushes the config's display area and re-applies the stored
+  calibration (commands get busy meanwhile), then gaze resumes for the
+  still-connected clients. A power-cycled ET5 forgets both its display area
+  and its calibration, so this restores it. The daemon also starts without a
+  tracker and waits for it.
 - **Calibration** — a successful `finish_calibration` saves the blob to
   `$XDG_STATE_HOME/tobiifree/calibration.bin` (default
-  `~/.local/state/tobiifree/calibration.bin`). At startup, if the file exists,
-  it is `cal_apply`'d on the job thread after the sockets are up: clients can
-  connect immediately, gaze starts when the apply ends (success, failure, or
-  the 120 s state-machine timeout), and device commands sent meanwhile get
-  `err` busy (0x03). Timing and result are logged.
+  `~/.local/state/tobiifree/calibration.bin`). At startup and after every
+  reconnect, if the file exists, it is `cal_apply`'d (by the USB thread) after
+  the sockets are up: clients can connect immediately, gaze starts when the
+  apply ends (~0.3 s for a 272 KB ET5 blob; on failure or after the 120 s
+  state-machine timeout the device keeps its current calibration), and device
+  commands sent meanwhile get `err` busy (0x03). Timing and result are logged.
   `--no-restore-calibration` skips it. Note the file is only written by
   tobiifreed's `finish_calibration`; a calibration made another way is
   overwritten at the next daemon start while the file exists.

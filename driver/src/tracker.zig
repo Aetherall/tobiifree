@@ -38,6 +38,9 @@ pub const Tracker = struct {
     /// before even attempting the idle->busy CAS, so the USB thread stops
     /// re-claiming ownership;
     cal_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by the owner when the transport is gone (unplug): running state
+    /// machines and waits return failure at once instead of timing out.
+    abort: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
@@ -374,6 +377,10 @@ pub const Tracker = struct {
         var steps: u32 = 0;
         const start_ms = std.time.milliTimestamp();
         while (std.time.milliTimestamp() - start_ms < timeout_ms) : (steps += 1) {
+            if (self.abort.load(.acquire)) {
+                log.err("{s} aborted at step {d} (transport lost)", .{ label, steps });
+                return false;
+            }
             const action: core.HandshakeAction = @enumFromInt(poll_fn());
             switch (action) {
                 .send => {
@@ -407,6 +414,7 @@ pub const Tracker = struct {
     }
 
     fn drainReads(self: *Tracker, max: u32) void {
+        if (self.abort.load(.acquire)) return;
         var buf: [16384]u8 = undefined;
         // First read: blocking (wait for device response).
         if (self.recv_fn(&buf)) |n| {
