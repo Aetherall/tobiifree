@@ -24,7 +24,9 @@
         version = "0.1.0";
         src = ./.;
 
-        nativeBuildInputs = [pkgs.zig pkgs.pkg-config] ++ nativeBuildInputs;
+        # The sources target Zig 0.15; a flake that makes this one follow its
+        # nixpkgs may have a newer default zig.
+        nativeBuildInputs = [pkgs.zig_0_15 pkgs.pkg-config] ++ nativeBuildInputs;
         inherit buildInputs;
 
         dontConfigure = true;
