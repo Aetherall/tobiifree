@@ -48,8 +48,9 @@ const usage =
     \\  --output NAME   output (connector) the tracker is mounted on, e.g. DP-1.
     \\                  Default: "output" in ~/.config/tobii.json, else the
     \\                  focused output (Hyprland), else the first one.
-    \\  --gap MM        tracker origin -> bottom edge of the screen's active
-    \\                  area, mm (default 10)
+    \\  --gap MM        screen's bottom edge (first lit row) -> tracker camera
+    \\                  centre, mm. Default: "gap_mm" in ~/.config/tobii.json,
+    \\                  else 10. Saved there when step 1 is confirmed.
     \\  --step STEP     run one step only: display | calibrate | validate
     \\                  (calibrate includes the position guide)
     \\  -h, --help      this help
@@ -61,7 +62,9 @@ const usage =
 const Only = enum { all, display, calibrate, validate };
 
 var opt_output: ?[]const u8 = null;
-var opt_gap: f64 = geo.DEFAULT_GAP_MM;
+var opt_gap: ?f64 = null; // --gap
+/// Gap in use: --gap, else "gap_mm" of tobii.json, else the default.
+var gap_mm: f64 = geo.DEFAULT_GAP_MM;
 var opt_only: Only = .all;
 
 // ─── Gaze-contingent dots (tune here) ───────────────────────────────
@@ -227,7 +230,7 @@ fn moveMark(i: usize, col: i32) void {
 }
 
 fn currentArea() ?geo.Area {
-    return geo.areaFromMarkers(marks[0], marks[1], width_px, height_px, opt_gap);
+    return geo.areaFromMarkers(marks[0], marks[1], width_px, height_px, gap_mm);
 }
 
 fn confirmDisplay() void {
@@ -238,7 +241,7 @@ fn confirmDisplay() void {
     };
     // Write the output first: the daemon rewrites tobii.json on the set and
     // keeps our key.
-    config.saveOutput(gpa, mon_name) catch |err| log.warn("could not save output to tobii.json: {}", .{err});
+    config.saveSetup(gpa, mon_name, gap_mm) catch |err| log.warn("could not save output/gap to tobii.json: {}", .{err});
     src.setDisplayAreaCorners(a.corners, onAreaSet, null) catch |err| {
         setMsg(true, "Sending the display area failed: {}", .{err});
         return;
@@ -316,9 +319,10 @@ fn drawDisplay(cr: *c.cairo_t, w: f64, h: f64) void {
     if (currentArea()) |a| {
         y += text(cr, w / 2, y, 24, .center, FG, "{d:.0} px between the lines  →  {d:.4} mm/px  →  screen {d:.1} × {d:.1} mm", .{ a.d_px, a.mm_per_px, a.w_mm, a.h_mm });
         const off = a.xc_px - @as(f64, @floatFromInt(width_px)) / 2;
-        y += text(cr, w / 2, y, 20, .center, DIM, "tracker centre at x = {d:.1} px ({d:.1} mm {s} the screen centre) · gap {d:.1} mm (--gap)", .{
-            a.xc_px, @abs(off * a.mm_per_px), if (off < 0) "left of" else "right of", opt_gap,
+        y += text(cr, w / 2, y, 20, .center, DIM, "tracker centre at x = {d:.1} px ({d:.1} mm {s} the screen centre) · gap {d:.1} mm", .{
+            a.xc_px, @abs(off * a.mm_per_px), if (off < 0) "left of" else "right of", gap_mm,
         });
+        y += text(cr, w / 2, y, 16, .center, DIM, "gap: measure from the screen's bottom edge (first lit row) to the camera centre, set with --gap", .{});
         if (mon_mm[0] > 0 and mon_mm[1] > 0) {
             const ew: f64 = @floatFromInt(mon_mm[0]);
             const eh: f64 = @floatFromInt(mon_mm[1]);
@@ -1446,6 +1450,7 @@ fn parseArgs() !void {
         } else if (std.mem.eql(u8, a, "--gap")) {
             const v = args.next() orelse return error.MissingValue;
             opt_gap = try std.fmt.parseFloat(f64, v);
+            if (!(opt_gap.? >= 0 and opt_gap.? < 500)) return error.BadGap;
         } else if (std.mem.eql(u8, a, "--step")) {
             const v = args.next() orelse return error.MissingValue;
             opt_only = std.meta.stringToEnum(Only, v) orelse return error.BadStep;
@@ -1462,6 +1467,9 @@ pub fn main() u8 {
         std.debug.print("tobiifree-setup: bad arguments ({})\n\n{s}", .{ err, usage });
         return 2;
     };
+
+    gap_mm = opt_gap orelse config.loadGap(gpa) orelse geo.DEFAULT_GAP_MM;
+    log.info("gap {d:.1} mm ({s})", .{ gap_mm, if (opt_gap != null) "--gap" else if (config.loadGap(gpa) != null) "tobii.json" else "default" });
 
     src = SocketSource.initWithAllocator(gpa) catch |err| {
         std.debug.print("tobiifree-setup: cannot reach tobiifreed ({}). Is the daemon running?\n", .{err});

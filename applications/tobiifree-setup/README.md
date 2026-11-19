@@ -9,7 +9,7 @@ the Zig `SocketSource`.
 just setup                      # or: cd applications/tobiifree-setup && zig build run
 tobiifree-setup --output DP-1   # the output the tracker is mounted on
 tobiifree-setup --step validate # one step only: display | calibrate | validate
-tobiifree-setup --gap 12        # tracker origin -> bottom of the active area, mm (default 10)
+tobiifree-setup --gap 30        # screen's bottom edge (first lit row) -> camera centre, mm
 ```
 
 The window is a layer-shell OVERLAY surface covering the whole output, with
@@ -18,6 +18,11 @@ exclusive keyboard. Output: `--output NAME`, else `"output"` in
 tobiifreed keeps the key when it rewrites the file), else the focused output
 (Hyprland), else the first one. Everything is computed in physical pixels of
 that output (logical size × monitor scale, fractional scales included).
+
+The gap g is the vertical distance from the screen's bottom edge (first lit
+row) to the tracker's camera centre, in mm. Default: `"gap_mm"` in
+`tobii.json`, else 10; `--gap` overrides it. It is saved there (with
+`"output"`) when step 1 is confirmed.
 
 ESC cancels at any time; nothing on the device changes until a step is
 confirmed.
