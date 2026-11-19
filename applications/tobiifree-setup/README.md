@@ -9,7 +9,6 @@ the Zig `SocketSource`.
 just setup                      # or: cd applications/tobiifree-setup && zig build run
 tobiifree-setup --output DP-1   # the output the tracker is mounted on
 tobiifree-setup --step validate # one step only: display | calibrate | validate
-tobiifree-setup --gap 30        # screen's bottom edge (first lit row) -> camera centre, mm
 ```
 
 The window is a layer-shell OVERLAY surface covering the whole output, with
@@ -19,10 +18,14 @@ tobiifreed keeps the key when it rewrites the file), else the focused output
 (Hyprland), else the first one. Everything is computed in physical pixels of
 that output (logical size × monitor scale, fractional scales included).
 
-The gap g is the vertical distance from the screen's bottom edge (first lit
-row) to the tracker's camera centre, in mm. Default: `"gap_mm"` in
-`tobii.json`, else 10; `--gap` overrides it. It is saved there (with
-`"output"`) when step 1 is confirmed.
+The gap g is the y of the screen's bottom edge in the tracker's frame, in mm.
+It is an offset of the ET5's coordinate frame, **not a ruler distance**: the
+frame origin is not the camera centre. On an ET5 under a 24" BenQ, the
+measured 30 mm (bottom lit row to camera centre) validated worse (0.74° and
+0.87° mean, with a 7–9 mm downward bias) than the default 10 mm (0.58° mean,
+2 mm bias). 10 mm is therefore the default. For experiments, `--gap MM`
+or `"gap_mm"` in `tobii.json` override it; it is saved there (with `"output"`)
+when step 1 is confirmed.
 
 ESC cancels at any time; nothing on the device changes until a step is
 confirmed.

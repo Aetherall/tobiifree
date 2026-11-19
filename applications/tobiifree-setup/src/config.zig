@@ -4,7 +4,7 @@
 // set and keeps the other top-level keys). The tool adds two top-level keys,
 // written when step 1 is confirmed and used as defaults of the next run:
 //   "output"  connector name (e.g. "DP-1") of the screen the tracker is on
-//   "gap_mm"  screen's bottom edge (first lit row) -> tracker camera centre, mm
+//   "gap_mm"  y of the screen's bottom edge in the tracker frame, mm (see README)
 
 const std = @import("std");
 

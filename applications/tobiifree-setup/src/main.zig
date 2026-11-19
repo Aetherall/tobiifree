@@ -48,9 +48,10 @@ const usage =
     \\  --output NAME   output (connector) the tracker is mounted on, e.g. DP-1.
     \\                  Default: "output" in ~/.config/tobii.json, else the
     \\                  focused output (Hyprland), else the first one.
-    \\  --gap MM        screen's bottom edge (first lit row) -> tracker camera
-    \\                  centre, mm. Default: "gap_mm" in ~/.config/tobii.json,
-    \\                  else 10. Saved there when step 1 is confirmed.
+    \\  --gap MM        (experiments) vertical offset of the screen's bottom edge
+    \\                  in the tracker frame, mm. Default: "gap_mm" in
+    \\                  ~/.config/tobii.json, else 10 (measured best on an ET5).
+    \\                  Saved there when step 1 is confirmed.
     \\  --step STEP     run one step only: display | calibrate | validate
     \\                  (calibrate includes the position guide)
     \\  -h, --help      this help
@@ -319,10 +320,9 @@ fn drawDisplay(cr: *c.cairo_t, w: f64, h: f64) void {
     if (currentArea()) |a| {
         y += text(cr, w / 2, y, 24, .center, FG, "{d:.0} px between the lines  →  {d:.4} mm/px  →  screen {d:.1} × {d:.1} mm", .{ a.d_px, a.mm_per_px, a.w_mm, a.h_mm });
         const off = a.xc_px - @as(f64, @floatFromInt(width_px)) / 2;
-        y += text(cr, w / 2, y, 20, .center, DIM, "tracker centre at x = {d:.1} px ({d:.1} mm {s} the screen centre) · gap {d:.1} mm", .{
-            a.xc_px, @abs(off * a.mm_per_px), if (off < 0) "left of" else "right of", gap_mm,
+        y += text(cr, w / 2, y, 20, .center, DIM, "tracker centre at x = {d:.1} px ({d:.1} mm {s} the screen centre)", .{
+            a.xc_px, @abs(off * a.mm_per_px), if (off < 0) "left of" else "right of",
         });
-        y += text(cr, w / 2, y, 16, .center, DIM, "gap: measure from the screen's bottom edge (first lit row) to the camera centre, set with --gap", .{});
         if (mon_mm[0] > 0 and mon_mm[1] > 0) {
             const ew: f64 = @floatFromInt(mon_mm[0]);
             const eh: f64 = @floatFromInt(mon_mm[1]);
@@ -340,7 +340,7 @@ fn drawDisplay(cr: *c.cairo_t, w: f64, h: f64) void {
         y += 8 * ui;
         y += text(cr, w / 2, y, 18, .center, DIM, "current device area: {d:.1} × {d:.1} mm, TL ({d:.1}, {d:.1}) BL ({d:.1}, {d:.1})", .{ s[0], s[1], a[0], a[1], a[6], a[7] });
     }
-    y += text(cr, w / 2, y, 18, .center, DIM, "output {s} · {d}×{d} px · scale {d:.2}", .{ mon_name, width_px, height_px, mon_scale });
+    y += text(cr, w / 2, y, 18, .center, DIM, "output {s} · {d}×{d} px · scale {d:.2} · gap {d:.0} mm", .{ mon_name, width_px, height_px, mon_scale, gap_mm });
     drawMsg(cr, w, y + 16 * ui);
 
     // The two lines: 1 physical px wide, bottom 30 % of the screen.

@@ -11,7 +11,8 @@
 //   W  = width_px * p,  H = height_px * p
 //   xc = centre of the two lines (px)     tracker centre on screen
 //   TL = (-xc*p, g+H, 0)  TR = ((width_px-xc)*p, g+H, 0)  BL = (-xc*p, g, 0)
-// g: tracker origin -> bottom edge of the active area (bezel), default 10 mm.
+// g: y of the screen's bottom edge in the tracker frame (mm). Not a ruler
+// distance to the camera: 10 mm validated best on an ET5 (see the README).
 
 const std = @import("std");
 
