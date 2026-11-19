@@ -112,6 +112,10 @@ build-setup:
 tobiifreed *ARGS:
     cd applications/tobiifreed && zig build run -- {{ARGS}}
 
+# Correction-map integration test (no tracker; isolated dirs)
+test-correction:
+    cd applications/tobiifreed && zig build && python3 tests/correction_test.py zig-out/bin/tobiifreed
+
 # Build the daemon binary
 build-tobiifreed:
     cd applications/tobiifreed && zig build -Doptimize=ReleaseSafe

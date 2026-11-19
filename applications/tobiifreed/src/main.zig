@@ -10,6 +10,9 @@
 //   tobiifreed --keep-device-area        # don't push the config's display area at startup
 //   tobiifreed --no-restore-calibration  # don't cal_apply the stored calibration at startup
 //   tobiifreed --init-config             # create default config file
+//   tobiifreed --no-device               # testing: never open the tracker (daemon-side commands only)
+//   tobiifreed --no-device --fake-gaze X,Y  # testing: + 30 Hz synthetic samples at (X, Y), and the
+//                                        #   stored calibration counts as applied
 //
 // Threads:
 //   USB thread  — tracker.poll(): feeds USB data to the core, which calls
@@ -662,7 +665,7 @@ fn deleteCorrection(reason: []const u8) void {
     updateCorrectionActive();
 }
 
-/// SHA-256 of the stored calibration blob, or null.
+/// SHA-256 of the stored calibration blob, or null (any thread).
 fn storedCalibrationSha() ?[64]u8 {
     var pbuf: [512]u8 = undefined;
     const path = config.calibrationPath(&pbuf) orelse return null;
@@ -912,6 +915,10 @@ var dev_state = std.atomic.Value(DevState).init(.restoring);
 var lost_ack = std.atomic.Value(bool).init(false);
 var opt_keep_device_area = false;
 var opt_restore_calibration = true;
+/// --no-device: never touch USB (tests of the daemon-side commands).
+var opt_no_device = false;
+/// --fake-gaze X,Y (with --no-device): synthetic gaze for tests.
+var opt_fake_gaze: ?[2]f64 = null;
 
 fn setState(st: DevState) void {
     dev_state.store(st, .release);
@@ -1103,7 +1110,7 @@ fn onTtpFrame(magic: u32, seq: u32, op: u32, payload_ptr: [*]const u8, payload_l
 
 fn usage() void {
     std.debug.print(
-        \\usage: tobiifreed [--ws [addr:]port] [--keep-device-area] [--no-restore-calibration] [--init-config]
+        \\usage: tobiifreed [--ws [addr:]port] [--keep-device-area] [--no-restore-calibration] [--init-config] [--no-device]
         \\
     , .{});
 }
@@ -1136,6 +1143,20 @@ pub fn main() void {
             keep_device_area = true;
         } else if (std.mem.eql(u8, arg, "--no-restore-calibration")) {
             restore_calibration = false;
+        } else if (std.mem.eql(u8, arg, "--no-device")) {
+            opt_no_device = true;
+        } else if (std.mem.eql(u8, arg, "--fake-gaze")) {
+            const v = args.next() orelse "";
+            var it = std.mem.splitScalar(u8, v, ',');
+            const x = std.fmt.parseFloat(f64, it.next() orelse "") catch {
+                usage();
+                return;
+            };
+            const y = std.fmt.parseFloat(f64, it.next() orelse "") catch {
+                usage();
+                return;
+            };
+            opt_fake_gaze = .{ x, y };
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             usage();
             return;
@@ -1160,7 +1181,9 @@ pub fn main() void {
     // Connect now if the tracker is there; otherwise start anyway and let
     // the USB thread wait for it (hotplug).
     var start_connected = false;
-    if (LibusbTransport.open(false)) |t| {
+    if (opt_no_device) {
+        log.warn("--no-device: not opening the tracker (testing mode)", .{});
+    } else if (LibusbTransport.open(false)) |t| {
         transport = t;
         if (Tracker.init(.{
             .send_fn = &transportSend,
@@ -1322,6 +1345,28 @@ fn parseIpv4(s: []const u8) ?u32 {
 
 fn usbThreadFn() void {
     log.info("USB thread started", .{});
+    if (opt_no_device) {
+        dev_state.store(.lost, .release);
+        if (opt_fake_gaze) |g| {
+            // Pretend the stored calibration is on the device.
+            if (storedCalibrationSha()) |sha| setAppliedSha(sha);
+            var sample = std.mem.zeroes(core.GazeSample);
+            sample.present_mask = core.GAZE_BIT_GAZE_2D | core.GAZE_BIT_GAZE_2D_L | core.GAZE_BIT_GAZE_2D_R | core.GAZE_BIT_GAZE_2D_UNFILTERED;
+            sample.gaze_point_2d_norm = g;
+            sample.gaze_point_2d_L_norm = g;
+            sample.gaze_point_2d_R_norm = g;
+            sample.gaze_point_2d_unfiltered = g;
+            sample.eye_origin_L_mm = .{ -30, 0, 700 };
+            sample.eye_origin_R_mm = .{ 30, 0, 700 };
+            while (!quit) {
+                sample.frame_counter +%= 1;
+                onGaze(&sample);
+                std.Thread.sleep(33_000_000);
+            }
+        }
+        while (!quit) std.Thread.sleep(50_000_000);
+        return;
+    }
     if (transport.isLost()) {
         reconnect(); // started without the tracker
     } else {
