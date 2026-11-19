@@ -10,6 +10,7 @@ current fixation. Hyprland only for now (IPC socket).
 tobiifree-warp                 # server (same as `tobiifree-warp serve`)
 tobiifree-warp jump            # move the cursor to the gaze
 tobiifree-warp jump --dry-run  # print the target, don't move
+tobiifree-warp follow-start / follow-stop   # cursor follows the gaze while a key is held
 ```
 
 Hyprland binding (hyprland.lua):
@@ -20,6 +21,61 @@ hl.bind("SUPER + G", hl.dsp.exec_cmd("tobiifree-warp jump"))
 
 (or `bind = SUPER, G, exec, tobiifree-warp jump` with a hyprlang config).
 `kill -USR1 <server pid>` triggers a jump too.
+
+## Follow mode (hold a key)
+
+```shell
+tobiifree-warp follow-start   # key press: the cursor follows the gaze...
+tobiifree-warp follow-stop    # key release: ...and stays where it is
+```
+
+Hyprland binds (hyprland.lua). The release bind ignores modifiers, so it
+fires whether SUPER or G is released first; the flag keeps ordinary `g`
+key releases from spawning anything:
+
+```lua
+local gazeFollowing = false
+hl.bind("SUPER + G", function()
+	gazeFollowing = true
+	hl.exec_cmd("tobiifree-warp follow-start")
+end)
+hl.bind("G", function()
+	if gazeFollowing then
+		gazeFollowing = false
+		hl.exec_cmd("tobiifree-warp follow-stop")
+	end
+end, { release = true, ignore_mods = true, non_consuming = true })
+```
+
+Safety: follow stops by itself after `--follow-timeout-ms` (10 s; a missed
+release), when tobiifreed goes away, or when a move fails. A new
+`follow-start` replaces a running follow.
+
+Filter (src/follow.zig), fixation-aware rather than a generic low-pass:
+
+- a valid sample within `--radius-deg` (1.5°) of the current fixation
+  joins it; the target is the median of the fixation's last `--fix-window`
+  (12) samples, and it only moves once that median has drifted more than
+  `--deadband-deg` (0.4°) from it: the cursor sits still during a fixation
+  (live: 0–3 small corrections per 3 s hold) yet follows slow drift;
+- a sample outside starts a candidate fixation, adopted once `--confirm`
+  (2) consecutive samples agree: a saccade lands one sample (~30 ms) after
+  the eye does, an isolated spike is ignored;
+- invalid samples (blinks, eyes lost) are not fed: the cursor holds;
+- the cursor eases toward the target at ~120 Hz with time constants
+  `--fix-tau-ms` (80) within a fixation, `--saccade-tau-ms` (0: land at
+  once) on a new fixation and `--first-tau-ms` (60) for the first move.
+
+A One-Euro filter was the alternative; at 33 Hz with saccades lasting 1–2
+samples its speed estimate cannot both kill fixation jitter and not lag a
+saccade, and "sit still, then jump" is what this mode is for.
+
+At follow start the monitor layout is read once and the current fixation
+(if any) seeds the filter, so the cursor sets off at once. The stop reply
+and the log give a summary: fixations, corrections, moves, time to the
+first move, Hyprland move cost (live: 0.56 ms avg, 2.2 ms max per move; the
+socket is one request per connection on Hyprland's side, so it cannot be
+kept open).
 
 ## How a jump is decided
 
@@ -96,7 +152,9 @@ nix build .#tobiifree-warp
 cd applications/tobiifree-warp && zig build test   # in `nix develop`
 ```
 
-Tests cover the sample selection (window, stale data, saccade rejection,
+Tests cover the follow filter (noisy fixation stays put and converges,
+deadband, saccade lands after one confirming sample, spike ignored, drift
+followed), the easing, the follow session timeout, the sample selection (window, stale data, saccade rejection,
 landing after a saccade, degrees vs viewing distance, median, ring wrap),
 gaze extraction (eye validity fallbacks), the norm→global mapping (the
 DP-1 / eDP-1 scale 2 / DP-2 portrait layout, fractional scales, clamping) and

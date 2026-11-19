@@ -3,6 +3,9 @@
 //
 //   tobiifree-warp [serve] [options]   long-running server
 //   tobiifree-warp jump [--dry-run]    poke the server (bind this to a key)
+//   tobiifree-warp follow-start [--dry-run] / follow-stop
+//                                      cursor follows the gaze while a key
+//                                      is held (follow.zig)
 //
 // The server is a gaze client of tobiifreed (corrected gaze, as every
 // client gets it by default), keeps the last samples in a ring and listens
@@ -22,6 +25,7 @@ const SocketSource = @import("socket_source").SocketSource;
 const select = @import("select.zig");
 const layout = @import("layout.zig");
 const gaze = @import("gaze.zig");
+const follow = @import("follow.zig");
 const Backend = @import("backend.zig").Backend;
 const Hyprland = @import("backend.zig").Hyprland;
 
@@ -62,7 +66,7 @@ fn unixAddr(path: []const u8) !posix.sockaddr.un {
 
 /// Exit status is 0 for every no-op: a key binding has nothing to do with
 /// an error, and the person travels without the tracker.
-fn jumpClient(dry: bool) u8 {
+fn client(verb: []const u8, dry: bool) u8 {
     const t0 = nowNs();
     var path_buf: [512]u8 = undefined;
     const path = controlPath(&path_buf) catch return 0;
@@ -77,7 +81,7 @@ fn jumpClient(dry: bool) u8 {
     const tv = posix.timeval{ .sec = 1, .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     var req: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&req, "jump {d}{s}\n", .{ t0, if (dry) " dry" else "" }) catch return 0;
+    const line = std.fmt.bufPrint(&req, "{s} {d}{s}\n", .{ verb, t0, if (dry) " dry" else "" }) catch return 0;
     _ = posix.write(fd, line) catch return 0;
     var buf: [256]u8 = undefined;
     var n: usize = 0;
@@ -103,6 +107,10 @@ const Opts = struct {
     params: select.Params = .{},
     /// How long a jump may wait for a fixation when the eye is moving.
     settle_ms: f64 = 200,
+    filter: follow.FilterParams = .{},
+    ease: follow.EaseParams = .{},
+    /// Follow stops by itself after this long (missed key release).
+    follow_timeout_ms: i64 = 10_000,
 };
 
 /// tobii.json: "output" (the screen the tracker is on) and the display area
@@ -150,6 +158,23 @@ const Jump = struct {
     t_start: i64,
     t_recv: i64,
     dry: bool,
+    verb: []const u8 = "jump",
+};
+
+const Follow = struct {
+    /// Owns the monitor names.
+    mons: layout.Parsed,
+    mon: layout.Monitor,
+    filter: follow.Filter,
+    easer: follow.Easer,
+    session: follow.Session,
+    last_step: i64,
+    last_sent: [2]f64,
+    fixations: usize = 0,
+    /// Target refinements within fixations (beyond the deadband).
+    updates: usize = 0,
+    /// Next new fixation is the first: ease it in.
+    first: bool = true,
 };
 
 const Server = struct {
@@ -166,6 +191,7 @@ const Server = struct {
     samples_flowing: bool = false,
     corrected: ?bool = null,
     pending: ?Jump = null,
+    follow: ?Follow = null,
     listen_fd: posix.fd_t,
     sig_fd: posix.fd_t,
     path: [:0]const u8,
@@ -184,12 +210,20 @@ const Server = struct {
             self.samples_flowing = true;
             log.info("gaze samples flowing", .{});
         }
+        // Per sample the bit is off where the map has no data (outside its
+        // grid), so only say whether any sample of the connection was.
         const c = s.present_mask & core.GAZE_BIT_CORRECTED != 0;
-        if (self.corrected == null or self.corrected.? != c) {
+        if (self.corrected == null) {
             self.corrected = c;
-            log.info("gaze {s}", .{if (c) "corrected by the daemon's correction map" else "not corrected (no active correction map in the daemon)"});
+            log.info("gaze {s}", .{if (c) "corrected by the daemon's correction map" else "not corrected (yet; no active correction map in the daemon?)"});
+        } else if (c and !self.corrected.?) {
+            self.corrected = true;
+            log.info("gaze corrected by the daemon's correction map", .{});
         }
-        if (gaze.toSample(s, t)) |g| self.ring.push(g);
+        if (gaze.toSample(s, t)) |g| {
+            self.ring.push(g);
+            if (self.follow != null) self.followSample(g);
+        }
     }
 
     fn connect(self: *Server, now: i64) void {
@@ -216,6 +250,7 @@ const Server = struct {
         self.samples_flowing = false;
         self.next_retry = now + self.retry_ms * std.time.ns_per_ms;
         log.info("tobiifreed connection lost, reconnecting", .{});
+        self.stopFollow(.daemon_lost, null);
     }
 
     fn run(self: *Server) !void {
@@ -233,6 +268,10 @@ const Server = struct {
             if (self.pending) |p| {
                 const deadline = p.t_recv + @as(i64, @intFromFloat(self.opts.settle_ms * 1e6));
                 timeout_ms = minTimeout(timeout_ms, @max(0, @divFloor(deadline - now, std.time.ns_per_ms) + 1));
+            }
+            if (self.follow) |f| {
+                timeout_ms = minTimeout(timeout_ms, @max(0, @divFloor(f.session.deadline() - now, std.time.ns_per_ms) + 1));
+                if (!f.easer.done()) timeout_ms = minTimeout(timeout_ms, self.opts.ease.tick_ms);
             }
 
             var fds: [3]posix.pollfd = .{
@@ -267,6 +306,9 @@ const Server = struct {
             }
             if (fds[1].revents & posix.POLL.IN != 0) self.accept();
             if (self.pending != null) self.evaluate();
+            if (self.follow) |f| {
+                if (f.session.expired(nowNs())) self.stopFollow(.timeout, null) else self.followStep(null);
+            }
         }
     }
 
@@ -290,18 +332,24 @@ const Server = struct {
         }
         var it = std.mem.tokenizeAny(u8, buf[0..n], " \n");
         const verb = it.next() orelse "";
-        if (!std.mem.eql(u8, verb, "jump")) {
-            reply(fd, "error unknown request\n");
-            posix.close(fd);
-            return;
-        }
         var j = Jump{ .fd = fd, .t_start = t_recv, .t_recv = t_recv, .dry = self.opts.dry_run };
         while (it.next()) |tok| {
             if (std.mem.eql(u8, tok, "dry")) j.dry = true else if (std.fmt.parseInt(i64, tok, 10)) |t| {
                 if (t <= t_recv and t_recv - t < 10 * std.time.ns_per_s) j.t_start = t;
             } else |_| {}
         }
-        self.startJump(j);
+        if (std.mem.eql(u8, verb, "jump")) {
+            self.startJump(j);
+        } else if (std.mem.eql(u8, verb, "follow-start")) {
+            j.verb = "follow-start";
+            self.startFollow(j);
+        } else if (std.mem.eql(u8, verb, "follow-stop")) {
+            j.verb = "follow-stop";
+            if (self.follow == null) self.finish(j, "noop not following") else self.stopFollow(.release, j);
+        } else {
+            reply(fd, "error unknown request\n");
+            posix.close(fd);
+        }
     }
 
     fn startJump(self: *Server, j: Jump) void {
@@ -382,8 +430,132 @@ const Server = struct {
         self.finish(j, msg);
     }
 
+    // ── Follow mode ─────────────────────────────────────────────────
+
+    fn startFollow(self: *Server, j: Jump) void {
+        var msg_buf: [256]u8 = undefined;
+        if (self.follow != null) self.stopFollow(.superseded, null);
+        if (self.src == null) return self.finish(j, "noop tobiifreed not connected");
+        // Monitor geometry once per session.
+        var mons = self.backend.monitors() catch |err| {
+            const msg = std.fmt.bufPrint(&msg_buf, "noop compositor unreachable ({})", .{err}) catch "noop";
+            return self.finish(j, msg);
+        };
+        const mon: layout.Monitor = blk: {
+            if (self.opts.output) |name| {
+                if (layout.find(mons.monitors, name)) |m| break :blk m;
+                mons.deinit();
+                const msg = std.fmt.bufPrint(&msg_buf, "noop output {s} not present", .{name}) catch "noop";
+                return self.finish(j, msg);
+            }
+            if (mons.focused) |f| break :blk mons.monitors[f];
+            mons.deinit();
+            return self.finish(j, "noop no output");
+        };
+        const cur = if (j.dry) layout.mapNorm(mon, 0.5, 0.5) else self.backend.cursorPos() catch layout.mapNorm(mon, 0.5, 0.5);
+        self.follow = .{
+            .mons = mons,
+            .mon = mon,
+            .filter = follow.Filter.init(self.opts.filter, self.opts.params),
+            .easer = follow.Easer.init(cur),
+            .session = .{ .started_ns = j.t_start, .timeout_ms = self.opts.follow_timeout_ms, .dry = j.dry },
+            .last_step = nowNs(),
+            .last_sent = cur,
+        };
+        // Seed from the current fixation, if any: the cursor sets off at once.
+        const f = &self.follow.?;
+        var seeded = false;
+        switch (select.select(&self.ring, nowNs(), self.opts.params)) {
+            .ok => |pick| {
+                const c = f.filter.seed(&[_]select.Sample{.{ .t_ns = nowNs(), .x = pick.x, .y = pick.y }});
+                f.fixations += 1;
+                f.easer.setTarget(layout.mapNorm(mon, c[0], c[1]), self.opts.ease.first_tau_ms);
+                f.first = false;
+                seeded = true;
+            },
+            else => {},
+        }
+        const msg = std.fmt.bufPrint(&msg_buf, "following on {s} from {d:.0},{d:.0}{s}{s}", .{
+            mon.name, cur[0], cur[1], if (seeded) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
+        }) catch "following";
+        self.finish(j, msg);
+        if (seeded) self.followStep(null);
+    }
+
+    /// A valid sample while following.
+    fn followSample(self: *Server, g: select.Sample) void {
+        const f = if (self.follow) |*ff| ff else return;
+        const e = f.filter.update(g);
+        const target = e.target orelse return;
+        const px = layout.mapNorm(f.mon, target[0], target[1]);
+        switch (e.kind) {
+            .new_fixation => {
+                f.fixations += 1;
+                const tau = if (f.first) self.opts.ease.first_tau_ms else self.opts.ease.saccade_tau_ms;
+                f.first = false;
+                f.easer.setTarget(px, tau);
+                if (f.session.dry) log.info("follow: fixation {d} at {d:.0},{d:.0} (gaze {d:.3},{d:.3})", .{ f.fixations, px[0], px[1], target[0], target[1] });
+            },
+            .update => {
+                f.updates += 1;
+                f.easer.setTarget(px, self.opts.ease.fix_tau_ms);
+            },
+            .held => return,
+        }
+        self.followStep(g.t_ns);
+    }
+
+    /// Advance the easing to now and send the cursor if its pixel changed.
+    /// `sample_t`: arrival of the sample that triggered this step (lag stats).
+    fn followStep(self: *Server, sample_t: ?i64) void {
+        const f = if (self.follow) |*ff| ff else return;
+        const now = nowNs();
+        _ = f.easer.step(msSince(f.last_step, now));
+        f.last_step = now;
+        const p = f.easer.pixel();
+        if (p[0] == f.last_sent[0] and p[1] == f.last_sent[1]) return;
+        f.last_sent = p;
+        if (!f.session.dry) {
+            self.backend.moveCursor(p[0], p[1]) catch |err| {
+                log.warn("follow: move failed ({})", .{err});
+                return self.stopFollow(.move_failed, null);
+            };
+        }
+        const done = nowNs();
+        f.session.recordMove(now, done);
+        if (sample_t) |t| {
+            f.session.lag_ns_sum += done - t;
+            f.session.lag_n += 1;
+        }
+    }
+
+    fn stopFollow(self: *Server, why: follow.StopReason, j: ?Jump) void {
+        var f = self.follow orelse return;
+        self.follow = null;
+        defer f.mons.deinit();
+        const now = nowNs();
+        const s = f.session;
+        var buf: [384]u8 = undefined;
+        const first_ms = if (s.first_move_ns) |t| msSince(s.started_ns, t) else -1;
+        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {d} fixations, {d} in-fixation updates, {d} moves{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
+            @tagName(why),
+            msSince(s.started_ns, now) / 1000,
+            f.last_sent[0],
+            f.last_sent[1],
+            f.fixations,
+            f.updates,
+            s.moves,
+            if (s.dry) " (dry run)" else "",
+            first_ms,
+            if (s.moves > 0) @as(f64, @floatFromInt(s.move_ns_sum)) / @as(f64, @floatFromInt(s.moves)) / 1e6 else 0,
+            @as(f64, @floatFromInt(s.move_ns_max)) / 1e6,
+            if (s.lag_n > 0) @as(f64, @floatFromInt(s.lag_ns_sum)) / @as(f64, @floatFromInt(s.lag_n)) / 1e6 else 0,
+        }) catch "stopped";
+        if (j) |jj| self.finish(jj, msg) else log.info("follow: {s}", .{msg});
+    }
+
     fn finish(_: *Server, j: Jump, msg: []const u8) void {
-        log.info("jump: {s}", .{msg});
+        log.info("{s}: {s}", .{ j.verb, msg });
         if (j.fd) |fd| {
             var buf: [600]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "{s}\n", .{msg}) catch "\n";
@@ -395,6 +567,7 @@ const Server = struct {
     fn deinit(self: *Server) void {
         if (self.pending) |p| self.finish(p, "noop server exiting");
         self.pending = null;
+        self.stopFollow(.exiting, null);
         if (self.src) |*s| s.deinit();
         posix.close(self.listen_fd);
         std.fs.cwd().deleteFileZ(self.path) catch {};
@@ -480,6 +653,9 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
     g_server = &srv;
     defer srv.deinit();
 
+    log.info("follow: radius {d:.2} deg, deadband {d:.2} deg, confirm {d}, window {d}, tau fixation {d:.0} / saccade {d:.0} / first {d:.0} ms, timeout {d} ms", .{
+        opts.filter.radius_deg, opts.filter.deadband_deg, opts.filter.confirm, opts.filter.window, opts.ease.fix_tau_ms, opts.ease.saccade_tau_ms, opts.ease.first_tau_ms, opts.follow_timeout_ms,
+    });
     log.info("listening on {s}; output {s}, window {d:.0} ms, max dispersion {d:.2} deg, settle {d:.0} ms, display {d:.0}x{d:.0} mm{s}", .{
         path,
         opts.output orelse "(focused)",
@@ -501,6 +677,8 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
 const usage =
     \\usage: tobiifree-warp [serve] [options]   run the server (default)
     \\       tobiifree-warp jump [--dry-run]    move the cursor to the gaze (bind to a key)
+    \\       tobiifree-warp follow-start [--dry-run]   cursor follows the gaze (key press)
+    \\       tobiifree-warp follow-stop                ...until this (key release)
     \\
     \\server options:
     \\  --output NAME             output the tracker is on (default: tobii.json "output")
@@ -510,7 +688,33 @@ const usage =
     \\  --settle-ms MS            how long a jump may wait for the eye to settle (200)
     \\  --dry-run                 log the target, never move the cursor
     \\
+    \\follow mode (cursor follows the gaze between follow-start and follow-stop):
+    \\  --radius-deg DEG          a sample this close to the fixation joins it (1.5)
+    \\  --deadband-deg DEG        within a fixation, move only when the median drifts this far (0.4)
+    \\  --confirm N               samples that must agree to start a new fixation (2)
+    \\  --fix-window N            fixation target = median of its last N samples (12)
+    \\  --fix-tau-ms MS           easing time constant within a fixation (80)
+    \\  --saccade-tau-ms MS       easing to a new fixation, 0 = jump (0)
+    \\  --first-tau-ms MS         easing of the first move (60)
+    \\  --follow-timeout-ms MS    stop by itself after this long, missed release (10000)
+    \\
 ;
+
+fn parseF0(args: *std.process.ArgIterator, name: []const u8) ?f64 {
+    const v = args.next() orelse {
+        std.debug.print("{s} needs a value\n", .{name});
+        return null;
+    };
+    const f = std.fmt.parseFloat(f64, v) catch {
+        std.debug.print("{s}: bad number '{s}'\n", .{ name, v });
+        return null;
+    };
+    if (!(f >= 0)) {
+        std.debug.print("{s}: must be >= 0\n", .{name});
+        return null;
+    }
+    return f;
+}
 
 fn parseF(args: *std.process.ArgIterator, name: []const u8) ?f64 {
     const v = args.next() orelse {
@@ -532,12 +736,16 @@ pub fn main() u8 {
     var args = std.process.args();
     _ = args.next();
     var opts = Opts{};
-    var mode: enum { serve, jump } = .serve;
+    var mode: enum { serve, jump, follow_start, follow_stop } = .serve;
     var first = true;
     while (args.next()) |a| {
         defer first = false;
         if (first and std.mem.eql(u8, a, "jump")) {
             mode = .jump;
+        } else if (first and std.mem.eql(u8, a, "follow-start")) {
+            mode = .follow_start;
+        } else if (first and std.mem.eql(u8, a, "follow-stop")) {
+            mode = .follow_stop;
         } else if (first and std.mem.eql(u8, a, "serve")) {
             mode = .serve;
         } else if (std.mem.eql(u8, a, "--dry-run")) {
@@ -555,6 +763,22 @@ pub fn main() u8 {
             opts.params.stale_ms = parseF(&args, a) orelse return 2;
         } else if (std.mem.eql(u8, a, "--settle-ms") and mode == .serve) {
             opts.settle_ms = parseF(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--radius-deg") and mode == .serve) {
+            opts.filter.radius_deg = parseF(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--deadband-deg") and mode == .serve) {
+            opts.filter.deadband_deg = parseF0(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--confirm") and mode == .serve) {
+            opts.filter.confirm = @intFromFloat(@max(1, @min(8, parseF(&args, a) orelse return 2)));
+        } else if (std.mem.eql(u8, a, "--fix-window") and mode == .serve) {
+            opts.filter.window = @intFromFloat(@max(1, @min(64, parseF(&args, a) orelse return 2)));
+        } else if (std.mem.eql(u8, a, "--fix-tau-ms") and mode == .serve) {
+            opts.ease.fix_tau_ms = parseF0(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--saccade-tau-ms") and mode == .serve) {
+            opts.ease.saccade_tau_ms = parseF0(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--first-tau-ms") and mode == .serve) {
+            opts.ease.first_tau_ms = parseF0(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--follow-timeout-ms") and mode == .serve) {
+            opts.follow_timeout_ms = @intFromFloat(@min(3600e3, parseF(&args, a) orelse return 2));
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             std.fs.File.stdout().writeAll(usage) catch {};
             return 0;
@@ -564,7 +788,9 @@ pub fn main() u8 {
         }
     }
     return switch (mode) {
-        .jump => jumpClient(opts.dry_run),
+        .jump => client("jump", opts.dry_run),
+        .follow_start => client("follow-start", opts.dry_run),
+        .follow_stop => client("follow-stop", false),
         .serve => serve(std.heap.page_allocator, opts),
     };
 }
@@ -573,4 +799,5 @@ test {
     _ = select;
     _ = layout;
     _ = gaze;
+    _ = follow;
 }
