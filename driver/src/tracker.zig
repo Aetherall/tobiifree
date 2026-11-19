@@ -315,6 +315,14 @@ pub const Tracker = struct {
         return true;
     }
 
+    /// End a calibration session without computing/applying it (CALIBRATE_STOP).
+    /// The calibration active on the device is left as it was.
+    pub fn cancelCalibration(self: *Tracker) bool {
+        self.beginCalibrating();
+        defer self.endCalibrating();
+        return self.sendAndAwait(core.request_cal_stop, "cal_stop");
+    }
+
     pub fn finishCalibration(self: *Tracker) bool {
         self.beginCalibrating();
         defer self.endCalibrating();
@@ -360,11 +368,17 @@ pub const Tracker = struct {
             log.err("{s}: send failed", .{label});
             return false;
         }
-        self.drainReads(30);
+        // Gaze frames may come first; keep reading until the reply shows up.
+        const start_ms = std.time.milliTimestamp();
+        while (captured_payload == null and std.time.milliTimestamp() - start_ms < 2000) {
+            if (self.abort.load(.acquire)) break;
+            self.drainReads(30);
+        }
         if (captured_payload == null) {
             log.warn("{s}: no response", .{label});
             return false;
         }
+        if (captured_status != 0) log.debug("{s}: status 0x{x}", .{ label, captured_status });
         log.debug("{s}: ok ({} bytes)", .{ label, captured_payload.?.len });
         return true;
     }

@@ -4,6 +4,7 @@
 //   tobiifree-ctl set-area TLx TLy TLz TRx TRy TRz BLx BLy BLz
 //   tobiifree-ctl stimulus
 //   tobiifree-ctl start-calibration
+//   tobiifree-ctl cancel-calibration          # end the session, keep the device calibration
 //   tobiifree-ctl add-point X Y
 //   tobiifree-ctl finish-calibration OUT.bin   # replaces the device calibration!
 //   tobiifree-ctl apply FILE.bin               # replaces the device calibration!
@@ -32,6 +33,7 @@ fn usage() u8 {
         \\       tobiifree-ctl set-area TLx TLy TLz TRx TRy TRz BLx BLy BLz
         \\       tobiifree-ctl stimulus
         \\       tobiifree-ctl start-calibration
+        \\       tobiifree-ctl cancel-calibration
         \\       tobiifree-ctl add-point X Y
         \\       tobiifree-ctl finish-calibration OUT.bin
         \\       tobiifree-ctl apply FILE.bin
@@ -73,6 +75,7 @@ pub fn main() u8 {
         }
         if (std.mem.eql(u8, verb, "stimulus")) break :blk .{ .get_calibration_stimulus, &.{}, 5000 };
         if (std.mem.eql(u8, verb, "start-calibration")) break :blk .{ .start_calibration, &.{}, 30000 };
+        if (std.mem.eql(u8, verb, "cancel-calibration")) break :blk .{ .cancel_calibration, &.{}, 30000 };
         if (std.mem.eql(u8, verb, "add-point")) {
             var p: [2]f64 = undefined;
             parseF64s(rest, &p) catch return usage();
@@ -118,7 +121,9 @@ pub fn main() u8 {
                 return 1;
             };
             out("{d} points\n", .{s.n});
-            for (s.points[0..s.n], 0..) |p, i| out("  [{d}] ({d:.4}, {d:.4})\n", .{ i, p[0], p[1] });
+            for (s.points[0..s.n], 0..) |p, i| out("  [{d}] ({d:.3}, {d:.3})  L status {d:.0} ({d:.4}, {d:.4})  R status {d:.0} ({d:.4}, {d:.4})\n", .{
+                i, p.x, p.y, p.left.status, p.left.a, p.left.b, p.right.status, p.right.a, p.right.b,
+            });
             out("raw ({d} bytes): {x}\n", .{ s.raw.len, s.raw });
         },
         .finish_calibration => {

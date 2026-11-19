@@ -51,10 +51,20 @@ pub const ReplyFn = *const fn (ctx: ?*anyopaque, cmd: proto.Cmd, reply: Reply) v
 
 pub const Corners = [9]f64;
 
+/// One point of the calibration active on the device (get_calibration_stimulus).
+pub const CalPoint = struct {
+    /// Target, normalised display coordinates (0..1, origin top-left).
+    x: f64,
+    y: f64,
+    /// Per eye: status (2 = valid and used, as in Tobii stream engine) and two
+    /// values that look like residuals (meaning not confirmed). NaN if absent.
+    left: Eye,
+    right: Eye,
+    pub const Eye = struct { status: f64, a: f64, b: f64 };
+};
+
 pub const Stimulus = struct {
-    /// Points found in the device reply (normalised display coordinates as
-    /// far as observed — see ARCHITECTURE.md).
-    points: [32][2]f64,
+    points: [32]CalPoint,
     n: u32,
     raw: []const u8,
 };
@@ -175,6 +185,12 @@ pub const SocketSource = struct {
     }
 
     /// Reply: the calibration blob (also saved by the daemon).
+    /// End the calibration session without applying it; the device keeps its
+    /// current calibration.
+    pub fn cancelCalibration(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.cancel_calibration, &.{}, cb, ctx);
+    }
+
     pub fn finishCalibration(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
         try self.request(.finish_calibration, &.{}, cb, ctx);
     }
@@ -205,17 +221,22 @@ pub const SocketSource = struct {
         return proto.decodeDisplayArea(payload[0..proto.DISPLAY_AREA_SIZE]);
     }
 
-    /// get_calibration_stimulus reply: [u32 n][n × (x f64, y f64)][raw TTP payload].
+    /// get_calibration_stimulus reply: [u32 n][n × 8 f64][raw TTP payload],
+    /// records x, y, status_L, a_L, b_L, status_R, a_R, b_R.
     pub fn decodeStimulus(payload: []const u8) ?Stimulus {
         if (payload.len < 4) return null;
         const n = std.mem.readInt(u32, payload[0..4], .little);
-        if (n > 32 or payload.len < 4 + n * 16) return null;
-        var s = Stimulus{ .points = undefined, .n = n, .raw = payload[4 + n * 16 ..] };
+        const rec = 8 * 8;
+        if (n > 32 or payload.len < 4 + n * rec) return null;
+        var s = Stimulus{ .points = undefined, .n = n, .raw = payload[4 + n * rec ..] };
         for (0..n) |i| {
-            const o = 4 + i * 16;
+            var f: [8]f64 = undefined;
+            for (&f, 0..) |*v, k| v.* = @bitCast(std.mem.readInt(u64, payload[4 + i * rec + k * 8 ..][0..8], .little));
             s.points[i] = .{
-                @bitCast(std.mem.readInt(u64, payload[o..][0..8], .little)),
-                @bitCast(std.mem.readInt(u64, payload[o + 8 ..][0..8], .little)),
+                .x = f[0],
+                .y = f[1],
+                .left = .{ .status = f[2], .a = f[3], .b = f[4] },
+                .right = .{ .status = f[5], .a = f[6], .b = f[7] },
             };
         }
         return s;
@@ -578,13 +599,15 @@ test "outstanding requests fail with disconnected on EOF" {
 }
 
 test "decodeStimulus" {
-    var p: [4 + 2 * 16 + 3]u8 = undefined;
+    var p: [4 + 2 * 64 + 3]u8 = undefined;
     std.mem.writeInt(u32, p[0..4], 2, .little);
-    const v = [_]f64{ 0.1, 0.1, 0.9, 0.5 };
+    const v = [_]f64{ 0.1, 0.1, 2, 0.02, 0.03, 2, 0.04, 0.05, 0.9, 0.5, 2, 0.01, 0.01, 1, 0.02, 0.02 };
     for (v, 0..) |x, i| std.mem.writeInt(u64, p[4 + i * 8 ..][0..8], @bitCast(x), .little);
-    @memcpy(p[36..39], "raw");
+    @memcpy(p[132..135], "raw");
     const s = SocketSource.decodeStimulus(&p).?;
     try testing.expectEqual(@as(u32, 2), s.n);
-    try testing.expectEqual(@as(f64, 0.9), s.points[1][0]);
+    try testing.expectEqual(@as(f64, 0.9), s.points[1].x);
+    try testing.expectEqual(@as(f64, 0.05), s.points[0].right.b);
+    try testing.expectEqual(@as(f64, 1), s.points[1].right.status);
     try testing.expectEqualStrings("raw", s.raw);
 }

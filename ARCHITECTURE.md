@@ -124,7 +124,8 @@ order TL.xyz, TR.xyz, BL.xyz.
 | `add_calibration_point` | 0x21 | 2×f64 (x,y) normalised display coords; eye_mask fixed at 3 (both eyes) | raw device reply |
 | `finish_calibration` | 0x22 | — | calibration blob (~400–640 KB; unix socket only) |
 | `cal_apply` | 0x23 | calibration blob | empty |
-| `get_calibration_stimulus` | 0x24 | — | u32 n, n×(f64 x, f64 y), then the raw TTP payload of op 0x460 |
+| `get_calibration_stimulus` | 0x24 | — | points of the active calibration: u32 n, n×8 f64 (x, y, status_L, a_L, b_L, status_R, a_R, b_R), then the raw TTP payload of op 0x460 |
+| `cancel_calibration` | 0x25 | — | empty; ends a started session (CALIBRATE_STOP) without computing/applying |
 | `disconnect` | 0xFF | — | — |
 
 Every command except `subscribe`/`disconnect` gets exactly one reply: a
@@ -138,7 +139,7 @@ in which case the device keeps its previous area). The daemon checks it, then
 reads the area back and replies with it. A successful set is persisted (see
 below).
 
-Calibration commands (`start_calibration`, `finish_calibration`, `cal_apply`)
+Calibration commands (`start_calibration`, `cancel_calibration`, `finish_calibration`, `cal_apply`)
 run one at a time on a daemon job thread that owns USB while it runs: gaze
 pauses, and any device command sent meanwhile gets `err` busy.
 
@@ -160,12 +161,37 @@ through.
 
 ### Calibration stimulus (op 0x460)
 
-`get_calibration_stimulus` forwards TTP op 0x460 (`get_calibration_stimulus_pts`,
-empty `[00 00]` request payload) and returns any point2d values found in the reply
-(`tobiifree_core.decode_cal_stimulus`) plus the raw payload. Not yet probed on
-hardware: what the points are (the device's recommended calibration targets?)
-and whether the request needs an open calibration realm is still to be
-established.
+`get_calibration_stimulus` forwards TTP op 0x460 (named
+`get_calibration_stimulus_pts` in the core; empty `[00 00]` request). Probed on
+an ET5 (2026-11-19): it is **not** a list of recommended targets. It returns
+the points of the calibration currently held by the device, with per-eye data:
+
+```
+[00 00]
+prolog 0x00070100             array, elements of 7 fields
+u32    0x3390                 element type
+per point:
+  prolog 0x00073390
+  prolog 0x031f42 + 3×fixed16x16   target x, y, z (normalised display coords, top-left origin)
+  type-1 u32 + 2×fixed16x16        left eye:  status, a, b
+  type-1 u32 + 2×fixed16x16        right eye: status, a, b
+```
+
+After the person's 6-point calibration (targets ▽ (0.1,0.1) (0.9,0.1) (0.5,0.9)
+then △ (0.1,0.9) (0.9,0.9) (0.5,0.1), exactly what the probe used) it listed
+those 6 targets in order, status 2 for both eyes, and a/b between 0.004 and
+0.07. The layout matches Tobii stream engine's `tobii_calibration_point_data_t`
+(point_xy, left_status, left_mapping_xy, right_status, right_mapping_xy; status
+2 = valid and used); a/b are small positive values, so they look like per-eye
+residuals, not absolute positions. Their exact meaning is unconfirmed. They
+could still serve as a quality indicator for the configurator.
+
+- `cal_apply` of a stored blob restores the list (the point data is part of the blob).
+- `start_calibration` (CALIBRATE_START + CLEAR) empties it at once (`n = 0`,
+  element count 1 in the header), and `cancel_calibration` (CALIBRATE_STOP)
+  leaves it empty. Whether the gaze *model* is also reset by START, or only the
+  point list, could not be checked (nobody at the tracker). To be safe, the
+  configurator should re-apply the stored blob after a cancelled calibration.
 
 ## tobiifreed (daemon)
 

@@ -381,18 +381,23 @@ fn handleResponse(m: *const RespMsg) void {
     }
 }
 
-// Stimulus reply: [u32 LE n][n × (x f64, y f64) LE][raw TTP payload].
+// Stimulus reply: [u32 LE n][n × 8 f64 LE][raw TTP payload], each record
+// x, y, status_L, a_L, b_L, status_R, a_R, b_R (see core.decode_cal_stimulus).
 fn sendStimulus(c: Client, cmd_type: u8, payload: []const u8) void {
-    var pts: [2 * 32]f64 align(8) = undefined;
+    const R = core.STIMULUS_RECORD_F64;
+    var pts: [R * 32]f64 align(8) = undefined;
     const n = core.decode_cal_stimulus(payload.ptr, payload.len, @ptrCast(&pts), 32);
-    log.info("calibration stimulus: {} points, {} raw bytes", .{ n, payload.len });
+    log.info("calibration points: {} ({} raw bytes)", .{ n, payload.len });
     var i: u32 = 0;
-    while (i < n) : (i += 1) log.info("  stimulus[{}] = ({d:.4}, {d:.4})", .{ i, pts[2 * i], pts[2 * i + 1] });
+    while (i < n) : (i += 1) {
+        const r = pts[i * R ..][0..R];
+        log.info("  [{}] ({d:.3}, {d:.3})  L {d:.0} ({d:.4}, {d:.4})  R {d:.0} ({d:.4}, {d:.4})", .{ i, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7] });
+    }
 
-    var buf: [4 + 2 * 32 * 8 + RESP_MAX]u8 = undefined;
+    var buf: [4 + R * 32 * 8 + RESP_MAX]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], n, .little);
     var off: usize = 4;
-    for (pts[0 .. 2 * n]) |v| {
+    for (pts[0 .. R * n]) |v| {
         std.mem.writeInt(u64, buf[off..][0..8], @bitCast(v), .little);
         off += 8;
     }
@@ -409,7 +414,7 @@ fn sendStimulus(c: Client, cmd_type: u8, payload: []const u8) void {
 // once no single request is in flight (the state machines' response hooks
 // don't filter by request_id).
 
-const JobKind = enum { start_cal, finish_cal, apply };
+const JobKind = enum { start_cal, cancel_cal, finish_cal, apply };
 
 const Job = struct {
     kind: JobKind,
@@ -442,6 +447,7 @@ fn jobThreadFn() void {
     core.clear_truncation(); // sticky flag; finish checks it for the blob
     job_ok = switch (j.kind) {
         .start_cal => tracker.startCalibration(),
+        .cancel_cal => tracker.cancelCalibration(),
         .finish_cal => tracker.finishCalibration(),
         .apply => tracker.calApply(j.blob.?),
     };
@@ -482,7 +488,7 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
     log.info("job {s} {s} in {d} ms", .{ @tagName(j.kind), if (ok) "succeeded" else "FAILED", elapsed_ms });
 
     switch (j.kind) {
-        .start_cal, .apply => {
+        .start_cal, .cancel_cal, .apply => {
             if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, proto.Err.failed);
         },
         .finish_cal => {
@@ -545,6 +551,7 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
 
         .start_calibration => queueJob(.{ .kind = .start_cal, .client = c, .cmd_type = cmd_type }),
         .finish_calibration => queueJob(.{ .kind = .finish_cal, .client = c, .cmd_type = cmd_type }),
+        .cancel_calibration => queueJob(.{ .kind = .cancel_cal, .client = c, .cmd_type = cmd_type }),
         .cal_apply => {
             log.debug("cal_apply: received payload_len={d} from fd={d}", .{ payload.len, client_fd });
             if (payload.len == 0 or payload.len > core.scratch_size()) {

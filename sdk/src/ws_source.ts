@@ -25,7 +25,14 @@ const CMD = {
   FINISH_CALIBRATION: 0x22,
   CAL_APPLY: 0x23,
   GET_CALIBRATION_STIMULUS: 0x24,
+  CANCEL_CALIBRATION: 0x25,
 } as const;
+
+export type CalPoint = {
+  x: number; y: number;
+  left: { status: number; a: number; b: number };
+  right: { status: number; a: number; b: number };
+};
 
 type Resolver = { resolve: (payload: Uint8Array) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> };
 
@@ -111,15 +118,28 @@ export class WsSource implements Source {
     this._displayArea = decodeArea(await this.request(cmd, payload));
   }
 
-  /** Reply of the device's get_calibration_stimulus_pts (op 0x460):
-   *  decoded points (whatever point2d values the payload contains) + raw payload. */
-  async getCalibrationStimulus(): Promise<{ points: { x: number; y: number }[]; raw: Uint8Array }> {
+  /** Points of the calibration active on the device (op 0x460): target in
+   *  normalised display coords + per-eye status (2 = valid and used) and two
+   *  values that look like residuals. */
+  async getCalibrationStimulus(): Promise<{ points: CalPoint[]; raw: Uint8Array }> {
     const p = await this.request(CMD.GET_CALIBRATION_STIMULUS);
     const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
     const n = dv.getUint32(0, true);
-    const points: { x: number; y: number }[] = [];
-    for (let i = 0; i < n; i++) points.push({ x: dv.getFloat64(4 + i * 16, true), y: dv.getFloat64(12 + i * 16, true) });
-    return { points, raw: p.slice(4 + n * 16) };
+    const points: CalPoint[] = [];
+    for (let i = 0; i < n; i++) {
+      const f = (k: number) => dv.getFloat64(4 + i * 64 + k * 8, true);
+      points.push({
+        x: f(0), y: f(1),
+        left: { status: f(2), a: f(3), b: f(4) },
+        right: { status: f(5), a: f(6), b: f(7) },
+      });
+    }
+    return { points, raw: p.slice(4 + n * 64) };
+  }
+
+  /** End a calibration session without applying it (device keeps its calibration). */
+  async cancelCalibration(): Promise<void> {
+    await this.request(CMD.CANCEL_CALIBRATION, undefined, 10_000);
   }
 
   async startCalibration(): Promise<void> {

@@ -39,6 +39,7 @@ pub const Cmd = enum(u8) {
     finish_calibration = 0x22,
     cal_apply = 0x23,
     get_calibration_stimulus = 0x24,
+    cancel_calibration = 0x25,
     disconnect = 0xFF,
 };
 

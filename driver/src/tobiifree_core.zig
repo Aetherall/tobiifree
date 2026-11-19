@@ -671,35 +671,83 @@ pub export fn build_cal_stimulus(seq: u32, out: [*]u8) usize {
     return wrapEnvelopeOut(out, &ttp_buf, ttp_len);
 }
 
-// Decode a cal_stimulus (op 0x460) response: walks the TLV payload (after
-// the 2-byte prefix) and collects every point2d (prolog 0x021f40 + 2×Q42) in
-// order, descending into structs. Writes up to `max` (x, y) f64 pairs to
-// `out` and returns the number of points found. Unknown field types are
-// skipped by their size, so the walk is tolerant of extra fields.
+// Decode a cal_stimulus (op 0x460, "get_calibration_stimulus_pts") response:
+// the points of the calibration currently active on the device, with per-eye
+// data. Observed layout (ET5, after a 6-point calibration):
+//
+//   [00 00]
+//   prolog 0x00070100            array, elements of 7 fields
+//   u32    0x3390                element type
+//   per point:
+//     prolog 0x00073390          element (7 fields)
+//     prolog 0x031f42 + 3×fixed16x16   point x, y, z (normalised display coords)
+//     type-1 u32 + 2×fixed16x16  left eye:  status, a, b
+//     type-1 u32 + 2×fixed16x16  right eye: status, a, b
+//
+// This matches Tobii stream engine's tobii_calibration_point_data_t
+// (point_xy, left_status, left_mapping_xy, right_status, right_mapping_xy;
+// status 2 = valid and used). a/b were ~0.004–0.07 for a 0.6° calibration,
+// so they look like per-eye residuals rather than absolute positions.
+//
+// Writes up to `max` records of STIMULUS_RECORD_F64 f64:
+//   x, y, status_L, a_L, b_L, status_R, a_R, b_R
+// (missing fields are NaN) and returns the number of points.
+pub const STIMULUS_RECORD_F64: usize = 8;
+
 pub export fn decode_cal_stimulus(src: [*]const u8, len: usize, out: [*]u8, max: u32) u32 {
     if (len < 2) return 0;
-    var r = tlv.Reader.init(src[0..len]);
-    r.pos = 2;
+    const b = src[0..len];
+    var pos: usize = 2;
     var n: u32 = 0;
-    while (r.remaining() >= 5 and n < max) {
-        const h = r.peekHeader() catch break;
-        if (h.type_byte == 5) {
-            if (r.remaining() < 9) break;
-            const tag = std.mem.readInt(u32, src[r.pos + 5 ..][0..4], .big);
-            if (tag == 0x021f40) {
-                const p = r.readPoint2d() catch break;
-                putF64(out + n * 16, p[0]);
-                putF64(out + n * 16 + 8, p[1]);
-                n += 1;
-            } else {
-                r.pos += 9; // prolog: descend into the struct's fields
-            }
-        } else {
-            if (r.remaining() < 5 + @as(usize, h.size)) break;
-            r.pos += 5 + h.size;
+    var field: usize = 0; // index into the current record (0 = none open)
+    while (pos + 5 <= len) {
+        const t = b[pos];
+        const size = std.mem.readInt(u32, b[pos + 1 ..][0..4], .big);
+        if (pos + 5 + size > len) break;
+        const body = b[pos + 5 .. pos + 5 + size];
+        pos += 5 + size;
+        switch (t) {
+            5 => {
+                if (size != 4) continue;
+                const tag = std.mem.readInt(u32, body[0..4], .big);
+                if (tag == 0x031f42 or tag == 0x031f41 or tag == 0x021f40 or tag == 0x021f43) {
+                    if (n >= max) break;
+                    n += 1;
+                    var k: usize = 0;
+                    while (k < STIMULUS_RECORD_F64) : (k += 1) putF64(out + ((n - 1) * STIMULUS_RECORD_F64 + k) * 8, std.math.nan(f64));
+                    field = 0;
+                    // Next 2 (or 3) scalars are the point; z is dropped.
+                    const dims: usize = if (tag >> 16 == 3) 3 else 2;
+                    var d: usize = 0;
+                    while (d < dims and pos + 5 <= len) : (d += 1) {
+                        const tt = b[pos];
+                        const ss = std.mem.readInt(u32, b[pos + 1 ..][0..4], .big);
+                        if (pos + 5 + ss > len) break;
+                        const v = scalarOf(tt, b[pos + 5 .. pos + 5 + ss]) orelse break;
+                        pos += 5 + ss;
+                        if (d < 2) putF64(out + ((n - 1) * STIMULUS_RECORD_F64 + d) * 8, v);
+                    }
+                    field = 2;
+                }
+            },
+            else => {
+                if (n == 0 or field == 0 or field >= STIMULUS_RECORD_F64) continue;
+                const v = scalarOf(t, body) orelse continue;
+                putF64(out + ((n - 1) * STIMULUS_RECORD_F64 + field) * 8, v);
+                field += 1;
+            },
         }
     }
     return n;
+}
+
+fn scalarOf(t: u8, body: []const u8) ?f64 {
+    return switch (t) {
+        1, 2 => if (body.len == 4) @floatFromInt(std.mem.readInt(u32, body[0..4], .big)) else null,
+        3 => if (body.len == 4) @as(f64, @floatFromInt(std.mem.readInt(i32, body[0..4], .big))) / 65536.0 else null,
+        4 => if (body.len == 8) @as(f64, @floatFromInt(std.mem.readInt(i64, body[0..8], .big))) / 4398046511104.0 else null,
+        else => null,
+    };
 }
 
 // Compute HMAC-MD5 for realm authentication.
@@ -2424,27 +2472,30 @@ test "set_display_area_corners is acked with status" {
     try std.testing.expectEqual(@as(u32, 0), test_resp_status);
 }
 
-test "decode_cal_stimulus collects point2d in order" {
-    var pay: [256]u8 = undefined;
-    var n: usize = 0;
-    pay[0] = 0;
-    pay[1] = 0;
-    n = 2;
-    n += tlvU32(@ptrCast(&pay[n]), 2); // a count, skipped
-    n += tlvTag(@ptrCast(&pay[n]), 0x020bb8); // some struct prolog, descended
-    const pts = [_][2]f64{ .{ 0.1, 0.1 }, .{ 0.9, 0.5 } };
-    for (pts) |p| {
-        n += tlvTag(@ptrCast(&pay[n]), 0x021f40);
-        n += tlvF64Q42(@ptrCast(&pay[n]), p[0]);
-        n += tlvF64Q42(@ptrCast(&pay[n]), p[1]);
-    }
-    var out: [4]f64 align(8) = undefined;
-    const got = decode_cal_stimulus(&pay, n, @ptrCast(&out), 2);
-    try std.testing.expectEqual(@as(u32, 2), got);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.1), out[0], 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[3], 1e-9);
+test "decode_cal_stimulus on a captured ET5 reply" {
+    // First two points of a real reply (6-point calibration), list header kept.
+    const hex = "0000050000000400070100020000000400003390" ++
+        "050000000400073390050000000400031f42030000000400001999030000000400001999030000000400000000" ++
+        "0100000004000000020300000004000005970300000004000005ea" ++
+        "010000000400000002030000000400000be50300000004000005b3" ++
+        "050000000400073390050000000400031f4203000000040000e666030000000400001999030000000400000000" ++
+        "0100000004000000020300000004000004d60300000004000003f0" ++
+        "010000000400000002030000000400001151030000000400000969";
+    var pay: [hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&pay, hex);
+    var out: [3 * STIMULUS_RECORD_F64]f64 align(8) = undefined;
+    const n = decode_cal_stimulus(&pay, pay.len, @ptrCast(&out), 3);
+    try std.testing.expectEqual(@as(u32, 2), n);
+    const r0 = out[0..8];
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), r0[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), r0[1], 1e-4);
+    try std.testing.expectEqual(@as(f64, 2), r0[2]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0x597) / 65536.0, r0[3], 1e-9);
+    try std.testing.expectEqual(@as(f64, 2), r0[5]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0x5b3) / 65536.0, r0[7], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), out[8], 1e-4);
     // max caps the output.
-    try std.testing.expectEqual(@as(u32, 1), decode_cal_stimulus(&pay, n, @ptrCast(&out), 1));
+    try std.testing.expectEqual(@as(u32, 1), decode_cal_stimulus(&pay, pay.len, @ptrCast(&out), 1));
 }
 
 test "parse single complete frame" {
