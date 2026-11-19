@@ -220,6 +220,15 @@ pub fn calibrationPath(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/calibration.bin", .{home}) catch null;
 }
 
+/// $XDG_STATE_HOME/tobiifree/correction.json (default ~/.local/state/…).
+pub fn correctionPath(buf: []u8) ?[]const u8 {
+    if (std.posix.getenv("XDG_STATE_HOME")) |s| if (s.len > 0) {
+        return std.fmt.bufPrint(buf, "{s}/tobiifree/correction.json", .{s}) catch null;
+    };
+    const home = std.posix.getenv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.local/state/tobiifree/correction.json", .{home}) catch null;
+}
+
 /// Read a whole file (caller frees). Null if missing/unreadable.
 pub fn readFile(gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
     return std.fs.cwd().readFileAlloc(gpa, path, max) catch null;

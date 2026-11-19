@@ -19,6 +19,8 @@ const CLIENT_BUF_SIZE = 700 * 1024;
 const Client = struct {
     fd: std.posix.fd_t,
     subscribed: bool,
+    /// set_gaze_raw: this client gets uncorrected samples.
+    raw: bool,
     // Per-client read buffer for incoming commands.
     buf: [CLIENT_BUF_SIZE]u8,
     buf_len: usize,
@@ -83,6 +85,7 @@ pub const Server = struct {
                     slot.* = .{
                         .fd = fd,
                         .subscribed = false,
+                        .raw = false,
                         .buf = undefined,
                         .buf_len = 0,
                     };
@@ -157,19 +160,31 @@ pub const Server = struct {
         if (msg_type == @intFromEnum(proto.Cmd.disconnect)) {
             return;
         }
+        if (msg_type == @intFromEnum(proto.Cmd.set_gaze_raw)) {
+            client.raw = payload.len > 0 and payload[0] != 0;
+            log.info("client fd={} gaze: {s}", .{ client.fd, if (client.raw) "raw (uncorrected)" else "corrected" });
+            var buf: [proto.HEADER_SIZE + 1]u8 = undefined;
+            _ = proto.encodeResponse(&buf, msg_type, &.{});
+            _ = std.posix.write(client.fd, &buf) catch {};
+            return;
+        }
         // Forward all other commands to the tracker via USB.
         self.forward_fn(client.fd, msg_type, payload, false);
     }
 
-    /// Broadcast a gaze sample to all subscribed clients.
-    pub fn broadcastGaze(self: *Server, sample: *const core.GazeSample) void {
+    /// Broadcast a gaze sample to all subscribed clients: `corrected` (if
+    /// any) to normal clients, `raw` to the ones that asked for raw gaze.
+    pub fn broadcastGaze(self: *Server, raw: *const core.GazeSample, corrected: ?*const core.GazeSample) void {
         var msg: [proto.HEADER_SIZE + @sizeOf(core.GazeSample)]u8 = undefined;
-        proto.encodeGaze(&msg, sample);
+        proto.encodeGaze(&msg, raw);
+        var msg_c: [proto.HEADER_SIZE + @sizeOf(core.GazeSample)]u8 = undefined;
+        if (corrected) |cs| proto.encodeGaze(&msg_c, cs);
 
         for (&self.clients) |*slot| {
             const client = &(slot.* orelse continue);
             if (!client.subscribed) continue;
-            _ = std.posix.write(client.fd, &msg) catch {
+            const m: []const u8 = if (corrected != null and !client.raw) &msg_c else &msg;
+            _ = std.posix.write(client.fd, m) catch {
                 self.removeClient(slot);
             };
         }

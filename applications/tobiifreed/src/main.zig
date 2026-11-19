@@ -37,6 +37,16 @@
 //     ends (or fails / times out after 120 s), and device commands sent
 //     meanwhile get Err.busy.
 //
+// Correction map: $XDG_STATE_HOME/tobiifree/correction.json (written through
+// set_correction by tobiifree-setup) describes a residual field measured
+// after the calibration; while active, the 2D gaze fields of every sample
+// are corrected (grid lookup, see driver/src/correction.zig) and flagged
+// GAZE_BIT_CORRECTED, except for clients that asked for raw gaze
+// (set_gaze_raw). It is active only while the device runs the calibration
+// blob it was measured with (SHA-256) and the display area is the same; a new
+// finish_calibration or a different display area deletes it (also checked at
+// startup); a client cal_apply of another blob just deactivates it.
+//
 // Hotplug: when the tracker disappears (USB error NO_DEVICE/IO) device
 // commands get Err.no_device, the daemon polls for the tracker every second,
 // and on return redoes the handshake, pushes the config's display area and
@@ -51,6 +61,7 @@ const Server = @import("server").Server;
 const WsServer = @import("ws_server").WsServer;
 const config = @import("config.zig");
 const proto = @import("daemon_protocol");
+const corr_mod = @import("correction");
 
 const log = std.log.scoped(.tobiifreed);
 
@@ -109,8 +120,11 @@ fn drainGaze() void {
                 sample.gaze_point_2d_norm[0], sample.gaze_point_2d_norm[1],
             });
         }
-        server.broadcastGaze(sample);
-        if (ws) |*w_| w_.broadcastGaze(sample);
+        if (applied_gen.load(.acquire) != corr_seen_gen) updateCorrectionActive();
+        var corrected: core.GazeSample = undefined;
+        const cs: ?*const core.GazeSample = if (correctSample(sample, &corrected)) &corrected else null;
+        server.broadcastGaze(sample, cs);
+        if (ws) |*w_| w_.broadcastGaze(sample, cs);
         gaze_read +%= 1;
     }
 }
@@ -369,6 +383,9 @@ fn handleResponse(m: *const RespMsg) void {
                 log.info("display area set: TL=({d:.3},{d:.3},{d:.3}) TR=({d:.3},{d:.3},{d:.3}) BL=({d:.3},{d:.3},{d:.3})", .{
                     c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8],
                 });
+                cur_area = c;
+                if (correction) |*cr| if (!corr_mod.areaMatches(cr.area, c)) deleteCorrection("the display area changed");
+                updateCorrectionActive();
                 config.saveDisplayArea(gpa, c) catch |err| {
                     log.err("failed to save display area to ~/{s}: {}", .{ config.CONFIG_REL_PATH, err });
                     return;
@@ -490,6 +507,9 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
     switch (j.kind) {
         .start_cal, .cancel_cal, .apply => {
             if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, proto.Err.failed);
+            // start clears the device's calibration; apply installs `blob`.
+            if (ok and j.kind == .start_cal) setAppliedSha(null);
+            if (ok and j.kind == .apply) setAppliedSha(corr_mod.sha256Hex(j.blob.?));
         },
         .finish_cal => {
             if (!ok) {
@@ -498,6 +518,7 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
             }
             const blob = core.cal_finish_blob_ptr()[0..core.cal_finish_blob_len()];
             sendReply(j.client, j.cmd_type, blob);
+            setAppliedSha(corr_mod.sha256Hex(blob));
             if (blob.len == 0 or core.had_truncation() != 0) {
                 log.warn("finish_calibration: blob empty or truncated ({} bytes), not saving", .{blob.len});
                 return;
@@ -509,8 +530,226 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
                 return;
             };
             log.info("calibration saved to {s} ({} bytes)", .{ path, blob.len });
+            if (correction != null) deleteCorrection("a new calibration was saved");
         },
     }
+}
+
+// ── Correction map ──────────────────────────────────────────────────
+
+const Correction = struct {
+    parsed: std.json.Parsed(corr_mod.File),
+    text: []u8,
+    grid: *corr_mod.Grid,
+    sha: [64]u8,
+    area: config.Corners,
+
+    fn deinit(self: *Correction) void {
+        self.parsed.deinit();
+        gpa.free(self.text);
+        gpa.destroy(self.grid);
+    }
+};
+
+var correction: ?Correction = null; // main thread only
+/// set_correction_enabled (global, runtime only).
+var correction_enabled = true;
+/// Display area the device holds (config at startup, then successful sets).
+var cur_area: ?config.Corners = null;
+var corr_active = false;
+var corr_seen_gen: u32 = 0xffff_ffff;
+
+// SHA-256 of the calibration blob the device runs, as far as the daemon
+// knows. Written by the USB thread (restore) and the main thread (jobs).
+var applied_sha_mutex: std.Thread.Mutex = .{};
+var applied_sha: ?[64]u8 = null;
+var applied_gen = std.atomic.Value(u32).init(0);
+
+fn setAppliedSha(s: ?[64]u8) void {
+    applied_sha_mutex.lock();
+    applied_sha = s;
+    applied_sha_mutex.unlock();
+    _ = applied_gen.fetchAdd(1, .release);
+}
+
+fn getAppliedSha() ?[64]u8 {
+    applied_sha_mutex.lock();
+    defer applied_sha_mutex.unlock();
+    return applied_sha;
+}
+
+/// Recompute whether the stored map applies (blob, area, enabled).
+fn updateCorrectionActive() void {
+    corr_seen_gen = applied_gen.load(.acquire);
+    const was = corr_active;
+    corr_active = false;
+    var why: []const u8 = "no map";
+    if (correction) |*c| {
+        const a = getAppliedSha();
+        if (!correction_enabled) {
+            why = "disabled";
+        } else if (a == null or !std.mem.eql(u8, &a.?, &c.sha)) {
+            why = "the device runs another calibration";
+        } else if (cur_area == null or !corr_mod.areaMatches(cur_area.?, c.area)) {
+            why = "another display area";
+        } else corr_active = true;
+    }
+    if (was != corr_active) {
+        if (corr_active) log.info("correction map active", .{}) else log.info("correction map inactive ({s})", .{why});
+    }
+}
+
+fn correctField(g: *const corr_mod.Grid, p: *[2]f64) bool {
+    const d = g.sample(p[0], p[1]) orelse return false;
+    p[0] -= d[0];
+    p[1] -= d[1];
+    return true;
+}
+
+/// Corrected copy of `s` into `out`; false if nothing was corrected.
+fn correctSample(s: *const core.GazeSample, out: *core.GazeSample) bool {
+    if (!corr_active) return false;
+    const g = correction.?.grid;
+    out.* = s.*;
+    const l = s.validity_L == 0;
+    const r = s.validity_R == 0;
+    var any = false;
+    if (l or r) {
+        if (s.present_mask & core.GAZE_BIT_GAZE_2D != 0) any = correctField(g, &out.gaze_point_2d_norm) or any;
+        if (s.present_mask & core.GAZE_BIT_GAZE_2D_UNFILTERED != 0) any = correctField(g, &out.gaze_point_2d_unfiltered) or any;
+    }
+    if (l and s.present_mask & core.GAZE_BIT_GAZE_2D_L != 0) any = correctField(g, &out.gaze_point_2d_L_norm) or any;
+    if (r and s.present_mask & core.GAZE_BIT_GAZE_2D_R != 0) any = correctField(g, &out.gaze_point_2d_R_norm) or any;
+    if (!any) return false;
+    out.present_mask |= core.GAZE_BIT_CORRECTED;
+    return true;
+}
+
+/// Parse + refit `text` (taken over) into a Correction.
+fn makeCorrection(text: []u8) !Correction {
+    errdefer gpa.free(text);
+    const parsed = try corr_mod.parseFile(gpa, text);
+    errdefer parsed.deinit();
+    const m = try parsed.value.map();
+    const grid = try gpa.create(corr_mod.Grid);
+    grid.init(&m);
+    var sha: [64]u8 = undefined;
+    @memcpy(&sha, parsed.value.calibration_sha256[0..64]);
+    return .{ .parsed = parsed, .text = text, .grid = grid, .sha = sha, .area = parsed.value.display_area };
+}
+
+fn installCorrection(c: Correction) void {
+    if (correction) |*old| old.deinit();
+    correction = c;
+    const f = &c.parsed.value;
+    log.info("correction map loaded: {} points, lambda {d}, cap {d:.0} mm, fade {d:.0} mm", .{ f.points.len, f.lambda, f.cap_mm, f.fade_mm });
+    updateCorrectionActive();
+}
+
+fn deleteCorrection(reason: []const u8) void {
+    var pbuf: [512]u8 = undefined;
+    if (config.correctionPath(&pbuf)) |path| {
+        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("could not delete {s}: {}", .{ path, err }),
+        };
+    }
+    if (correction) |*c| {
+        c.deinit();
+        correction = null;
+    }
+    log.info("correction map deleted: {s}", .{reason});
+    updateCorrectionActive();
+}
+
+/// SHA-256 of the stored calibration blob, or null.
+fn storedCalibrationSha() ?[64]u8 {
+    var pbuf: [512]u8 = undefined;
+    const path = config.calibrationPath(&pbuf) orelse return null;
+    const blob = config.readFile(gpa, path, core.scratch_size() + 1) orelse return null;
+    defer gpa.free(blob);
+    return corr_mod.sha256Hex(blob);
+}
+
+/// Startup: load the stored map; delete it if it no longer matches the
+/// stored calibration or the configured display area.
+fn loadCorrection() void {
+    var pbuf: [512]u8 = undefined;
+    const path = config.correctionPath(&pbuf) orelse return;
+    const text = config.readFile(gpa, path, 1 << 20) orelse return;
+    const c = makeCorrection(text) catch |err| {
+        log.warn("{s} unusable ({}), deleting it", .{ path, err });
+        deleteCorrection("unreadable");
+        return;
+    };
+    var cc = c;
+    const stored = storedCalibrationSha();
+    if (stored == null or !std.mem.eql(u8, &stored.?, &cc.sha)) {
+        cc.deinit();
+        deleteCorrection("made for another calibration");
+        return;
+    }
+    if (cur_area == null or !corr_mod.areaMatches(cur_area.?, cc.area)) {
+        cc.deinit();
+        deleteCorrection("made for another display area");
+        return;
+    }
+    installCorrection(cc);
+}
+
+fn setCorrection(c: Client, cmd_type: u8, payload: []const u8) void {
+    const text = gpa.dupe(u8, payload) catch {
+        sendError(c, cmd_type, proto.Err.failed);
+        return;
+    };
+    var nc = makeCorrection(text) catch |err| {
+        log.warn("set_correction: bad map ({})", .{err});
+        sendError(c, cmd_type, proto.Err.bad_payload);
+        return;
+    };
+    const stored = storedCalibrationSha();
+    if (stored == null or !std.mem.eql(u8, &stored.?, &nc.sha)) {
+        log.warn("set_correction: made for another calibration than the stored one", .{});
+        nc.deinit();
+        sendError(c, cmd_type, proto.Err.mismatch);
+        return;
+    }
+    if (cur_area == null or !corr_mod.areaMatches(cur_area.?, nc.area)) {
+        log.warn("set_correction: made for another display area", .{});
+        nc.deinit();
+        sendError(c, cmd_type, proto.Err.mismatch);
+        return;
+    }
+    var pbuf: [512]u8 = undefined;
+    const path = config.correctionPath(&pbuf) orelse {
+        nc.deinit();
+        sendError(c, cmd_type, proto.Err.failed);
+        return;
+    };
+    config.writeFileAtomic(path, nc.text) catch |err| {
+        log.err("failed to save {s}: {}", .{ path, err });
+        nc.deinit();
+        sendError(c, cmd_type, proto.Err.failed);
+        return;
+    };
+    log.info("correction map saved to {s}", .{path});
+    installCorrection(nc);
+    sendReply(c, cmd_type, &.{});
+}
+
+fn getCorrection(c: Client, cmd_type: u8) void {
+    const cr = correction orelse {
+        sendReply(c, cmd_type, &.{0});
+        return;
+    };
+    const buf = gpa.alloc(u8, 1 + cr.text.len) catch {
+        sendError(c, cmd_type, proto.Err.failed);
+        return;
+    };
+    defer gpa.free(buf);
+    buf[0] = if (corr_active) 1 else 2;
+    @memcpy(buf[1..], cr.text);
+    sendReply(c, cmd_type, buf);
 }
 
 // ── Command forwarding: client → tracker ────────────────────────────
@@ -524,7 +763,26 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
         sendError(c, cmd_type, proto.Err.unknown_cmd);
         return;
     };
-    if (cmd == .subscribe or cmd == .disconnect) return; // handled by the servers
+    if (cmd == .subscribe or cmd == .disconnect or cmd == .set_gaze_raw) return; // handled by the servers
+
+    // Correction map: answered by the daemon, whatever the device state.
+    switch (cmd) {
+        .set_correction => return setCorrection(c, cmd_type, payload),
+        .get_correction => return getCorrection(c, cmd_type),
+        .clear_correction => {
+            deleteCorrection("cleared by a client");
+            sendReply(c, cmd_type, &.{});
+            return;
+        },
+        .set_correction_enabled => {
+            correction_enabled = payload.len > 0 and payload[0] != 0;
+            log.info("correction map {s} by a client", .{if (correction_enabled) "enabled" else "disabled"});
+            updateCorrectionActive();
+            sendReply(c, cmd_type, &.{});
+            return;
+        },
+        else => {},
+    }
 
     switch (dev_state.load(.acquire)) {
         .up => {},
@@ -547,7 +805,8 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
     }
 
     switch (cmd) {
-        .subscribe, .disconnect => unreachable,
+        .subscribe, .disconnect, .set_gaze_raw => unreachable,
+        .set_correction, .get_correction, .clear_correction, .set_correction_enabled => unreachable,
 
         .start_calibration => queueJob(.{ .kind = .start_cal, .client = c, .cmd_type = cmd_type }),
         .finish_calibration => queueJob(.{ .kind = .finish_cal, .client = c, .cmd_type = cmd_type }),
@@ -695,6 +954,7 @@ fn restoreCalibration() void {
     const path = config.calibrationPath(&pbuf) orelse return;
     const blob = config.readFile(gpa, path, core.scratch_size() + 1) orelse {
         log.info("no stored calibration at {s}", .{path});
+        setAppliedSha(null);
         return;
     };
     defer gpa.free(blob);
@@ -706,6 +966,7 @@ fn restoreCalibration() void {
     const t0 = std.time.milliTimestamp();
     const ok = tracker.calApply(blob);
     const dt = std.time.milliTimestamp() - t0;
+    setAppliedSha(if (ok) corr_mod.sha256Hex(blob) else null);
     if (ok) {
         log.info("stored calibration applied in {d} ms", .{dt});
     } else {
@@ -892,6 +1153,7 @@ pub fn main() void {
         });
     }
 
+    cur_area = cfg_area;
     opt_keep_device_area = keep_device_area;
     opt_restore_calibration = restore_calibration;
 
@@ -931,8 +1193,10 @@ pub fn main() void {
 
     if (start_connected) {
         applyStartupDisplayArea(cfg_area, keep_device_area);
+        if (cur_area == null) cur_area = cornersOf(tracker.display);
         tracker.onGaze(onGaze);
     }
+    loadCorrection();
 
     // Install hooks for command forwarding (after the synchronous startup
     // queries, which use their own capture hook).

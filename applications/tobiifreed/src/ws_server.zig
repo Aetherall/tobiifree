@@ -22,6 +22,7 @@ const WsClient = struct {
     buf: [4096]u8,
     buf_len: usize,
     subscribed: bool,
+    raw: bool = false,
 };
 
 pub const ForwardFn = *const fn (client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, is_ws: bool) void;
@@ -129,18 +130,25 @@ pub const WsServer = struct {
     }
 
     /// Broadcast a gaze sample as a binary WebSocket frame to all subscribed open clients.
-    pub fn broadcastGaze(self: *WsServer, sample: *const core.GazeSample) void {
+    /// `corrected` (if any) to normal clients, `raw` to raw-gaze clients.
+    pub fn broadcastGaze(self: *WsServer, raw: *const core.GazeSample, corrected: ?*const core.GazeSample) void {
         // Wrap in daemon protocol framing first, then in a WebSocket binary frame.
         var msg: [proto.HEADER_SIZE + @sizeOf(core.GazeSample)]u8 = undefined;
-        proto.encodeGaze(&msg, sample);
-
+        proto.encodeGaze(&msg, raw);
         var frame: [4 + msg.len]u8 = undefined;
         const frame_len = encodeWsFrame(&frame, &msg);
+        var frame_c: [4 + msg.len]u8 = undefined;
+        var frame_c_len: usize = 0;
+        if (corrected) |cs| {
+            proto.encodeGaze(&msg, cs);
+            frame_c_len = encodeWsFrame(&frame_c, &msg);
+        }
 
         for (&self.clients) |*slot| {
             const client = &(slot.* orelse continue);
             if (client.state != .open or !client.subscribed) continue;
-            _ = std.posix.write(client.fd, frame[0..frame_len]) catch {
+            const f: []const u8 = if (corrected != null and !client.raw) frame_c[0..frame_c_len] else frame[0..frame_len];
+            _ = std.posix.write(client.fd, f) catch {
                 self.removeClient(slot);
             };
         }
@@ -342,6 +350,14 @@ pub const WsServer = struct {
             return;
         }
         if (hdr.msg_type == @intFromEnum(proto.Cmd.disconnect)) {
+            return;
+        }
+        if (hdr.msg_type == @intFromEnum(proto.Cmd.set_gaze_raw)) {
+            client.raw = payload.len > 0 and payload[0] != 0;
+            log.info("ws client fd={} gaze: {s}", .{ client.fd, if (client.raw) "raw (uncorrected)" else "corrected" });
+            var buf: [proto.HEADER_SIZE + 1]u8 = undefined;
+            _ = proto.encodeResponse(&buf, hdr.msg_type, &.{});
+            self.sendToClient(client.fd, &buf);
             return;
         }
         // Forward to tracker via USB.

@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Correction map (TPS model, grid, file format; std only).
+    const correction = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/correction.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tobiifreed",
         .root_module = b.createModule(.{
@@ -75,6 +82,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "daemon_protocol", .module = daemon_protocol },
                 .{ .name = "server", .module = server },
                 .{ .name = "ws_server", .module = ws_server },
+                .{ .name = "correction", .module = correction },
             },
         }),
     });
@@ -144,4 +152,11 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run tobiifreed unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    // Nested leave-one-out fits are very slow in Debug: test optimised.
+    const corr_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/correction.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(corr_tests).step);
 }

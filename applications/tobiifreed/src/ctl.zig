@@ -8,6 +8,10 @@
 //   tobiifree-ctl add-point X Y
 //   tobiifree-ctl finish-calibration OUT.bin   # replaces the device calibration!
 //   tobiifree-ctl apply FILE.bin               # replaces the device calibration!
+//   tobiifree-ctl correction                   # state + correction.json of the map
+//   tobiifree-ctl correction-set FILE.json     # install a correction map
+//   tobiifree-ctl correction-clear             # delete it
+//   tobiifree-ctl correction-enable on|off     # all clients, until the daemon restarts
 
 const std = @import("std");
 const proto = @import("daemon_protocol");
@@ -37,6 +41,10 @@ fn usage() u8 {
         \\       tobiifree-ctl add-point X Y
         \\       tobiifree-ctl finish-calibration OUT.bin
         \\       tobiifree-ctl apply FILE.bin
+        \\       tobiifree-ctl correction
+        \\       tobiifree-ctl correction-set FILE.json
+        \\       tobiifree-ctl correction-clear
+        \\       tobiifree-ctl correction-enable on|off
         \\
     , .{});
     return 2;
@@ -95,6 +103,21 @@ pub fn main() u8 {
             };
             break :blk .{ .cal_apply, file_blob.?, 180000 };
         }
+        if (std.mem.eql(u8, verb, "correction")) break :blk .{ .get_correction, &.{}, 5000 };
+        if (std.mem.eql(u8, verb, "correction-clear")) break :blk .{ .clear_correction, &.{}, 5000 };
+        if (std.mem.eql(u8, verb, "correction-set")) {
+            if (rest.len != 1) return usage();
+            file_blob = std.fs.cwd().readFileAlloc(gpa, rest[0], 1 << 20) catch |err| {
+                out("cannot read {s}: {}\n", .{ rest[0], err });
+                return 1;
+            };
+            break :blk .{ .set_correction, file_blob.?, 10000 };
+        }
+        if (std.mem.eql(u8, verb, "correction-enable")) {
+            if (rest.len != 1) return usage();
+            payload_buf[0] = if (std.mem.eql(u8, rest[0], "on")) 1 else if (std.mem.eql(u8, rest[0], "off")) 0 else return usage();
+            break :blk .{ .set_correction_enabled, payload_buf[0..1], 5000 };
+        }
         return usage();
     };
 
@@ -132,6 +155,15 @@ pub fn main() u8 {
                 return 1;
             };
             out("calibration blob: {d} bytes -> {s}\n", .{ reply.data.len, rest[0] });
+        },
+        .get_correction => {
+            if (reply.data.len == 0 or reply.data[0] == 0) {
+                out("no correction map\n", .{});
+            } else {
+                out("correction map: {s}\n", .{if (reply.data[0] == 1) "active" else "stored but inactive (other calibration/area, or disabled)"});
+                std.fs.File.stdout().writeAll(reply.data[1..]) catch {};
+                out("\n", .{});
+            }
         },
         else => out("ok ({d} bytes)\n", .{reply.data.len}),
     }
