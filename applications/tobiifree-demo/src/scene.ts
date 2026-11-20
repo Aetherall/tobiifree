@@ -235,18 +235,18 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   trackerOffset.add(eyesGroup);
 
   // Raw (pre-calibration) eye origin dots — show calibration offset
-  const rawEyeDotL = new THREE.Mesh(
+  const eyeballCentreDotL = new THREE.Mesh(
     new THREE.SphereGeometry(5, 12, 8),
     new THREE.MeshBasicMaterial({ color: 0xff9944, transparent: true, opacity: 0.5, depthWrite: false }),
   );
-  const rawEyeDotR = new THREE.Mesh(
+  const eyeballCentreDotR = new THREE.Mesh(
     new THREE.SphereGeometry(5, 12, 8),
     new THREE.MeshBasicMaterial({ color: 0xff9944, transparent: true, opacity: 0.5, depthWrite: false }),
   );
-  rawEyeDotL.visible = false;
-  rawEyeDotR.visible = false;
-  trackerOffset.add(rawEyeDotL);
-  trackerOffset.add(rawEyeDotR);
+  eyeballCentreDotL.visible = false;
+  eyeballCentreDotR.visible = false;
+  trackerOffset.add(eyeballCentreDotL);
+  trackerOffset.add(eyeballCentreDotR);
 
   // Display-space eye origin dots
   const dispEyeDotL = new THREE.Mesh(
@@ -520,17 +520,17 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     }
 
     // Raw (pre-calibration) eye origins — orange dots
-    if (s.eye_origin_raw_L_mm) {
-      rawEyeDotL.position.set(s.eye_origin_raw_L_mm.x, s.eye_origin_raw_L_mm.y, s.eye_origin_raw_L_mm.z);
-      rawEyeDotL.visible = true;
+    if (s.eyeball_centre_L_mm) {
+      eyeballCentreDotL.position.set(s.eyeball_centre_L_mm.x, s.eyeball_centre_L_mm.y, s.eyeball_centre_L_mm.z);
+      eyeballCentreDotL.visible = true;
     } else {
-      rawEyeDotL.visible = false;
+      eyeballCentreDotL.visible = false;
     }
-    if (s.eye_origin_raw_R_mm) {
-      rawEyeDotR.position.set(s.eye_origin_raw_R_mm.x, s.eye_origin_raw_R_mm.y, s.eye_origin_raw_R_mm.z);
-      rawEyeDotR.visible = true;
+    if (s.eyeball_centre_R_mm) {
+      eyeballCentreDotR.position.set(s.eyeball_centre_R_mm.x, s.eyeball_centre_R_mm.y, s.eyeball_centre_R_mm.z);
+      eyeballCentreDotR.visible = true;
     } else {
-      rawEyeDotR.visible = false;
+      eyeballCentreDotR.visible = false;
     }
 
     // Display-space eye origins — purple dots
@@ -599,8 +599,8 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
     // Display-space trackbox dots — same recovery but using display-space coefficients.
     // These use the same linear model with different intercepts due to the
     // display-area coordinate transform (tilt rotation).
-    const ddL = s.trackbox_eye_pos_L_display;
-    const ddR = s.trackbox_eye_pos_R_display;
+    const ddL = s.position_guide_L;
+    const ddR = s.position_guide_R;
     // Use own validity: column 0x25/0x27 can lag behind validity_L/R by a frame.
     // When invalid the values are all zeros, so check that too.
     if (ddL && (ddL.x !== 0 || ddL.y !== 0 || ddL.z !== 0)) {

@@ -34,10 +34,12 @@ type Sample = {
   validity_L?: number; validity_R?: number;
   pupil_diameter_L_mm?: number; pupil_diameter_R_mm?: number;
   eye_origin_L_mm?: V3; eye_origin_R_mm?: V3;
+  eyeball_centre_L_mm?: V3; eyeball_centre_R_mm?: V3;
+  // Datasets collected before the rename store the eyeball centres here.
   eye_origin_raw_L_mm?: V3; eye_origin_raw_R_mm?: V3;
   eye_origin_L_display_mm?: V3; eye_origin_R_display_mm?: V3;
   trackbox_eye_pos_L?: V3; trackbox_eye_pos_R?: V3;
-  trackbox_eye_pos_L_display?: V3; trackbox_eye_pos_R_display?: V3;
+  position_guide_L?: V3; position_guide_R?: V3;
   gaze_point_3d_L_mm?: V3; gaze_point_3d_R_mm?: V3;
   gaze_point_2d_norm?: V2;
   gaze_point_2d_L_norm?: V2; gaze_point_2d_R_norm?: V2;
@@ -53,14 +55,14 @@ const v3 = (v: V3 | undefined): [number, number, number] =>
   v ? [v.x, v.y, v.z] : [0, 0, 0];
 
 export type FeatureSet =
-  | 'eye_origins' | 'eye_origins_raw' | 'trackbox'
+  | 'eye_origins' | 'eyeball_centres' | 'trackbox'
   | 'all_positions' | 'kitchen_sink'
   | 'gaze_correct'       // device 2D gaze + eye origins → learn correction
   | 'gaze_correct_full'; // device 2D gaze + all positions + pupils
 
 export function featureNames(set: FeatureSet): string[] {
   const eo = ['eo_L.x', 'eo_L.y', 'eo_L.z', 'eo_R.x', 'eo_R.y', 'eo_R.z'];
-  const er = ['er_L.x', 'er_L.y', 'er_L.z', 'er_R.x', 'er_R.y', 'er_R.z'];
+  const ec = ['ec_L.x', 'ec_L.y', 'ec_L.z', 'ec_R.x', 'ec_R.y', 'ec_R.z'];
   const tb = ['tb_L.x', 'tb_L.y', 'tb_L.z', 'tb_R.x', 'tb_R.y', 'tb_R.z'];
   const pp = ['pupil_L', 'pupil_R'];
   const g2d = ['gaze_2d.x', 'gaze_2d.y'];
@@ -69,12 +71,12 @@ export function featureNames(set: FeatureSet): string[] {
   const g2du = ['gaze_2d_unfilt.x', 'gaze_2d_unfilt.y'];
   switch (set) {
     case 'eye_origins': return eo;
-    case 'eye_origins_raw': return er;
+    case 'eyeball_centres': return ec;
     case 'trackbox': return tb;
-    case 'all_positions': return [...eo, ...er, ...tb];
-    case 'kitchen_sink': return [...eo, ...er, ...tb, ...pp];
+    case 'all_positions': return [...eo, ...ec, ...tb];
+    case 'kitchen_sink': return [...eo, ...ec, ...tb, ...pp];
     case 'gaze_correct': return [...g2d, ...g2dL, ...g2dR, ...eo];
-    case 'gaze_correct_full': return [...g2d, ...g2dL, ...g2dR, ...g2du, ...eo, ...er, ...tb, ...pp];
+    case 'gaze_correct_full': return [...g2d, ...g2dL, ...g2dR, ...g2du, ...eo, ...ec, ...tb, ...pp];
   }
 }
 
@@ -83,7 +85,7 @@ const v2 = (v: V2 | undefined): [number, number] =>
 
 export function extractFeatures(s: Sample, set: FeatureSet): number[] {
   const eo = [...v3(s.eye_origin_L_mm), ...v3(s.eye_origin_R_mm)];
-  const er = [...v3(s.eye_origin_raw_L_mm), ...v3(s.eye_origin_raw_R_mm)];
+  const ec = [...v3(s.eyeball_centre_L_mm ?? s.eye_origin_raw_L_mm), ...v3(s.eyeball_centre_R_mm ?? s.eye_origin_raw_R_mm)];
   const tb = [...v3(s.trackbox_eye_pos_L), ...v3(s.trackbox_eye_pos_R)];
   const g2d = v2(s.gaze_point_2d_norm);
   const g2dL = v2(s.gaze_point_2d_L_norm);
@@ -91,12 +93,12 @@ export function extractFeatures(s: Sample, set: FeatureSet): number[] {
   const g2du = v2(s.gaze_point_2d_unfiltered);
   switch (set) {
     case 'eye_origins': return eo;
-    case 'eye_origins_raw': return er;
+    case 'eyeball_centres': return ec;
     case 'trackbox': return tb;
-    case 'all_positions': return [...eo, ...er, ...tb];
-    case 'kitchen_sink': return [...eo, ...er, ...tb, s.pupil_diameter_L_mm ?? -1, s.pupil_diameter_R_mm ?? -1];
+    case 'all_positions': return [...eo, ...ec, ...tb];
+    case 'kitchen_sink': return [...eo, ...ec, ...tb, s.pupil_diameter_L_mm ?? -1, s.pupil_diameter_R_mm ?? -1];
     case 'gaze_correct': return [...g2d, ...g2dL, ...g2dR, ...eo];
-    case 'gaze_correct_full': return [...g2d, ...g2dL, ...g2dR, ...g2du, ...eo, ...er, ...tb, s.pupil_diameter_L_mm ?? -1, s.pupil_diameter_R_mm ?? -1];
+    case 'gaze_correct_full': return [...g2d, ...g2dL, ...g2dR, ...g2du, ...eo, ...ec, ...tb, s.pupil_diameter_L_mm ?? -1, s.pupil_diameter_R_mm ?? -1];
   }
 }
 

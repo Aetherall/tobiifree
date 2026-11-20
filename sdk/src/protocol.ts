@@ -75,15 +75,15 @@ export type GazeSample = {
   eye_origin_L_display_mm?: Vec3;
   /** Calibrated right eye position in display-area frame (mm). */
   eye_origin_R_display_mm?: Vec3;
-  /** Normalized track-box position, left eye, in display-area frame. */
-  trackbox_eye_pos_L_display?: Vec3;
-  /** Normalized track-box position, right eye, in display-area frame. */
-  trackbox_eye_pos_R_display?: Vec3;
+  /** Left user position guide. */
+  position_guide_L?: Vec3;
+  /** Right user position guide. */
+  position_guide_R?: Vec3;
 
   /** Left eyeball centre (tracker-space mm): eye_origin_L − 4.6 mm · optical axis. */
-  eye_origin_raw_L_mm?: Vec3;
+  eyeball_centre_L_mm?: Vec3;
   /** Right eyeball centre (tracker-space mm): eye_origin_R − 4.6 mm · optical axis. */
-  eye_origin_raw_R_mm?: Vec3;
+  eyeball_centre_R_mm?: Vec3;
   /** Combined binocular 2D gaze before temporal smoothing, [0,1]². */
   gaze_point_2d_unfiltered?: Vec2;
   /** tobiifreed applied its correction map to the 2D gaze fields
@@ -135,16 +135,15 @@ export type RawGazeColumn = {
  *    back along the per-eye *optical* axis (constant over every frame
  *    observed). unit(origin − centre) is the optical axis; the gaze ray
  *    (origin → 0x04/0x0a) is it rotated by the profile's foveal angles
- *    (foveal_* + slope·r), about 2–3° on this device. It is not a
- *    pre-calibration origin; the `eye_origin_raw_*` names are historical.
+ *    (foveal_* + slope·r), about 2–3° on this device.
  *  - **display-relative** (0x22/0x24): gaze origin in display_area frame.
  *
  * "Gaze directions" — **misleading column name**: these are NOT direction
  * vectors. They encode the eye's normalized position in the track box
  * (d ≈ linear_transform(eye_origin), reconstruction error ~4mm).
  *  - **eye-model coords** (0x03/0x09): normalized track-box position, per eye.
- *  - **display-space** (0x25/0x27): same in display_area frame
- *    (observed as zeros/invalid on tested firmware; may be unused).
+ *  - **user position guide** (0x25/0x27)
+ *    (observed as zeros/invalid on this device).
  *
  * 2D gaze points:
  *  - **per-eye** (0x05/0x0b): ray→plane intersection per eye.
@@ -153,8 +152,7 @@ export type RawGazeColumn = {
  *
  * Validity flags follow data columns. 0=valid, 4=invalid (eye not detected).
  * The u32 flags 0x15/0x16, 0x1d–0x1f, 0x21, 0x23, 0x26, 0x28, 0x2a, 0x2c are
- * validities of other columns, given per line below (several label strings
- * are older and name the wrong column).
+ * validities of other columns, given per line below.
  */
 export const GAZE_COLUMN_LABELS: Record<number, string> = {
   // ── Timestamp & frame ──────────────────────────────────────────────
@@ -180,38 +178,38 @@ export const GAZE_COLUMN_LABELS: Record<number, string> = {
   // ── Tracking status ────────────────────────────────────────────────
   0x0e: 'tracking_status_0e',         // [u32]     unknown — always observed as 0 or 4
   0x11: 'tracking_mode',              // [u32]     always 4 — likely tracking mode/config
-  0x15: 'eye_present_L',              // [u32]     right gaze origin validity (right eye, despite the label)
-  0x16: 'eye_present_R',              // [u32]     left gaze origin validity (left eye, despite the label)
-  0x1b: 'binocular_flag',             // [u32]     combined gaze validity (of 0x1c)
+  0x15: 'gaze_origin_R_valid',        // [u32]     right gaze origin validity
+  0x16: 'gaze_origin_L_valid',        // [u32]     left gaze origin validity
+  0x1b: 'gaze_point_2d_valid',        // [u32]     combined gaze validity (of 0x1c)
 
-  // ── Raw / uncalibrated eye origins ─────────────────────────────────
-  0x17: 'eye_origin_raw_L_mm',        // [point3d] left eyeball centre: origin − 4.6 mm·optical axis
-  0x18: 'eye_origin_raw_R_mm',        // [point3d] right eyeball centre: origin − 4.6 mm·optical axis
+  // ── Eyeball centres ────────────────────────────────────────────────
+  0x17: 'eyeball_centre_L_mm',        // [point3d] left eyeball centre: origin − 4.6 mm·optical axis
+  0x18: 'eyeball_centre_R_mm',        // [point3d] right eyeball centre: origin − 4.6 mm·optical axis
 
   // ── Combined 2D gaze output ────────────────────────────────────────
-  0x19: 'gaze_point_2d_unused_19',    // [point2d] left eye 2D position on the sensor; (-1,-1) on this device
-  0x1a: 'gaze_point_2d_unused_1a',    // [point2d] right eye 2D position on the sensor; (-1,-1) on this device
+  0x19: 'eye_pos_sensor_L',           // [point2d] left eye 2D position on the sensor; (-1,-1) on this device
+  0x1a: 'eye_pos_sensor_R',           // [point2d] right eye 2D position on the sensor; (-1,-1) on this device
   0x1c: 'gaze_point_2d_norm',         // [point2d] combined binocular 2D gaze, temporally filtered
-  0x1d: 'gaze_2d_valid',              // [u32]     left track-box position validity (of 0x03)
-  0x1e: 'gaze_2d_L_valid',            // [u32]     right track-box position validity (of 0x09)
-  0x1f: 'gaze_2d_R_valid',            // [u32]     validity of 0x20
+  0x1d: 'trackbox_eye_pos_L_valid',   // [u32]     left track-box position validity (of 0x03)
+  0x1e: 'trackbox_eye_pos_R_valid',   // [u32]     right track-box position validity (of 0x09)
+  0x1f: 'gaze_point_2d_unfiltered_valid', // [u32] validity of 0x20
   0x20: 'gaze_point_2d_unfiltered',   // [point2d] combined 2D gaze before temporal smoothing
-  0x21: 'gaze_2d_unfiltered_valid',   // [u32]     left display-space origin validity (of 0x22)
+  0x21: 'eye_origin_L_display_valid', // [u32]     left display-space origin validity (of 0x22)
 
   // ── Display-space eye data ─────────────────────────────────────────
   0x22: 'eye_origin_L_display_mm',    // [point3d] calibrated left eye in display_area frame
-  0x23: 'eye_origin_L_display_valid', // [u32]     right display-space origin validity (of 0x24)
+  0x23: 'eye_origin_R_display_valid', // [u32]     right display-space origin validity (of 0x24)
   0x24: 'eye_origin_R_display_mm',    // [point3d] calibrated right eye in display_area frame
-  0x25: 'trackbox_eye_pos_L_display', // [point3d] left user position guide
-  0x26: 'trackbox_L_display_valid',   // [u32]     left user position guide validity
-  0x27: 'trackbox_eye_pos_R_display', // [point3d] right user position guide
-  0x28: 'trackbox_R_display_valid',   // [u32]     right user position guide validity
+  0x25: 'position_guide_L',           // [point3d] left user position guide
+  0x26: 'position_guide_L_valid',     // [u32]     left user position guide validity
+  0x27: 'position_guide_R',           // [point3d] right user position guide
+  0x28: 'position_guide_R_valid',     // [u32]     right user position guide validity
 
-  // ── Unknown scalars (always -1 / 0) ────────────────────────────────
-  0x29: 'scalar_unused_29',           // [fix16]   left eye openness; -1 on this device
-  0x2a: 'scalar_unused_29_valid',     // [u32]     left eye openness validity
-  0x2b: 'scalar_unused_2b',           // [fix16]   right eye openness; -1 on this device
-  0x2c: 'scalar_unused_2b_valid',     // [u32]     right eye openness validity
+  // ── Eye openness (always -1 / 0 on this device) ────────────────────
+  0x29: 'eye_openness_L',             // [fix16]   left eye openness; -1 on this device
+  0x2a: 'eye_openness_L_valid',       // [u32]     left eye openness validity
+  0x2b: 'eye_openness_R',             // [fix16]   right eye openness; -1 on this device
+  0x2c: 'eye_openness_R_valid',       // [u32]     right eye openness validity
 };
 
 export type TtpFrame = {

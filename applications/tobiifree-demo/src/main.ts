@@ -146,12 +146,12 @@ function modelExtractFeatures(s: GazeSample, names: string[]): number[] {
     'eo_R.x': () => v(s.eye_origin_R_mm, 'x'),
     'eo_R.y': () => v(s.eye_origin_R_mm, 'y'),
     'eo_R.z': () => v(s.eye_origin_R_mm, 'z'),
-    'er_L.x': () => v(s.eye_origin_raw_L_mm, 'x'),
-    'er_L.y': () => v(s.eye_origin_raw_L_mm, 'y'),
-    'er_L.z': () => v(s.eye_origin_raw_L_mm, 'z'),
-    'er_R.x': () => v(s.eye_origin_raw_R_mm, 'x'),
-    'er_R.y': () => v(s.eye_origin_raw_R_mm, 'y'),
-    'er_R.z': () => v(s.eye_origin_raw_R_mm, 'z'),
+    'ec_L.x': () => v(s.eyeball_centre_L_mm, 'x'),
+    'ec_L.y': () => v(s.eyeball_centre_L_mm, 'y'),
+    'ec_L.z': () => v(s.eyeball_centre_L_mm, 'z'),
+    'ec_R.x': () => v(s.eyeball_centre_R_mm, 'x'),
+    'ec_R.y': () => v(s.eyeball_centre_R_mm, 'y'),
+    'ec_R.z': () => v(s.eyeball_centre_R_mm, 'z'),
     'tb_L.x': () => v(s.trackbox_eye_pos_L, 'x'),
     'tb_L.y': () => v(s.trackbox_eye_pos_L, 'y'),
     'tb_L.z': () => v(s.trackbox_eye_pos_L, 'z'),
@@ -161,7 +161,8 @@ function modelExtractFeatures(s: GazeSample, names: string[]): number[] {
     'pupil_L': () => s.pupil_diameter_L_mm ?? -1,
     'pupil_R': () => s.pupil_diameter_R_mm ?? -1,
   };
-  return names.map(n => (lookup[n] ?? (() => 0))());
+  // Models trained before the eyeball-centre rename name those features er_*.
+  return names.map(n => (lookup[n.replace(/^er_/, 'ec_')] ?? (() => 0))());
 }
 
 function modelPolyExpand(x: number[], degree: number): number[] {
@@ -1145,10 +1146,10 @@ type CollectedSample = {
   validity_L?: number; validity_R?: number;
   pupil_diameter_L_mm?: number; pupil_diameter_R_mm?: number;
   eye_origin_L_mm?: V3; eye_origin_R_mm?: V3;
-  eye_origin_raw_L_mm?: V3; eye_origin_raw_R_mm?: V3;
+  eyeball_centre_L_mm?: V3; eyeball_centre_R_mm?: V3;
   eye_origin_L_display_mm?: V3; eye_origin_R_display_mm?: V3;
   trackbox_eye_pos_L?: V3; trackbox_eye_pos_R?: V3;
-  trackbox_eye_pos_L_display?: V3; trackbox_eye_pos_R_display?: V3;
+  position_guide_L?: V3; position_guide_R?: V3;
   gaze_point_3d_L_mm?: V3; gaze_point_3d_R_mm?: V3;
   gaze_point_2d_norm?: V2;
   gaze_point_2d_L_norm?: V2; gaze_point_2d_R_norm?: V2;
@@ -1162,10 +1163,10 @@ function snapshotSample(s: GazeSample): CollectedSample {
     validity_L: s.validity_L, validity_R: s.validity_R,
     pupil_diameter_L_mm: s.pupil_diameter_L_mm, pupil_diameter_R_mm: s.pupil_diameter_R_mm,
     eye_origin_L_mm: cp3(s.eye_origin_L_mm), eye_origin_R_mm: cp3(s.eye_origin_R_mm),
-    eye_origin_raw_L_mm: cp3(s.eye_origin_raw_L_mm), eye_origin_raw_R_mm: cp3(s.eye_origin_raw_R_mm),
+    eyeball_centre_L_mm: cp3(s.eyeball_centre_L_mm), eyeball_centre_R_mm: cp3(s.eyeball_centre_R_mm),
     eye_origin_L_display_mm: cp3(s.eye_origin_L_display_mm), eye_origin_R_display_mm: cp3(s.eye_origin_R_display_mm),
     trackbox_eye_pos_L: cp3(s.trackbox_eye_pos_L), trackbox_eye_pos_R: cp3(s.trackbox_eye_pos_R),
-    trackbox_eye_pos_L_display: cp3(s.trackbox_eye_pos_L_display), trackbox_eye_pos_R_display: cp3(s.trackbox_eye_pos_R_display),
+    position_guide_L: cp3(s.position_guide_L), position_guide_R: cp3(s.position_guide_R),
     gaze_point_3d_L_mm: cp3(s.gaze_point_3d_L_mm), gaze_point_3d_R_mm: cp3(s.gaze_point_3d_R_mm),
     gaze_point_2d_norm: cp2(s.gaze_point_2d_norm),
     gaze_point_2d_L_norm: cp2(s.gaze_point_2d_L_norm), gaze_point_2d_R_norm: cp2(s.gaze_point_2d_R_norm),
