@@ -10,6 +10,7 @@ current fixation. Hyprland only for now (IPC socket).
 tobiifree-warp                 # server (same as `tobiifree-warp serve`)
 tobiifree-warp jump            # move the cursor to the gaze
 tobiifree-warp jump --dry-run  # print the target, don't move
+tobiifree-warp follow-start / follow-stop   # cursor follows the gaze while a key is held
 ```
 
 Hyprland binding (hyprland.lua):
@@ -20,6 +21,105 @@ hl.bind("SUPER + G", hl.dsp.exec_cmd("tobiifree-warp jump"))
 
 (or `bind = SUPER, G, exec, tobiifree-warp jump` with a hyprlang config).
 `kill -USR1 <server pid>` triggers a jump too.
+
+## Follow mode (hold a key)
+
+```shell
+tobiifree-warp follow-start   # key press: the cursor follows the gaze...
+tobiifree-warp follow-stop    # key release: ...and stays where it is
+```
+
+Hyprland binds (hyprland.lua). The release bind ignores modifiers, so it
+fires whether SUPER or G is released first; the flag keeps ordinary `g`
+key releases from spawning anything:
+
+```lua
+local gazeFollowing = false
+hl.bind("SUPER + G", function()
+	gazeFollowing = true
+	hl.exec_cmd("tobiifree-warp follow-start")
+end)
+hl.bind("G", function()
+	if gazeFollowing then
+		gazeFollowing = false
+		hl.exec_cmd("tobiifree-warp follow-stop")
+	end
+end, { release = true, ignore_mods = true, non_consuming = true })
+```
+
+### MAGIC pointing (gaze for the jump, pointer for the last degrees)
+
+`follow-start --min-distance-deg N` (N > 0): while following, the cursor
+moves to the gaze only when the gaze is more than N° (visual angle at the
+eye's distance, screen size from tobii.json) from where the cursor is; once
+moved it sits at the gaze, so gaze changes within N° leave it alone and a
+trackpad/mouse can do the fine positioning. The cursor position is read from
+Hyprland (`cursorpos`, ~0.1 ms) before every candidate move, not tracked
+from what we set: the person moves the pointer during the follow, and a
+stale position would make the gaze snap the cursor back. (In a dry run
+nothing moves, so the position we would have set is used.) Default 0: plain
+follow. `--timeout-ms MS` overrides the server's auto-stop for this follow
+(a finger may rest on the trackpad longer than 10 s). The stop summary
+counts the moves, the samples within N° and the pointer moves by the person.
+
+`--glide-ms N`: a needed move glides from the cursor to the gaze over N ms
+instead of jumping (`--glide-curve inout`, cubic, by default; or `in`). Both
+curves start slowly, so a touch that turns out to be a tap and stops the
+follow early has barely moved the cursor. If the gaze target changes
+mid-glide, the glide retargets with a continuous position and the same end
+time. Steps every `--glide-step-ms` (server option, 8 ms ≈ 120 Hz; a
+Hyprland move costs ~0.4 ms, measured 0.44 ms avg at 120 Hz, 0.31 ms at
+240 Hz).
+
+`--notify-hid`: on the first real move of the follow (at the decision, before
+the first glide step; not at all when nothing moves, never in a dry run),
+write one QMK Raw HID report to the keyboard: payload `'M'` (0x4D) then
+zeros, 32 bytes, written as 33 with the hidraw report ID 0x00 first. The
+board can then tell that its touch moved the cursor and not turn it into a
+click. The device is the hidraw node whose `device/uevent` has
+`HID_ID=0003:0000FEED:00000130` (`--hid-id`) on USB interface 1
+(`--hid-interface N`, or `any` to match the Raw HID usage page `06 60 ff` in
+the report descriptor); it is opened at follow start and kept open. Absent:
+skipped, logged once. `tobiifree-warp hid-probe` prints the node it would
+use (no write).
+
+E.g. a key the keyboard holds while a finger is on its trackpad (F19):
+
+```lua
+hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-start --min-distance-deg 5 --timeout-ms 600000 --glide-ms 100 --notify-hid"), { ignore_mods = true })
+hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-stop"), { release = true, ignore_mods = true })
+```
+
+Safety: follow stops by itself after `--follow-timeout-ms` (10 s; a missed
+release), when tobiifreed goes away, or when a move fails. A new
+`follow-start` replaces a running follow.
+
+Filter, `--follow-filter`:
+
+- `device` (default): the same processing as tobiifree-overlay. On every
+  valid sample the cursor goes straight to the device's temporally filtered
+  combined gaze (`gaze_point_2d_norm`, corrected by the daemon; if it is
+  invalid: the unfiltered combined point, then the valid eye's own point).
+  No dead zone, no confirmation, no easing; a move is skipped only when the
+  pixel does not change. Invalid samples (blinks, eyes lost): the cursor
+  holds.
+- `fixation` (src/follow.zig): a fixation-aware filter. A valid sample
+  within `--radius-deg` (1.5°) of the current fixation joins it; the target
+  is the median of its last `--fix-window` (12) samples and moves only once
+  that median has drifted more than `--deadband-deg` (0.4°). A sample
+  outside starts a candidate, adopted once `--confirm` (2) consecutive
+  samples agree (a saccade lands ~30 ms after the eye; a spike is ignored).
+  The cursor eases at ~120 Hz: `--fix-tau-ms` (80) within a fixation,
+  `--saccade-tau-ms` (0) to a new one, `--first-tau-ms` (60) first move.
+  Stiller, but the dead zone felt uncomfortable in use.
+
+At follow start the monitor layout is read once (with `fixation`, the
+current fixation seeds the filter). The stop reply and the log give a
+summary: updates, moves, time to the first move, Hyprland move cost. Live,
+`device` at 33 Hz: 33 moves/s, 0.54 ms avg / 0.87 ms max per move, sample
+arrival → cursor moved 0.54 ms (Hyprland's socket takes one request per
+connection, so it cannot be kept open; at 33 Hz that is ~2 % of one core's
+time at most, spent in Hyprland and us).
 
 ## How a jump is decided
 
@@ -38,8 +138,13 @@ hl.bind("SUPER + G", hl.dsp.exec_cmd("tobiifree-warp jump"))
   that run.
 - Mid-saccade (run shorter than 2 samples): the jump waits for the eye to
   land, up to `--settle-ms` (200 ms), then gives up.
-- Mapping: gaze is normalised on the display area = the whole output named
-  by `--output` or tobii.json `"output"` (same as tobiifree-overlay/-setup).
+- Output: `--output NAME|desc:DESC`, else tobii.json `"output_desc"` (the
+  monitor's description, matched first) then `"output"` (connector), the
+  same rule as tobiifree-overlay/-setup; tobii.json and Hyprland's monitors
+  are re-read on every jump and follow start, so a connector swap or a new
+  setup needs no restart. The log says how the output matched and warns
+  when the saved connector is stale.
+- Mapping: gaze is normalised on the display area = the whole output.
   Global logical position = output position + norm × logical size (mode
   size, rotated for 90/270° transforms, divided by the scale), rounded and
   clamped to the output. Monitor geometry is read from Hyprland on every
@@ -96,7 +201,14 @@ nix build .#tobiifree-warp
 cd applications/tobiifree-warp && zig build test   # in `nix develop`
 ```
 
-Tests cover the sample selection (window, stale data, saccade rejection,
+Tests cover the glide (curves, duration, continuous retarget), the HID
+notification (once per follow, only on a real move, never dry; report bytes;
+hidraw discovery on a fake sysfs: interface number, descriptor fallback,
+re-discovery), the MAGIC-pointing distance gate (5° at 650 mm on the BenQ ≈
+205 px, diagonal, viewing distance, 0 = always), the follow gaze source (filtered point first, fallbacks), the
+fixation filter (noisy fixation stays put and converges,
+deadband, saccade lands after one confirming sample, spike ignored, drift
+followed), the easing, the follow session timeout, the sample selection (window, stale data, saccade rejection,
 landing after a saccade, degrees vs viewing distance, median, ring wrap),
 gaze extraction (eye validity fallbacks), the norm→global mapping (the
 DP-1 / eDP-1 scale 2 / DP-2 portrait layout, fractional scales, clamping) and

@@ -12,11 +12,19 @@ tobiifree-setup --step validate # one step only: display | calibrate | validate
 ```
 
 The window is a layer-shell OVERLAY surface covering the whole output, with
-exclusive keyboard. Output: `--output NAME`, else `"output"` in
-`~/.config/tobii.json` (written by the tool when step 1 is confirmed;
-tobiifreed keeps the key when it rewrites the file), else the focused output
-(Hyprland), else the first one. Everything is computed in physical pixels of
-that output (logical size × monitor scale, fractional scales included).
+exclusive keyboard. Output: `--output NAME|desc:DESC`, else `"output_desc"`
+then `"output"` in `~/.config/tobii.json` (both written by the tool when
+step 1 is confirmed; tobiifreed keeps the keys when it rewrites the file),
+else the focused output (Hyprland), else the first one. Everything is
+computed in physical pixels of that output (logical size × monitor scale,
+fractional scales included).
+
+Connector names can swap across reboots (DP-1 ↔ DP-2), so tobiifree-setup
+saves the monitor's identity too (`"output_desc"`, make model serial as in
+Hyprland's `desc:` rules, e.g. `"BNQ BenQ XL2430T R9F02179SL0"`). The
+description is matched first, then the connector; the log says which one
+matched and warns when the saved connector now names another screen.
+`--output` takes a connector or `desc:<description>`.
 
 Without `--output`, step 1 starts with a **screen picker**: a drop-down of
 the outputs (connector, model/description, logical size, scale; the saved one

@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const output_id = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/output_id.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const root = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -40,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "tobiifree_core", .module = tobiifree_core },
             .{ .name = "socket_source", .module = socket_source },
+            .{ .name = "output_id", .module = output_id },
         },
     });
     const exe = b.addExecutable(.{ .name = "tobiifree-warp", .root_module = root });
@@ -53,5 +60,7 @@ pub fn build(b: *std.Build) void {
     // Sample selection, layout mapping, gaze extraction (src/main.zig pulls
     // them in).
     const tests = b.addTest(.{ .root_module = root });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = output_id })).step);
 }

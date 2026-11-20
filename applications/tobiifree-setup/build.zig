@@ -86,6 +86,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Which screen is the tracker's (description, then connector).
+    const output_id = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/output_id.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tobiifree-setup",
         .root_module = b.createModule(.{
@@ -97,6 +104,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "daemon_protocol", .module = daemon_protocol },
                 .{ .name = "socket_source", .module = socket_source },
                 .{ .name = "correction", .module = correction },
+                .{ .name = "output_id", .module = output_id },
             },
         }),
     });

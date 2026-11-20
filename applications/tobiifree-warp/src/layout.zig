@@ -6,6 +6,9 @@ const std = @import("std");
 
 pub const Monitor = struct {
     name: []const u8,
+    /// Make, model and serial as the compositor describes the monitor
+    /// (identity; connector names can swap across reboots).
+    desc: []const u8 = "",
     /// Global logical position of the top-left corner.
     x: f64,
     y: f64,
@@ -49,6 +52,7 @@ pub fn find(monitors: []const Monitor, name: []const u8) ?Monitor {
 
 const HyprMonitor = struct {
     name: []const u8,
+    description: []const u8 = "",
     width: f64,
     height: f64,
     x: f64,
@@ -80,7 +84,7 @@ pub fn parseHyprMonitors(gpa: std.mem.Allocator, json: []const u8) !Parsed {
     for (list) |h| {
         if (h.disabled) continue;
         if (h.focused) focused = n;
-        out[n] = .{ .name = h.name, .x = h.x, .y = h.y, .width = h.width, .height = h.height, .scale = h.scale, .transform = h.transform };
+        out[n] = .{ .name = h.name, .desc = h.description, .x = h.x, .y = h.y, .width = h.width, .height = h.height, .scale = h.scale, .transform = h.transform };
         n += 1;
     }
     return .{ .arena = arena, .monitors = out[0..n], .focused = focused };
@@ -144,7 +148,7 @@ test "fractional scales" {
 test "parse Hyprland monitors JSON" {
     const json =
         \\[{"id":0,"name":"eDP-1","width":3200,"height":2000,"x":3000,"y":645,"scale":2.00,"transform":0,"focused":false,"disabled":false,"reserved":[0,38,0,0],"activeWorkspace":{"id":1,"name":"1"}},
-        \\ {"id":1,"name":"DP-1","width":1920,"height":1080,"x":1080,"y":565,"scale":1.00,"transform":0,"focused":true,"disabled":false},
+        \\ {"id":1,"name":"DP-1","description":"BNQ BenQ XL2430T R9F02179SL0","width":1920,"height":1080,"x":1080,"y":565,"scale":1.00,"transform":0,"focused":true,"disabled":false},
         \\ {"id":2,"name":"DP-2","width":1920,"height":1080,"x":0,"y":0,"scale":1.00,"transform":1,"focused":false,"disabled":false},
         \\ {"id":3,"name":"HDMI-A-1","width":1920,"height":1080,"x":0,"y":0,"scale":1,"transform":0,"focused":false,"disabled":true}]
     ;
@@ -153,6 +157,8 @@ test "parse Hyprland monitors JSON" {
     try testing.expectEqual(@as(usize, 3), p.monitors.len);
     try testing.expectEqual(@as(?usize, 1), p.focused);
     const m = find(p.monitors, "DP-1").?;
+    try testing.expectEqualStrings("BNQ BenQ XL2430T R9F02179SL0", m.desc);
+    try testing.expectEqualStrings("", find(p.monitors, "DP-2").?.desc);
     try expectPt(.{ 2040, 1105 }, mapNorm(m, 0.5, 0.5));
     try expectPt(.{ 540, 960 }, mapNorm(find(p.monitors, "DP-2").?, 0.5, 0.5));
     try testing.expectEqual(@as(?Monitor, null), find(p.monitors, "HDMI-A-1"));

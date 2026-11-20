@@ -79,6 +79,12 @@ pub fn build(b: *std.Build) void {
     usb_source.addImport("gaze_source", gaze_source);
     socket_source.addImport("gaze_source", gaze_source);
 
+    const output_id = b.createModule(.{
+        .root_source_file = b.path("../../driver/src/output_id.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "tobiifree-overlay",
         .root_module = b.createModule(.{
@@ -90,6 +96,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "gaze_source", .module = gaze_source },
                 .{ .name = "usb_source", .module = usb_source },
                 .{ .name = "socket_source", .module = socket_source },
+                .{ .name = "output_id", .module = output_id },
             },
         }),
     });

@@ -33,8 +33,16 @@ zig build run
 
 ## Output
 
-The overlay covers `--output NAME`, else the `"output"` of `~/.config/tobii.json`
-(the screen chosen in tobiifree-setup), else the largest monitor.
+The overlay covers `--output NAME|desc:DESC`, else the `"output_desc"` /
+`"output"` of `~/.config/tobii.json` (the screen chosen in tobiifree-setup),
+else the largest monitor.
+
+Connector names can swap across reboots (DP-1 ↔ DP-2), so tobiifree-setup
+saves the monitor's identity too (`"output_desc"`, make model serial as in
+Hyprland's `desc:` rules, e.g. `"BNQ BenQ XL2430T R9F02179SL0"`). The
+description is matched first, then the connector; the log says which one
+matched and warns when the saved connector now names another screen.
+`--output` takes a connector or `desc:<description>`.
 
 ## Wayland / X11
 

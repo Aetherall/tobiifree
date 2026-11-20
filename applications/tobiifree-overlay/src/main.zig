@@ -5,6 +5,7 @@
 // Renders the gaze dot with cairo in a single GtkDrawingArea.
 
 const std = @import("std");
+const output_id = @import("output_id");
 const core = @import("tobiifree_core");
 const GazeSource = @import("gaze_source").GazeSource;
 const UsbSource = @import("usb_source").UsbSource;
@@ -41,9 +42,11 @@ var socket_source: SocketSource = undefined;
 var source: GazeSource = undefined;
 var gtk_app: ?*c.GApplication = null;
 var quit: bool = false;
-/// Output to cover: --output NAME, else "output" of tobii.json (written by
-/// tobiifree-setup), else the largest monitor.
-var want_output: ?[]const u8 = null;
+/// Output to cover: --output NAME|desc:DESC, else "output_desc" then
+/// "output" of tobii.json (written by tobiifree-setup), else the largest
+/// monitor. See driver/src/output_id.zig.
+var opt_output: ?[]const u8 = null;
+var want_output: output_id.Want = .{};
 
 // ─── Tracker callback ───────────────────────────────────────────────
 
@@ -149,18 +152,18 @@ fn activate(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 
     // Pin the overlay to the configured output, else the largest monitor.
     const display = c.gdk_display_get_default();
-    if (want_output) |name| if (display) |d| {
-        if (monitorByConnector(d, name)) |m| {
+    if (!want_output.isEmpty()) if (display) |d| {
+        if (monitorByWant(d, want_output)) |m| {
             var geo: c.GdkRectangle = undefined;
             c.gdk_monitor_get_geometry(m, &geo);
             screen_w = @floatFromInt(geo.width);
             screen_h = @floatFromInt(geo.height);
             c.gtk_layer_set_monitor(@ptrCast(window), m);
-            log.info("overlay: output {s}, {d:.0}x{d:.0}", .{ name, screen_w, screen_h });
+            log.info("overlay: {d:.0}x{d:.0}", .{ screen_w, screen_h });
             c.g_object_unref(m);
             return finishActivate(window);
         }
-        log.warn("output {s} not found, using the largest monitor", .{name});
+        log.warn("using the largest monitor", .{});
     };
     if (display) |d| {
         const monitors = c.gdk_display_get_monitors(d);
@@ -211,17 +214,30 @@ fn finishActivate(window: *c.GtkWidget) void {
     _ = c.g_idle_add(@as(c.GSourceFunc, @ptrCast(&pollTracker)), null);
 }
 
-/// Monitor whose connector is `name` (caller unrefs), or null.
-fn monitorByConnector(d: *c.GdkDisplay, name: []const u8) ?*c.GdkMonitor {
+/// The wanted monitor, by description then connector (caller unrefs), or
+/// null. Logs how it matched (and a stale connector in tobii.json).
+fn monitorByWant(d: *c.GdkDisplay, want: output_id.Want) ?*c.GdkMonitor {
     const mons = c.gdk_display_get_monitors(d) orelse return null;
-    const n = c.g_list_model_get_n_items(mons);
+    const n = @min(c.g_list_model_get_n_items(mons), 16);
+    var items: [16]*c.GdkMonitor = undefined;
+    var cands: [16]output_id.Candidate = undefined;
+    var k: usize = 0;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
-        if (c.gdk_monitor_get_connector(m)) |conn| if (std.mem.eql(u8, std.mem.span(conn), name)) return m;
-        c.g_object_unref(m);
+        items[k] = m;
+        cands[k] = .{
+            .connector = if (c.gdk_monitor_get_connector(m)) |x| std.mem.span(x) else "",
+            .desc = if (c.gdk_monitor_get_description(m)) |x| std.mem.span(x) else "",
+        };
+        k += 1;
     }
-    return null;
+    const r = output_id.resolve(cands[0..k], want);
+    var buf: [512]u8 = undefined;
+    const line = output_id.explain(&buf, cands[0..k], want, r);
+    if (r == null or r.?.stale) log.warn("{s}", .{line}) else log.info("{s}", .{line});
+    for (items[0..k], 0..) |m, j| if (r == null or r.?.index != j) c.g_object_unref(m);
+    return if (r) |x| items[x.index] else null;
 }
 
 // ─── Signal handling ─────────────────────────────────────────────────
@@ -246,6 +262,7 @@ fn installSignalHandlers() void {
 const Config = struct {
     display_area: ?std.json.Value = null,
     output: ?[]const u8 = null,
+    output_desc: ?[]const u8 = null,
 };
 
 fn loadConfig() ?std.json.Parsed(Config) {
@@ -424,14 +441,16 @@ pub fn main() void {
         } else if (std.mem.eql(u8, arg, "--socket")) {
             mode = .socket;
         } else if (std.mem.eql(u8, arg, "--output")) {
-            want_output = args.next();
+            opt_output = args.next();
         }
     }
 
     const cfg = loadConfig();
-    if (want_output == null) if (cfg) |p| {
-        want_output = p.value.output;
-    };
+    if (opt_output) |spec| {
+        want_output = output_id.parseSpec(spec);
+    } else if (cfg) |p| {
+        want_output = .{ .connector = p.value.output, .desc = p.value.output_desc };
+    }
     const display = displayAreaFromConfig(cfg);
     if (cfg != null) {
         log.info("config: loaded from ~/{s}", .{CONFIG_PATH});
