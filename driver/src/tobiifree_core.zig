@@ -1054,66 +1054,69 @@ const KIND_FIXED16X16: u32 = 4;
 ///   display-space: tracker-space shifted by the display_area offset.
 ///   normalized 2D: ray→plane intersection on display_area, [0,1]².
 ///
-/// Eye origins:
-///   0x17/0x18  raw (pre-calibration) eye position from pupil/glint detection
-///   0x02/0x08  calibrated eye position (post onboard model, ~1-5mm correction)
-///   0x22/0x24  calibrated eye position in display_area frame
+/// Eye positions:
+///   0x02/0x08  gaze origin: start of the gaze ray
+///   0x17/0x18  eyeball centre: gaze origin − 4.6 mm · optical axis, so
+///              unit(origin − centre) is the optical axis and the gaze ray is
+///              it rotated by the calibration's foveal angles
+///   0x22/0x24  gaze origin in display_area frame
 ///
 /// "Gaze directions" — misleading column name: NOT direction vectors.
 ///   These encode the eye's normalized position in the track box
 ///   (d ≈ linear_transform(eye_origin), reconstruction error ~4mm):
 ///   0x03/0x09  normalized track-box eye position (per-eye scaling)
-///   0x25/0x27  same in display-space (observed as zeros on tested firmware)
+///   0x25/0x27  user position guide (observed as zeros on tested firmware)
 ///
 /// 3D intersection:
 ///   0x04/0x0a  ray–plane hit in tracker-space (mm)
 ///
 /// 2D projection:
 ///   0x05/0x0b  per-eye projection on display_area [0,1]²
-///   0x20       combined binocular 2D before temporal filtering
+///   0x20       combined binocular 2D before temporal smoothing
 ///   0x1c       combined binocular 2D after temporal smoothing (final output)
-///   0x19/0x1a  unused slots (always -1,-1)
+///   0x19/0x1a  eye 2D position relative to the sensor area (always -1,-1 here)
 ///
 /// Scalars:
 ///   0x06/0x0c  pupil diameter (mm), -1 when invalid
-///   0x29/0x2b  unused (always -1)
+///   0x29/0x2b  absolute eye openness (always -1 here)
 ///
 /// Flags (u32):
 ///   0x07/0x0d  validity (0=valid, 4=not detected)
-///   0x15/0x16  eye present (1=detected, 0=absent)
-///   0x1b       binocular flag (1=both eyes, 0=mono/none)
-///   0x1d-0x1f  per-output 2D validity (1=valid)
-///   0x21       unfiltered 2D validity
-///   0x23/0x26/0x28  display-space data validity
+///   0x16/0x15  L/R gaze origin tracker validity (1=valid)
+///   0x1b       combined gaze (0x1c) validity
+///   0x1d/0x1e  L/R track-box position (0x03/0x09) validity
+///   0x1f       unfiltered combined 2D (0x20) validity
+///   0x21/0x23  L/R gaze origin display (0x22/0x24) validity
+///   0x26/0x28  L/R user position guide validity
 ///   0x11       tracking mode (always 4)
 ///   0x0e       unknown status
-///   0x2a/0x2c  unused scalar validity (always 0)
+///   0x2a/0x2c  L/R eye openness validity (always 0)
 fn columnKind(col: u32) ?u32 {
     return switch (col) {
         0x01 => KIND_S64, // timestamp_us
         0x02, 0x03, 0x04, // L: calibrated origin, gaze dir (eye-model coords), 3D hit
         0x08, 0x09, 0x0a, // R: calibrated origin, gaze dir (eye-model coords), 3D hit
-        0x17, 0x18,       // L/R: raw (pre-calibration) eye origin
+        0x17, 0x18,       // L/R: eyeball centre (origin − 4.6 mm · optical axis)
         0x22, 0x24,       // L/R: calibrated eye origin (display-space)
         0x25, 0x27,       // L/R: gaze direction (display-space)
         => KIND_POINT3D,
         0x05, 0x0b,       // L/R: per-eye 2D projection
         0x1c,             // combined 2D filtered (final output)
         0x20,             // combined 2D unfiltered
-        0x19, 0x1a,       // unused 2D slots
+        0x19, 0x1a,       // L/R: 2D position relative to sensor area (unused here)
         => KIND_POINT2D,
         0x06, 0x0c,       // L/R: pupil diameter
-        0x29, 0x2b,       // unused scalars
+        0x29, 0x2b,       // L/R: absolute eye openness (unused here)
         => KIND_FIXED16X16,
         0x07, 0x0d,       // L/R: validity
         0x0e, 0x11,       // tracking status/mode
         0x14,             // frame counter
-        0x15, 0x16,       // L/R: eye present flag
-        0x1b,             // binocular flag
-        0x1d, 0x1e, 0x1f, // 2D validity flags
-        0x21,             // unfiltered 2D validity
-        0x23, 0x26, 0x28, // display-space validity
-        0x2a, 0x2c,       // unused scalar validity
+        0x15, 0x16,       // R/L: gaze origin tracker validity
+        0x1b,             // combined gaze validity
+        0x1d, 0x1e, 0x1f, // L/R track-box position, unfiltered 2D validity
+        0x21,             // L gaze origin display validity
+        0x23, 0x26, 0x28, // R gaze origin display, L/R position guide validity
+        0x2a, 0x2c,       // L/R eye openness validity
         => KIND_U32,
         else => null,
     };
@@ -1278,8 +1281,8 @@ pub const GAZE_BIT_CORRECTED: u32            = 1 << 22;
 ///   display-space: tracker-space shifted by display_area offset.
 ///   normalized 2D: ray→plane intersection on display_area, [0,1]².
 ///
-/// The onboard calibration model applies a ~1-5mm correction to eye
-/// origins (raw → calibrated). The fields here are post-calibration.
+/// eye_origin_raw_* is the eyeball centre: eye_origin − 4.6 mm
+/// along the optical axis, not an uncalibrated origin.
 pub const GazeSample = extern struct {
     present_mask: u32,             // bitmask of GAZE_BIT_* flags
     frame_counter: u32,            // monotonic frame index
@@ -1301,8 +1304,8 @@ pub const GazeSample = extern struct {
     eye_origin_R_display_mm: [3]f64, // calibrated right eye position (display-space)
     trackbox_eye_pos_L_display: [3]f64, // normalized track-box position (display-space)
     trackbox_eye_pos_R_display: [3]f64, // normalized track-box position (display-space)
-    eye_origin_raw_L_mm: [3]f64,       // pre-calibration left eye position (tracker-space)
-    eye_origin_raw_R_mm: [3]f64,       // pre-calibration right eye position (tracker-space)
+    eye_origin_raw_L_mm: [3]f64,       // left eyeball centre: eye_origin_L − 4.6 mm · optical axis
+    eye_origin_raw_R_mm: [3]f64,       // right eyeball centre: eye_origin_R − 4.6 mm · optical axis
     gaze_point_2d_unfiltered: [2]f64,  // combined 2D gaze before temporal smoothing
 };
 
@@ -1430,12 +1433,12 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
                 gaze_sample.trackbox_eye_pos_R_display = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_R_DISP;
             },
-            0x17 => { // eye_origin_raw_L — pre-calibration left eye position (tracker-space)
+            0x17 => { // eye_origin_raw_L — left eyeball centre (tracker-space)
                 const v = r.readPoint3d() catch return true;
                 gaze_sample.eye_origin_raw_L_mm = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_L;
             },
-            0x18 => { // eye_origin_raw_R — pre-calibration right eye position (tracker-space)
+            0x18 => { // eye_origin_raw_R — right eyeball centre (tracker-space)
                 const v = r.readPoint3d() catch return true;
                 gaze_sample.eye_origin_raw_R_mm = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_R;
