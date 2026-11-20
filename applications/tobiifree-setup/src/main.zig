@@ -30,6 +30,7 @@ const config = @import("config.zig");
 const fixation = @import("fixation.zig");
 const refine = @import("refine.zig");
 const corr = @import("correction");
+const output_id = @import("output_id");
 
 const c = @cImport({
     @cInclude("gtk/gtk.h");
@@ -47,8 +48,9 @@ const usage =
     \\Fullscreen configurator for the Tobii ET5 (needs tobiifreed running).
     \\
     \\Options:
-    \\  --output NAME   output (connector) the tracker is mounted on, e.g. DP-1.
-    \\                  Default: "output" in ~/.config/tobii.json, else the
+    \\  --output NAME   output the tracker is mounted on: a connector (DP-1) or
+    \\                  desc:<monitor description> (as in Hyprland's desc: rules).
+    \\                  Default: "output_desc", then "output" in ~/.config/tobii.json, else the
     \\                  focused output (Hyprland), else the first one.
     \\  --gap MM        (experiments) vertical offset of the screen's bottom edge
     \\                  in the tracker frame, mm. Default: "gap_mm" in
@@ -147,6 +149,10 @@ var exit_code: u8 = 0;
 var monitor: ?*c.GdkMonitor = null;
 var mon_name_buf: [64]u8 = undefined;
 var mon_name: []const u8 = "?";
+/// Identity of the chosen output (normalised description), saved as
+/// tobii.json "output_desc".
+var mon_desc_buf: [output_id.MAX_DESC]u8 = undefined;
+var mon_desc: []const u8 = "";
 var width_px: u32 = 1920;
 var height_px: u32 = 1080;
 var mon_scale: f64 = 1;
@@ -249,7 +255,7 @@ fn confirmDisplay() void {
     };
     // Write the output first: the daemon rewrites tobii.json on the set and
     // keeps our key.
-    config.saveSetup(gpa, mon_name, gap_mm) catch |err| log.warn("could not save output/gap to tobii.json: {}", .{err});
+    config.saveSetup(gpa, mon_name, mon_desc, gap_mm) catch |err| log.warn("could not save output/gap to tobii.json: {}", .{err});
     src.setDisplayAreaCorners(a.corners, onAreaSet, null) catch |err| {
         setMsg(true, "Sending the display area failed: {}", .{err});
         return;
@@ -1650,9 +1656,41 @@ fn listMonitors() void {
     while (i < n) : (i += 1) {
         const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
         defer c.g_object_unref(m);
-        const conn = c.gdk_monitor_get_connector(m);
-        std.debug.print("  {s}\n", .{if (conn) |s| std.mem.span(s) else "?"});
+        const conn = if (c.gdk_monitor_get_connector(m)) |s| std.mem.span(s) else "?";
+        var nb: [output_id.MAX_DESC]u8 = undefined;
+        const desc = output_id.normalize(&nb, if (c.gdk_monitor_get_description(m)) |s| std.mem.span(s) else "", conn);
+        std.debug.print("  {s}  desc:{s}\n", .{ conn, desc });
     }
+}
+
+/// The wanted monitor among GDK's (caller unrefs), by description then
+/// connector; logs how it matched. `index` gets its position in the list.
+fn resolveMonitor(want: output_id.Want, index: ?*u32) ?*c.GdkMonitor {
+    const mons = c.gdk_display_get_monitors(c.gdk_display_get_default());
+    const n = @min(c.g_list_model_get_n_items(mons), 16);
+    var items: [16]*c.GdkMonitor = undefined;
+    var pos: [16]u32 = undefined;
+    var cands: [16]output_id.Candidate = undefined;
+    var k: usize = 0;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
+        items[k] = m;
+        pos[k] = i;
+        cands[k] = .{
+            .connector = if (c.gdk_monitor_get_connector(m)) |x| std.mem.span(x) else "",
+            .desc = if (c.gdk_monitor_get_description(m)) |x| std.mem.span(x) else "",
+        };
+        k += 1;
+    }
+    const r = output_id.resolve(cands[0..k], want);
+    var buf: [512]u8 = undefined;
+    const line = output_id.explain(&buf, cands[0..k], want, r);
+    if (r == null or r.?.stale) log.warn("{s}", .{line}) else log.info("{s}", .{line});
+    for (items[0..k], 0..) |m, j| if (r == null or r.?.index != j) c.g_object_unref(m);
+    const x = r orelse return null;
+    if (index) |p| p.* = pos[x.index];
+    return items[x.index];
 }
 
 fn firstMonitor() ?*c.GdkMonitor {
@@ -1662,19 +1700,21 @@ fn firstMonitor() ?*c.GdkMonitor {
 }
 
 fn pickMonitor() ?*c.GdkMonitor {
-    if (opt_output) |name| {
-        if (findMonitor(name)) |m| return m;
-        std.debug.print("tobiifree-setup: no output named {s}; outputs:\n", .{name});
+    if (opt_output) |spec| {
+        if (resolveMonitor(output_id.parseSpec(spec), null)) |m| return m;
+        std.debug.print("tobiifree-setup: no output {s}; outputs:\n", .{spec});
         listMonitors();
         return null;
     }
-    if (config.loadOutput(gpa)) |name| {
-        defer gpa.free(name);
-        if (findMonitor(name)) |m| {
-            log.info("output {s} (from tobii.json)", .{name});
+    const saved = config.loadOutput(gpa);
+    defer saved.free(gpa);
+    const want: output_id.Want = .{ .connector = saved.connector, .desc = saved.desc };
+    if (!want.isEmpty()) {
+        if (resolveMonitor(want, null)) |m| {
+            log.info("output from tobii.json", .{});
             return m;
         }
-        log.warn("output {s} from tobii.json is not connected, using the focused one", .{name});
+        log.warn("the output in tobii.json is not connected, using the focused one", .{});
     }
     if (hyprFocusedOutput()) |name| {
         defer gpa.free(name);
@@ -1693,6 +1733,7 @@ fn useMonitor(m: *c.GdkMonitor) void {
     const len = @min(name.len, mon_name_buf.len);
     @memcpy(mon_name_buf[0..len], name[0..len]);
     mon_name = mon_name_buf[0..len];
+    mon_desc = output_id.normalize(&mon_desc_buf, if (c.gdk_monitor_get_description(m)) |s| std.mem.span(s) else "", name);
     var g: c.GdkRectangle = undefined;
     c.gdk_monitor_get_geometry(m, &g);
     mon_scale = c.gdk_monitor_get_scale(m);
@@ -1701,7 +1742,7 @@ fn useMonitor(m: *c.GdkMonitor) void {
     mon_mm = .{ c.gdk_monitor_get_width_mm(m), c.gdk_monitor_get_height_mm(m) };
     draw_scale = mon_scale;
     ui = @max(1.0, mon_scale);
-    log.info("output {s}: {d}x{d} logical, scale {d:.3} -> {d}x{d} px, {d}x{d} mm", .{ mon_name, g.width, g.height, mon_scale, width_px, height_px, mon_mm[0], mon_mm[1] });
+    log.info("output {s} ({s}): {d}x{d} logical, scale {d:.3} -> {d}x{d} px, {d}x{d} mm", .{ mon_name, mon_desc, g.width, g.height, mon_scale, width_px, height_px, mon_mm[0], mon_mm[1] });
 }
 
 // ─── Screen picker (before step 1) ──────────────────────────────────
@@ -1750,15 +1791,19 @@ fn monitorLabel(buf: *[200:0]u8, m: *c.GdkMonitor, saved: bool, here: bool) void
 fn buildPicker(ov: *c.GtkOverlay, preselect: *c.GdkMonitor) void {
     const mons = c.gdk_display_get_monitors(c.gdk_display_get_default());
     const n = @min(c.g_list_model_get_n_items(mons), MAX_MONS);
+    // The saved screen, matched like everywhere (description, then connector).
     const saved = config.loadOutput(gpa);
-    defer if (saved) |x| gpa.free(x);
+    defer saved.free(gpa);
+    var saved_i: u32 = std.math.maxInt(u32);
+    const want: output_id.Want = .{ .connector = saved.connector, .desc = saved.desc };
+    if (!want.isEmpty()) if (resolveMonitor(want, &saved_i)) |sm| c.g_object_unref(sm);
     var pre: u32 = 0;
     pick_n = 0;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         const m: *c.GdkMonitor = @ptrCast(@alignCast(c.g_list_model_get_item(mons, i) orelse continue));
         const conn = if (c.gdk_monitor_get_connector(m)) |x| std.mem.span(x) else "";
-        const is_saved = saved != null and std.mem.eql(u8, saved.?, conn);
+        const is_saved = i == saved_i;
         const is_here = pick_here != null and std.mem.eql(u8, pick_here.?, conn);
         monitorLabel(&pick_labels[pick_n], m, is_saved, is_here);
         pick_ptrs[pick_n] = &pick_labels[pick_n];

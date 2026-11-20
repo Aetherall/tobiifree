@@ -26,6 +26,7 @@ const select = @import("select.zig");
 const layout = @import("layout.zig");
 const gaze = @import("gaze.zig");
 const follow = @import("follow.zig");
+const output_id = @import("output_id");
 const Backend = @import("backend.zig").Backend;
 const Hyprland = @import("backend.zig").Hyprland;
 
@@ -102,6 +103,8 @@ fn client(verb: []const u8, dry: bool) u8 {
 // ── Config ──────────────────────────────────────────────────────────
 
 const Opts = struct {
+    /// --output: a connector or "desc:<description>". Without it, tobii.json
+    /// "output_desc" / "output" (re-read on every jump / follow start).
     output: ?[]const u8 = null,
     dry_run: bool = false,
     params: select.Params = .{},
@@ -116,14 +119,19 @@ const Opts = struct {
     follow_timeout_ms: i64 = 10_000,
 };
 
-/// tobii.json: "output" (the screen the tracker is on) and the display area
-/// size in mm (degrees for the dispersion threshold).
-fn loadTobiiJson(gpa: std.mem.Allocator, o: *Opts) void {
-    const home = posix.getenv("HOME") orelse return;
+fn loadTobiiText(gpa: std.mem.Allocator) ?[]u8 {
+    const home = posix.getenv("HOME") orelse return null;
     var buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "{s}/.config/tobii.json", .{home}) catch return;
-    const text = std.fs.cwd().readFileAlloc(gpa, path, 1 << 20) catch |err| {
-        log.warn("{s}: {}", .{ path, err });
+    const path = std.fmt.bufPrint(&buf, "{s}/.config/tobii.json", .{home}) catch return null;
+    return std.fs.cwd().readFileAlloc(gpa, path, 1 << 20) catch null;
+}
+
+/// tobii.json: the display area size in mm (degrees for the dispersion
+/// threshold). The output is resolved per jump (resolveOutput).
+fn loadTobiiJson(gpa: std.mem.Allocator, o: *Opts) void {
+    const path = "~/.config/tobii.json";
+    const text = loadTobiiText(gpa) orelse {
+        log.warn("{s}: not readable, default screen size", .{path});
         return;
     };
     defer gpa.free(text);
@@ -133,9 +141,6 @@ fn loadTobiiJson(gpa: std.mem.Allocator, o: *Opts) void {
     };
     defer v.deinit();
     if (v.value != .object) return;
-    if (o.output == null) if (v.value.object.get("output")) |out| if (out == .string) {
-        o.output = gpa.dupe(u8, out.string) catch null;
-    };
     if (v.value.object.get("display_area")) |da| if (da == .object) {
         if (num(da.object.get("w_mm"))) |w| o.params.width_mm = w;
         if (num(da.object.get("h_mm"))) |h| o.params.height_mm = h;
@@ -196,6 +201,9 @@ const Server = struct {
     corrected: ?bool = null,
     pending: ?Jump = null,
     follow: ?Follow = null,
+    /// Last output resolution logged.
+    out_note: [512]u8 = undefined,
+    out_note_len: usize = 0,
     listen_fd: posix.fd_t,
     sig_fd: posix.fd_t,
     path: [:0]const u8,
@@ -402,15 +410,7 @@ const Server = struct {
             return self.finish(j, msg);
         };
         defer mons.deinit();
-        const mon: layout.Monitor = blk: {
-            if (self.opts.output) |name| {
-                if (layout.find(mons.monitors, name)) |m| break :blk m;
-                const msg = std.fmt.bufPrint(&msg_buf, "noop output {s} not present", .{name}) catch "noop";
-                return self.finish(j, msg);
-            }
-            if (mons.focused) |f| break :blk mons.monitors[f];
-            return self.finish(j, "noop no output");
-        };
+        const mon = self.resolveOutput(&mons) orelse return self.finish(j, "noop tracker's output not present");
         const t_mons = nowNs();
         const p = layout.mapNorm(mon, pick.x, pick.y);
         const detail = std.fmt.bufPrint(&msg_buf, "{d:.0},{d:.0} on {s} (gaze {d:.3},{d:.3}, {d}/{d} samples, {d:.2} deg, newest {d:.0} ms)", .{
@@ -437,6 +437,46 @@ const Server = struct {
         self.finish(j, msg);
     }
 
+    // ── Output ──────────────────────────────────────────────────────
+
+    /// The tracker's output among the current monitors: --output, else
+    /// tobii.json's "output_desc" then "output" (re-read each time, so a
+    /// new setup or a connector swap needs no restart), else the focused
+    /// monitor. Logs when the outcome changes.
+    fn resolveOutput(self: *Server, mons: *const layout.Parsed) ?layout.Monitor {
+        var saved: output_id.Saved = .{};
+        defer saved.free(self.gpa);
+        const want: output_id.Want = if (self.opts.output) |spec| output_id.parseSpec(spec) else blk: {
+            if (loadTobiiText(self.gpa)) |text| {
+                defer self.gpa.free(text);
+                saved = output_id.parseSaved(self.gpa, text);
+            }
+            break :blk saved.want();
+        };
+        if (want.isEmpty()) {
+            const f = mons.focused orelse return null;
+            self.noteOutput("no output configured, using the focused one", false);
+            return mons.monitors[f];
+        }
+        var cands: [16]output_id.Candidate = undefined;
+        const n = @min(mons.monitors.len, cands.len);
+        for (mons.monitors[0..n], 0..) |m, i| cands[i] = .{ .connector = m.name, .desc = m.desc };
+        const r = output_id.resolve(cands[0..n], want);
+        var buf: [512]u8 = undefined;
+        self.noteOutput(output_id.explain(&buf, cands[0..n], want, r), r == null or r.?.stale);
+        const m = r orelse return null;
+        return mons.monitors[m.index];
+    }
+
+    /// Log `line` once (until it changes).
+    fn noteOutput(self: *Server, line: []const u8, warn: bool) void {
+        if (std.mem.eql(u8, line, self.out_note[0..self.out_note_len])) return;
+        const k = @min(line.len, self.out_note.len);
+        @memcpy(self.out_note[0..k], line[0..k]);
+        self.out_note_len = k;
+        if (warn) log.warn("{s}", .{line}) else log.info("{s}", .{line});
+    }
+
     // ── Follow mode ─────────────────────────────────────────────────
 
     fn startFollow(self: *Server, j: Jump) void {
@@ -448,16 +488,9 @@ const Server = struct {
             const msg = std.fmt.bufPrint(&msg_buf, "noop compositor unreachable ({})", .{err}) catch "noop";
             return self.finish(j, msg);
         };
-        const mon: layout.Monitor = blk: {
-            if (self.opts.output) |name| {
-                if (layout.find(mons.monitors, name)) |m| break :blk m;
-                mons.deinit();
-                const msg = std.fmt.bufPrint(&msg_buf, "noop output {s} not present", .{name}) catch "noop";
-                return self.finish(j, msg);
-            }
-            if (mons.focused) |f| break :blk mons.monitors[f];
+        const mon = self.resolveOutput(&mons) orelse {
             mons.deinit();
-            return self.finish(j, "noop no output");
+            return self.finish(j, "noop tracker's output not present");
         };
         const cur = if (j.dry) layout.mapNorm(mon, 0.5, 0.5) else self.backend.cursorPos() catch layout.mapNorm(mon, 0.5, 0.5);
         self.follow = .{
@@ -676,7 +709,7 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
     });
     log.info("listening on {s}; output {s}, window {d:.0} ms, max dispersion {d:.2} deg, settle {d:.0} ms, display {d:.0}x{d:.0} mm{s}", .{
         path,
-        opts.output orelse "(focused)",
+        opts.output orelse "(tobii.json)",
         opts.params.window_ms,
         opts.params.max_dispersion_deg,
         opts.settle_ms,
@@ -699,7 +732,9 @@ const usage =
     \\       tobiifree-warp follow-stop                ...until this (key release)
     \\
     \\server options:
-    \\  --output NAME             output the tracker is on (default: tobii.json "output")
+    \\  --output NAME|desc:DESC   output the tracker is on, by connector or monitor
+    \\                            description (default: tobii.json "output_desc",
+    \\                            then "output"; the focused one if neither)
     \\  --window-ms MS            gaze history considered on a jump (150)
     \\  --max-dispersion-deg DEG  fixation threshold, max spread of the samples (1.5)
     \\  --stale-ms MS             newest sample older than this: no gaze, do nothing (300)

@@ -95,8 +95,13 @@ time at most, spent in Hyprland and us).
   that run.
 - Mid-saccade (run shorter than 2 samples): the jump waits for the eye to
   land, up to `--settle-ms` (200 ms), then gives up.
-- Mapping: gaze is normalised on the display area = the whole output named
-  by `--output` or tobii.json `"output"` (same as tobiifree-overlay/-setup).
+- Output: `--output NAME|desc:DESC`, else tobii.json `"output_desc"` (the
+  monitor's description, matched first) then `"output"` (connector), the
+  same rule as tobiifree-overlay/-setup; tobii.json and Hyprland's monitors
+  are re-read on every jump and follow start, so a connector swap or a new
+  setup needs no restart. The log says how the output matched and warns
+  when the saved connector is stale.
+- Mapping: gaze is normalised on the display area = the whole output.
   Global logical position = output position + norm × logical size (mode
   size, rotated for 90/270° transforms, divided by the scale), rounded and
   clamped to the output. Monitor geometry is read from Hyprland on every
