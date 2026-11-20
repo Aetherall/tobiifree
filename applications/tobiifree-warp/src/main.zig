@@ -27,6 +27,7 @@ const layout = @import("layout.zig");
 const gaze = @import("gaze.zig");
 const follow = @import("follow.zig");
 const output_id = @import("output_id");
+const hid = @import("hid.zig");
 const Backend = @import("backend.zig").Backend;
 const Hyprland = @import("backend.zig").Hyprland;
 
@@ -67,7 +68,8 @@ fn unixAddr(path: []const u8) !posix.sockaddr.un {
 
 /// Exit status is 0 for every no-op: a key binding has nothing to do with
 /// an error, and the person travels without the tracker.
-fn client(verb: []const u8, dry: bool, min_deg: f64, timeout_ms: f64) u8 {
+/// `extra`: request tokens (" min=5 timeout=600000 glide=100 …").
+fn client(verb: []const u8, dry: bool, extra: []const u8) u8 {
     const t0 = nowNs();
     var path_buf: [512]u8 = undefined;
     const path = controlPath(&path_buf) catch return 0;
@@ -81,14 +83,10 @@ fn client(verb: []const u8, dry: bool, min_deg: f64, timeout_ms: f64) u8 {
     // The server waits at most ~settle_ms for a fixation, then answers.
     const tv = posix.timeval{ .sec = 1, .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    var req: [96]u8 = undefined;
-    var minbuf: [32]u8 = undefined;
-    const min_tok = if (min_deg > 0) std.fmt.bufPrint(&minbuf, " min={d}", .{min_deg}) catch "" else "";
-    var tobuf: [32]u8 = undefined;
-    const to_tok = if (timeout_ms > 0) std.fmt.bufPrint(&tobuf, " timeout={d:.0}", .{timeout_ms}) catch "" else "";
-    const line = std.fmt.bufPrint(&req, "{s} {d}{s}{s}{s}\n", .{ verb, t0, if (dry) " dry" else "", min_tok, to_tok }) catch return 0;
+    var req: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&req, "{s} {d}{s}{s}\n", .{ verb, t0, if (dry) " dry" else "", extra }) catch return 0;
     _ = posix.write(fd, line) catch return 0;
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
         const k = posix.read(fd, buf[n..]) catch break;
@@ -121,6 +119,8 @@ const Opts = struct {
     follow_filter: enum { device, fixation } = .device,
     /// Follow stops by itself after this long (missed key release).
     follow_timeout_ms: i64 = 10_000,
+    /// Keyboard to notify on follow-start --notify-hid.
+    hid: hid.Config = .{},
 };
 
 fn loadTobiiText(gpa: std.mem.Allocator) ?[]u8 {
@@ -175,6 +175,11 @@ const Jump = struct {
     min_deg: f64 = 0,
     /// follow-start --timeout-ms (0: the server's --follow-timeout-ms).
     timeout_ms: i64 = 0,
+    /// follow-start --glide-ms (0: jump / the follow filter's easing).
+    glide_ms: f64 = 0,
+    curve: follow.Curve = .inout,
+    /// follow-start --notify-hid.
+    notify: bool = false,
 };
 
 const Follow = struct {
@@ -201,6 +206,16 @@ const Follow = struct {
     near: usize = 0,
     /// Cursor found away from where we left it (moved by the person).
     moved_by_user: usize = 0,
+    /// --glide-ms: moves glide from the cursor to the target.
+    glide_ms: f64 = 0,
+    curve: follow.Curve = .inout,
+    glide: ?follow.Glide = null,
+    glides: usize = 0,
+    /// --notify-hid: tell the keyboard on the first real move.
+    notify: follow.NotifyOnce = .{ .enabled = false, .dry = false },
+    /// When the notification went out (or failed), for the summary.
+    notify_ms: ?f64 = null,
+    notify_ok: bool = false,
 };
 
 const Server = struct {
@@ -218,6 +233,7 @@ const Server = struct {
     corrected: ?bool = null,
     pending: ?Jump = null,
     follow: ?Follow = null,
+    hid: hid.Notifier,
     /// Last output resolution logged.
     out_note: [512]u8 = undefined,
     out_note_len: usize = 0,
@@ -303,7 +319,7 @@ const Server = struct {
             }
             if (self.follow) |f| {
                 timeout_ms = minTimeout(timeout_ms, @max(0, @divFloor(f.session.deadline() - now, std.time.ns_per_ms) + 1));
-                if (!f.easer.done()) timeout_ms = minTimeout(timeout_ms, self.opts.ease.tick_ms);
+                if (!f.easer.done() or f.glide != null) timeout_ms = minTimeout(timeout_ms, self.opts.ease.tick_ms);
             }
 
             var fds: [3]posix.pollfd = .{
@@ -366,7 +382,13 @@ const Server = struct {
         const verb = it.next() orelse "";
         var j = Jump{ .fd = fd, .t_start = t_recv, .t_recv = t_recv, .dry = self.opts.dry_run };
         while (it.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "timeout=")) {
+            if (std.mem.startsWith(u8, tok, "glide=")) {
+                j.glide_ms = std.math.clamp(std.fmt.parseFloat(f64, tok[6..]) catch 0, 0, 2000);
+            } else if (std.mem.eql(u8, tok, "curve=in")) {
+                j.curve = .in;
+            } else if (std.mem.eql(u8, tok, "notify")) {
+                j.notify = true;
+            } else if (std.mem.startsWith(u8, tok, "timeout=")) {
                 j.timeout_ms = std.fmt.parseInt(i64, tok[8..], 10) catch 0;
                 j.timeout_ms = std.math.clamp(j.timeout_ms, 0, 3600_000);
             } else if (std.mem.startsWith(u8, tok, "min=")) {
@@ -525,11 +547,17 @@ const Server = struct {
             .last_step = nowNs(),
             .last_sent = cur,
             .min_deg = j.min_deg,
+            .glide_ms = j.glide_ms,
+            .curve = j.curve,
+            .notify = .{ .enabled = j.notify, .dry = j.dry },
             .mm_per_px = blk: {
                 const ls = mon.logicalSize();
                 break :blk .{ self.opts.params.width_mm / ls[0], self.opts.params.height_mm / ls[1] };
             },
         };
+        // Open the keyboard now so the notification at the first move is a
+        // single write.
+        if (j.notify and !j.dry) _ = self.hid.prepare();
         // Seed from the current fixation, if any: the cursor sets off at once.
         const f = &self.follow.?;
         var seeded = false;
@@ -540,14 +568,18 @@ const Server = struct {
                 f.first = false;
                 const px = layout.mapNorm(mon, c[0], c[1]);
                 if (follow.farEnough(cur, px, f.mm_per_px, 0, f.min_deg)) {
-                    f.easer.setTarget(px, self.opts.ease.first_tau_ms);
+                    self.moveTo(f, px, self.opts.ease.first_tau_ms);
                     seeded = true;
                 } else f.near += 1;
             },
             else => {},
         };
         var min_buf: [48]u8 = undefined;
-        const min_txt = if (j.min_deg > 0) std.fmt.bufPrint(&min_buf, ", only beyond {d:.1} deg", .{j.min_deg}) catch "" else "";
+        const min_txt = std.fmt.bufPrint(&min_buf, "{s}{s}{s}", .{
+            if (j.min_deg > 0) ", min distance" else "",
+            if (j.glide_ms > 0) ", glide" else "",
+            if (j.notify) ", HID notify" else "",
+        }) catch "";
         const msg = std.fmt.bufPrint(&msg_buf, "following on {s} from {d:.0},{d:.0}{s}{s}{s}", .{
             mon.name, cur[0], cur[1], min_txt, if (seeded or self.opts.follow_filter == .device) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
         }) catch "following";
@@ -563,7 +595,7 @@ const Server = struct {
         f.updates += 1; // valid samples followed
         const px = layout.mapNorm(f.mon, g.x, g.y);
         if (!self.followGate(f, px, g.view_mm)) return;
-        f.easer.setTarget(px, 0);
+        self.moveTo(f, px, 0);
         self.followStep(g.t_ns);
     }
 
@@ -579,16 +611,42 @@ const Server = struct {
                 f.fixations += 1;
                 const tau = if (f.first) self.opts.ease.first_tau_ms else self.opts.ease.saccade_tau_ms;
                 f.first = false;
-                f.easer.setTarget(px, tau);
+                self.moveTo(f, px, tau);
                 if (f.session.dry) log.info("follow: fixation {d} at {d:.0},{d:.0} (gaze {d:.3},{d:.3})", .{ f.fixations, px[0], px[1], target[0], target[1] });
             },
             .update => {
                 f.updates += 1;
-                f.easer.setTarget(px, self.opts.ease.fix_tau_ms);
+                self.moveTo(f, px, self.opts.ease.fix_tau_ms);
             },
             .held => return,
         }
         self.followStep(g.t_ns);
+    }
+
+    /// The decision to move to `px`: notify the keyboard first (once per
+    /// session), then glide (--glide-ms) or ease with `tau`.
+    fn moveTo(self: *Server, f: *Follow, px: [2]f64, tau: f64) void {
+        const now = nowNs();
+        const cur = if (f.glide) |g| g.at(now) else f.easer.pos;
+        if (f.notify.take(cur, px)) {
+            f.notify_ok = self.hid.send(hid.CMD_MOVED);
+            f.notify_ms = msSince(f.session.started_ns, nowNs());
+        } else if (f.notify.enabled and f.notify.dry and f.notify_ms == null and
+            (@abs(px[0] - cur[0]) >= 1 or @abs(px[1] - cur[1]) >= 1))
+        {
+            f.notify_ms = msSince(f.session.started_ns, now); // would have notified
+        }
+        if (f.glide_ms > 0) {
+            if (f.glide) |*g| if (!g.done(now)) {
+                g.retarget(px, now);
+                return;
+            };
+            if (@abs(px[0] - cur[0]) < 1 and @abs(px[1] - cur[1]) < 1) return;
+            f.glide = follow.Glide.start(cur, px, now, f.glide_ms, f.curve);
+            f.glides += 1;
+            return;
+        }
+        f.easer.setTarget(px, tau);
     }
 
     /// --min-distance-deg: true when `px` is far enough from the cursor to
@@ -606,6 +664,7 @@ const Server = struct {
                     f.moved_by_user += 1;
                     // Ease from where the cursor really is.
                     f.easer = follow.Easer.init(p);
+                    f.glide = null;
                     f.last_sent = p;
                 }
                 cur = p;
@@ -621,7 +680,12 @@ const Server = struct {
     fn followStep(self: *Server, sample_t: ?i64) void {
         const f = if (self.follow) |*ff| ff else return;
         const now = nowNs();
-        _ = f.easer.step(msSince(f.last_step, now));
+        if (f.glide) |g| {
+            // The glide drives the position; the easer just follows it.
+            const p = g.at(now);
+            f.easer = follow.Easer.init(p);
+            if (g.done(now)) f.glide = null;
+        } else _ = f.easer.step(msSince(f.last_step, now));
         f.last_step = now;
         const p = f.easer.pixel();
         if (p[0] == f.last_sent[0] and p[1] == f.last_sent[1]) return;
@@ -646,9 +710,14 @@ const Server = struct {
         defer f.mons.deinit();
         const now = nowNs();
         const s = f.session;
-        var buf: [512]u8 = undefined;
+        var buf: [768]u8 = undefined;
+        var hb: [64]u8 = undefined;
+        const hid_txt = if (!f.notify.enabled) "off" else if (f.notify_ms) |t|
+            std.fmt.bufPrint(&hb, "{s} at {d:.1} ms", .{ if (s.dry) "would be sent" else if (f.notify_ok) "sent" else "FAILED", t }) catch "?"
+        else
+            "not sent (no move)";
         const first_ms = if (s.first_move_ns) |t| msSince(s.started_ns, t) else -1;
-        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {s} filter, {d} fixations, {d} updates, {d} moves, {d} within {d:.1} deg, {d} pointer moves by the person{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
+        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {s} filter, {d} fixations, {d} updates, {d} moves, {d} within {d:.1} deg, {d} pointer moves by the person, {d} glides, HID {s}{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
             @tagName(why),
             msSince(s.started_ns, now) / 1000,
             f.last_sent[0],
@@ -660,6 +729,8 @@ const Server = struct {
             f.near,
             f.min_deg,
             f.moved_by_user,
+            f.glides,
+            hid_txt,
             if (s.dry) " (dry run)" else "",
             first_ms,
             if (s.moves > 0) @as(f64, @floatFromInt(s.move_ns_sum)) / @as(f64, @floatFromInt(s.moves)) / 1e6 else 0,
@@ -672,7 +743,7 @@ const Server = struct {
     fn finish(_: *Server, j: Jump, msg: []const u8) void {
         log.info("{s}: {s}", .{ j.verb, msg });
         if (j.fd) |fd| {
-            var buf: [600]u8 = undefined;
+            var buf: [1024]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "{s}\n", .{msg}) catch "\n";
             reply(fd, line);
             posix.close(fd);
@@ -764,6 +835,7 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
         .listen_fd = listen_fd,
         .sig_fd = sig_fd,
         .path = path,
+        .hid = .{ .cfg = opts.hid },
     };
     g_server = &srv;
     defer srv.deinit();
@@ -797,6 +869,11 @@ const usage =
     \\                                          N > 0 only when the gaze is more than N deg
     \\                                          from the cursor (MAGIC pointing); --timeout-ms
     \\                                          overrides the server's --follow-timeout-ms
+    \\                                          [--glide-ms N] [--glide-curve inout|in]: glide
+    \\                                          to the gaze over N ms instead of jumping
+    \\                                          [--notify-hid]: on the first real move, send a
+    \\                                          Raw HID 'M' report to the keyboard
+    \\       tobiifree-warp hid-probe [--hid-* …]    print the hidraw node --notify-hid uses
     \\       tobiifree-warp follow-stop                ...until this (key release)
     \\
     \\server options:
@@ -821,6 +898,9 @@ const usage =
     \\  --fix-tau-ms MS           easing time constant within a fixation (80)
     \\  --saccade-tau-ms MS       easing to a new fixation, 0 = jump (0)
     \\  --first-tau-ms MS         easing of the first move (60)
+    \\  --glide-step-ms MS        easing / glide step (8, ~120 Hz)
+    \\  --hid-id BUS:VID:PID      keyboard for --notify-hid (0003:0000FEED:00000130)
+    \\  --hid-interface N|any     its Raw HID USB interface (1; any: by descriptor)
     \\  (both:)
     \\  --follow-timeout-ms MS    stop by itself after this long, missed release (10000)
     \\
@@ -858,13 +938,28 @@ fn parseF(args: *std.process.ArgIterator, name: []const u8) ?f64 {
     return f;
 }
 
+/// `hid-probe`: which hidraw node --notify-hid would write to (no write).
+fn hidProbe(opts: Opts) u8 {
+    var buf: [256]u8 = undefined;
+    if (hid.find(opts.hid, &buf)) |p| {
+        std.fs.File.stdout().writeAll(p) catch {};
+        std.fs.File.stdout().writeAll("\n") catch {};
+        return 0;
+    }
+    std.debug.print("no hidraw device {s} on interface {?d}\n", .{ opts.hid.hid_id, opts.hid.iface });
+    return 1;
+}
+
 pub fn main() u8 {
     var args = std.process.args();
     _ = args.next();
     var opts = Opts{};
-    var mode: enum { serve, jump, follow_start, follow_stop } = .serve;
+    var mode: enum { serve, jump, follow_start, follow_stop, hid_probe } = .serve;
     var min_deg: f64 = 0;
     var timeout_ms: f64 = 0;
+    var glide_ms: f64 = 0;
+    var curve_in = false;
+    var notify_hid = false;
     var first = true;
     while (args.next()) |a| {
         defer first = false;
@@ -874,8 +969,31 @@ pub fn main() u8 {
             mode = .follow_start;
         } else if (first and std.mem.eql(u8, a, "follow-stop")) {
             mode = .follow_stop;
+        } else if (first and std.mem.eql(u8, a, "hid-probe")) {
+            mode = .hid_probe;
         } else if (first and std.mem.eql(u8, a, "serve")) {
             mode = .serve;
+        } else if (std.mem.eql(u8, a, "--glide-ms") and mode == .follow_start) {
+            glide_ms = parseF0(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--glide-curve") and mode == .follow_start) {
+            const v = args.next() orelse "";
+            if (std.mem.eql(u8, v, "in")) curve_in = true else if (!std.mem.eql(u8, v, "inout")) {
+                std.debug.print("--glide-curve: inout or in\n", .{});
+                return 2;
+            }
+        } else if (std.mem.eql(u8, a, "--notify-hid") and mode == .follow_start) {
+            notify_hid = true;
+        } else if (std.mem.eql(u8, a, "--hid-id") and (mode == .serve or mode == .hid_probe)) {
+            opts.hid.hid_id = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, a, "--hid-interface") and (mode == .serve or mode == .hid_probe)) {
+            const v = args.next() orelse return 2;
+            opts.hid.iface = if (std.mem.eql(u8, v, "any")) null else std.fmt.parseInt(u8, v, 10) catch return 2;
+        } else if (std.mem.eql(u8, a, "--hid-sysfs") and (mode == .serve or mode == .hid_probe)) {
+            opts.hid.sysfs_dir = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, a, "--hid-dev-dir") and (mode == .serve or mode == .hid_probe)) {
+            opts.hid.dev_dir = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, a, "--glide-step-ms") and mode == .serve) {
+            opts.ease.tick_ms = @intFromFloat(std.math.clamp(parseF(&args, a) orelse return 2, 1, 100));
         } else if (std.mem.eql(u8, a, "--timeout-ms") and mode == .follow_start) {
             timeout_ms = parseF(&args, a) orelse return 2;
         } else if (std.mem.eql(u8, a, "--min-distance-deg") and mode == .follow_start) {
@@ -926,9 +1044,19 @@ pub fn main() u8 {
         }
     }
     return switch (mode) {
-        .jump => client("jump", opts.dry_run, 0, 0),
-        .follow_start => client("follow-start", opts.dry_run, min_deg, timeout_ms),
-        .follow_stop => client("follow-stop", false, 0, 0),
+        .jump => client("jump", opts.dry_run, ""),
+        .follow_start => blk: {
+            var tb: [200]u8 = undefined;
+            var w = std.Io.Writer.fixed(&tb);
+            if (min_deg > 0) w.print(" min={d}", .{min_deg}) catch {};
+            if (timeout_ms > 0) w.print(" timeout={d:.0}", .{timeout_ms}) catch {};
+            if (glide_ms > 0) w.print(" glide={d}", .{glide_ms}) catch {};
+            if (curve_in) w.writeAll(" curve=in") catch {};
+            if (notify_hid) w.writeAll(" notify") catch {};
+            break :blk client("follow-start", opts.dry_run, w.buffered());
+        },
+        .follow_stop => client("follow-stop", false, ""),
+        .hid_probe => hidProbe(opts),
         .serve => serve(std.heap.page_allocator, opts),
     };
 }
@@ -938,4 +1066,5 @@ test {
     _ = layout;
     _ = gaze;
     _ = follow;
+    _ = hid;
 }

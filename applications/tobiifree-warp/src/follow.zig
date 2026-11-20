@@ -181,6 +181,81 @@ pub const EaseParams = struct {
     tick_ms: i64 = 8,
 };
 
+pub const Curve = enum {
+    /// Cubic ease-in-out: slow start (a tap lifting early barely moved the
+    /// cursor), soft landing.
+    inout,
+    /// Quadratic ease-in: slow start, full speed at the target.
+    in,
+
+    pub fn at(self: Curve, u_in: f64) f64 {
+        const u = std.math.clamp(u_in, 0, 1);
+        return switch (self) {
+            .inout => if (u < 0.5) 4 * u * u * u else 1 - std.math.pow(f64, -2 * u + 2, 3) / 2,
+            .in => u * u,
+        };
+    }
+};
+
+/// Cursor glide from where it is to a target over a fixed time. Retargeting
+/// keeps the position continuous and the remaining fraction of the curve:
+///   p(t) = anchor + (to - anchor) * (e(u) - e0) / (1 - e0)
+/// with anchor/e0 the position and curve value at the last retarget.
+pub const Glide = struct {
+    anchor: [2]f64,
+    to: [2]f64,
+    e0: f64 = 0,
+    t_start: i64,
+    dur_ns: i64,
+    curve: Curve = .inout,
+
+    pub fn start(from: [2]f64, to: [2]f64, now: i64, dur_ms: f64, curve: Curve) Glide {
+        return .{ .anchor = from, .to = to, .t_start = now, .dur_ns = @intFromFloat(@max(1, dur_ms) * 1e6), .curve = curve };
+    }
+
+    fn u(self: Glide, now: i64) f64 {
+        return @as(f64, @floatFromInt(now - self.t_start)) / @as(f64, @floatFromInt(self.dur_ns));
+    }
+
+    pub fn done(self: Glide, now: i64) bool {
+        return now - self.t_start >= self.dur_ns;
+    }
+
+    pub fn at(self: Glide, now: i64) [2]f64 {
+        if (self.done(now)) return self.to;
+        const e = self.curve.at(self.u(now));
+        if (self.e0 >= 0.999) return self.to;
+        const k = (e - self.e0) / (1 - self.e0);
+        return .{ self.anchor[0] + (self.to[0] - self.anchor[0]) * k, self.anchor[1] + (self.to[1] - self.anchor[1]) * k };
+    }
+
+    /// New target mid-glide: same end time, continuous position.
+    pub fn retarget(self: *Glide, to: [2]f64, now: i64) void {
+        if (self.done(now)) {
+            self.to = to;
+            return;
+        }
+        self.anchor = self.at(now);
+        self.e0 = self.curve.at(self.u(now));
+        self.to = to;
+    }
+};
+
+/// "The host moved the cursor" goes out once per follow session, on the
+/// first decision to really move it (at least a pixel), never in a dry run.
+pub const NotifyOnce = struct {
+    enabled: bool,
+    dry: bool,
+    done: bool = false,
+
+    pub fn take(self: *NotifyOnce, cur: [2]f64, target: [2]f64) bool {
+        if (!self.enabled or self.dry or self.done) return false;
+        if (@abs(target[0] - cur[0]) < 1 and @abs(target[1] - cur[1]) < 1) return false;
+        self.done = true;
+        return true;
+    }
+};
+
 /// MAGIC-pointing gate: is `target` more than `min_deg` of visual angle away
 /// from the cursor at `cur` (both global logical px)? `mm_per_px`: physical
 /// size of a logical pixel on the tracker's screen; `view_mm`: eye distance.
@@ -369,6 +444,71 @@ test "farEnough: 5 deg at 650 mm on the BenQ (0.2766 mm/px) is ~205 px" {
     // 0 = plain follow: every change moves.
     try testing.expect(farEnough(.{ 1000, 500 }, .{ 1000, 501 }, mmpp, 650, 0));
     try testing.expect(farEnough(.{ 1000, 500 }, .{ 1000, 500 }, mmpp, 650, 0));
+}
+
+test "curves: endpoints, monotonic, slow start" {
+    for ([_]Curve{ .inout, .in }) |c| {
+        try testing.expectEqual(@as(f64, 0), c.at(0));
+        try testing.expectEqual(@as(f64, 1), c.at(1));
+        try testing.expectEqual(@as(f64, 1), c.at(1.5));
+        var prev: f64 = 0;
+        var k: f64 = 0.05;
+        while (k <= 1) : (k += 0.05) {
+            try testing.expect(c.at(k) >= prev);
+            prev = c.at(k);
+        }
+        // A tap lifting after a fifth of the glide barely moved the cursor.
+        try testing.expect(c.at(0.2) < 0.05);
+    }
+    try testing.expectApproxEqAbs(@as(f64, 0.5), Curve.inout.at(0.5), 1e-12);
+}
+
+test "glide: from cursor to target over the duration" {
+    var g = Glide.start(.{ 100, 100 }, .{ 900, 500 }, 0, 100, .inout);
+    try testing.expectEqual([2]f64{ 100, 100 }, g.at(0));
+    try testing.expectEqual([2]f64{ 500, 300 }, g.at(50 * MS));
+    try testing.expect(!g.done(99 * MS));
+    try testing.expect(g.done(100 * MS));
+    try testing.expectEqual([2]f64{ 900, 500 }, g.at(100 * MS));
+    try testing.expectEqual([2]f64{ 900, 500 }, g.at(250 * MS));
+}
+
+test "glide retarget: continuous, same end time, lands on the new target" {
+    var g = Glide.start(.{ 0, 0 }, .{ 1000, 0 }, 0, 100, .inout);
+    const before = g.at(40 * MS);
+    g.retarget(.{ 1000, 400 }, 40 * MS);
+    const after = g.at(40 * MS);
+    try testing.expectApproxEqAbs(before[0], after[0], 1e-9);
+    try testing.expectApproxEqAbs(before[1], after[1], 1e-9);
+    // Keeps moving toward the new target, no jump between steps.
+    var prev = after;
+    var t: i64 = 44;
+    while (t <= 100) : (t += 4) {
+        const p = g.at(t * MS);
+        try testing.expect(@abs(p[0] - prev[0]) < 120 and @abs(p[1] - prev[1]) < 80);
+        prev = p;
+    }
+    try testing.expectEqual([2]f64{ 1000, 400 }, g.at(100 * MS));
+    // Small retargets (gaze noise) only nudge the path.
+    var h = Glide.start(.{ 0, 0 }, .{ 1000, 0 }, 0, 100, .inout);
+    const p1 = h.at(60 * MS);
+    h.retarget(.{ 1003, 2 }, 60 * MS);
+    const p2 = h.at(64 * MS);
+    try testing.expect(p2[0] > p1[0] and p2[1] >= 0 and p2[1] < 1);
+    // Retarget after the end: just the new target.
+    h.retarget(.{ 10, 10 }, 200 * MS);
+    try testing.expectEqual([2]f64{ 10, 10 }, h.at(200 * MS));
+}
+
+test "notify once: first real move only, not when nothing moves, never dry or disabled" {
+    var n = NotifyOnce{ .enabled = true, .dry = false };
+    try testing.expect(!n.take(.{ 100, 100 }, .{ 100.4, 99.7 })); // same pixel
+    try testing.expect(n.take(.{ 100, 100 }, .{ 400, 300 }));
+    try testing.expect(!n.take(.{ 400, 300 }, .{ 900, 300 })); // once per session
+    var d = NotifyOnce{ .enabled = true, .dry = true };
+    try testing.expect(!d.take(.{ 0, 0 }, .{ 500, 500 }));
+    var off = NotifyOnce{ .enabled = false, .dry = false };
+    try testing.expect(!off.take(.{ 0, 0 }, .{ 500, 500 }));
 }
 
 test "session timeout and stats" {

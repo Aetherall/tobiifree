@@ -62,11 +62,31 @@ follow. `--timeout-ms MS` overrides the server's auto-stop for this follow
 (a finger may rest on the trackpad longer than 10 s). The stop summary
 counts the moves, the samples within N° and the pointer moves by the person.
 
-E.g. a key held while a finger is on a trackpad (F19 from the keyboard's
-firmware):
+`--glide-ms N`: a needed move glides from the cursor to the gaze over N ms
+instead of jumping (`--glide-curve inout`, cubic, by default; or `in`). Both
+curves start slowly, so a touch that turns out to be a tap and stops the
+follow early has barely moved the cursor. If the gaze target changes
+mid-glide, the glide retargets with a continuous position and the same end
+time. Steps every `--glide-step-ms` (server option, 8 ms ≈ 120 Hz; a
+Hyprland move costs ~0.4 ms, measured 0.44 ms avg at 120 Hz, 0.31 ms at
+240 Hz).
+
+`--notify-hid`: on the first real move of the follow (at the decision, before
+the first glide step; not at all when nothing moves, never in a dry run),
+write one QMK Raw HID report to the keyboard: payload `'M'` (0x4D) then
+zeros, 32 bytes, written as 33 with the hidraw report ID 0x00 first. The
+board can then tell that its touch moved the cursor and not turn it into a
+click. The device is the hidraw node whose `device/uevent` has
+`HID_ID=0003:0000FEED:00000130` (`--hid-id`) on USB interface 1
+(`--hid-interface N`, or `any` to match the Raw HID usage page `06 60 ff` in
+the report descriptor); it is opened at follow start and kept open. Absent:
+skipped, logged once. `tobiifree-warp hid-probe` prints the node it would
+use (no write).
+
+E.g. a key the keyboard holds while a finger is on its trackpad (F19):
 
 ```lua
-hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-start --min-distance-deg 5 --timeout-ms 600000"), { ignore_mods = true })
+hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-start --min-distance-deg 5 --timeout-ms 600000 --glide-ms 100 --notify-hid"), { ignore_mods = true })
 hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-stop"), { release = true, ignore_mods = true })
 ```
 
@@ -181,7 +201,10 @@ nix build .#tobiifree-warp
 cd applications/tobiifree-warp && zig build test   # in `nix develop`
 ```
 
-Tests cover the MAGIC-pointing distance gate (5° at 650 mm on the BenQ ≈
+Tests cover the glide (curves, duration, continuous retarget), the HID
+notification (once per follow, only on a real move, never dry; report bytes;
+hidraw discovery on a fake sysfs: interface number, descriptor fallback,
+re-discovery), the MAGIC-pointing distance gate (5° at 650 mm on the BenQ ≈
 205 px, diagonal, viewing distance, 0 = always), the follow gaze source (filtered point first, fallbacks), the
 fixation filter (noisy fixation stays put and converges,
 deadband, saccade lands after one confirming sample, spike ignored, drift
