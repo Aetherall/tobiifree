@@ -33,7 +33,7 @@
 //                 the notify pipe; no client I/O happens on this thread.
 //   main thread — client sockets, request building/sending, response routing,
 //                 config/calibration persistence.
-//   job thread  — one at a time: start/finish calibration, cal_apply. These
+//   job thread  — one at a time: start/finish calibration, retrieve, cal_apply. These
 //                 own the USB transport while they run (gaze pauses);
 //                 meanwhile device commands get Err.busy.
 //   The USB thread also does (re)connection and the restore of area +
@@ -506,7 +506,7 @@ fn sendStimulus(c: Client, cmd_type: u8, payload: []const u8) void {
 // once no single request is in flight (the state machines' response hooks
 // don't filter by request_id).
 
-const JobKind = enum { start_cal, cancel_cal, finish_cal, apply };
+const JobKind = enum { start_cal, cancel_cal, finish_cal, retrieve_cal, apply };
 
 const Job = struct {
     kind: JobKind,
@@ -541,6 +541,7 @@ fn jobThreadFn() void {
         .start_cal => tracker.startCalibration(),
         .cancel_cal => tracker.cancelCalibration(),
         .finish_cal => tracker.finishCalibration(),
+        .retrieve_cal => tracker.retrieveCalibration(),
         .apply => tracker.calApply(j.blob.?),
     };
     job_done.store(true, .release);
@@ -585,6 +586,9 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
             // start clears the device's calibration; apply installs `blob`.
             if (ok and j.kind == .start_cal) setAppliedSha(null);
             if (ok and j.kind == .apply) setAppliedSha(corr_mod.sha256Hex(j.blob.?));
+        },
+        .retrieve_cal => {
+            if (ok) sendReply(j.client, j.cmd_type, core.cal_finish_blob_ptr()[0..core.cal_finish_blob_len()]) else sendError(j.client, j.cmd_type, proto.Err.failed);
         },
         .finish_cal => {
             if (!ok) {
@@ -927,6 +931,7 @@ fn forwardCommand(client_fd: std.posix.fd_t, cmd_type: u8, payload: []const u8, 
         .start_calibration => queueJob(.{ .kind = .start_cal, .client = c, .cmd_type = cmd_type }),
         .finish_calibration => queueJob(.{ .kind = .finish_cal, .client = c, .cmd_type = cmd_type }),
         .cancel_calibration => queueJob(.{ .kind = .cancel_cal, .client = c, .cmd_type = cmd_type }),
+        .retrieve_calibration => queueJob(.{ .kind = .retrieve_cal, .client = c, .cmd_type = cmd_type }),
         .cal_apply => {
             log.debug("cal_apply: received payload_len={d} from fd={d}", .{ payload.len, client_fd });
             if (payload.len == 0 or payload.len > core.scratch_size()) {

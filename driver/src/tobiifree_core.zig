@@ -2092,6 +2092,13 @@ pub export fn cal_finish_init() void {
     hook_response = cfResponseHook;
 }
 
+/// Like cal_finish_init, but only the retrieve step: reads the calibration the
+/// device runs now, outside a calibration session. Same poll and blob accessors.
+pub export fn cal_retrieve_init() void {
+    cal_finish_init();
+    cf_state = .build_retrieve;
+}
+
 /// Drive the finish sequence one step. Same action codes as handshake_poll.
 pub export fn cal_finish_poll() u8 {
     return @intFromEnum(calFinishPollInner());

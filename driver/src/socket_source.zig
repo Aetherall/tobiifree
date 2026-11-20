@@ -32,6 +32,7 @@
 //   start_calibration / add_calibration_point / cal_apply: empty (add_point:
 //     raw device reply).
 //   finish_calibration: calibration blob.
+//   retrieve_calibration: the blob the device runs now (not saved).
 //   get_calibration_stimulus: decodeStimulus.
 // Errors: proto.Err codes, or a device TTP status (see daemon_protocol.zig);
 // Err.disconnected when the daemon goes away with the request outstanding.
@@ -201,6 +202,10 @@ pub const SocketSource = struct {
 
     pub fn finishCalibration(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
         try self.request(.finish_calibration, &.{}, cb, ctx);
+    }
+
+    pub fn retrieveCalibration(self: *SocketSource, cb: ?ReplyFn, ctx: ?*anyopaque) !void {
+        try self.request(.retrieve_calibration, &.{}, cb, ctx);
     }
 
     pub fn calApply(self: *SocketSource, blob: []const u8, cb: ?ReplyFn, ctx: ?*anyopaque) !void {

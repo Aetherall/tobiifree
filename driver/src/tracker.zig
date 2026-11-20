@@ -330,6 +330,16 @@ pub const Tracker = struct {
         return self.driveStateMachine(&core.cal_finish_poll, "cal_finish");
     }
 
+    /// Read the active calibration blob (cal_finish_blob_ptr/len) without
+    /// changing it. Fails on a device error status or a truncated blob.
+    pub fn retrieveCalibration(self: *Tracker) bool {
+        self.beginCalibrating();
+        defer self.endCalibrating();
+        core.cal_retrieve_init();
+        if (!self.driveStateMachine(&core.cal_finish_poll, "cal_retrieve")) return false;
+        return core.response_status() == 0 and core.had_truncation() == 0 and core.cal_finish_blob_len() > 0;
+    }
+
     pub fn calApply(self: *Tracker, blob: []const u8) bool {
         self.beginCalibrating();
         defer self.endCalibrating();

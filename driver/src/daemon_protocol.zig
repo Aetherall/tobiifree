@@ -60,6 +60,7 @@ pub const Cmd = enum(u8) {
     cal_apply = 0x23,
     get_calibration_stimulus = 0x24,
     cancel_calibration = 0x25,
+    retrieve_calibration = 0x26, // reply: the blob the device runs now (not saved)
     // Correction map (host-side, see correction.zig). Not device commands:
     // answered by the daemon itself, also while the tracker is away.
     set_correction = 0x30, // payload: correction.json text; reply empty

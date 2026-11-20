@@ -7,6 +7,7 @@
 //   tobiifree-ctl cancel-calibration          # end the session, keep the device calibration
 //   tobiifree-ctl add-point X Y
 //   tobiifree-ctl finish-calibration OUT.bin   # replaces the device calibration!
+//   tobiifree-ctl retrieve OUT.bin             # the calibration the device runs now
 //   tobiifree-ctl apply FILE.bin               # replaces the device calibration!
 //   tobiifree-ctl correction                   # state + correction.json of the map
 //   tobiifree-ctl correction-set FILE.json     # install a correction map
@@ -40,6 +41,7 @@ fn usage() u8 {
         \\       tobiifree-ctl cancel-calibration
         \\       tobiifree-ctl add-point X Y
         \\       tobiifree-ctl finish-calibration OUT.bin
+        \\       tobiifree-ctl retrieve OUT.bin
         \\       tobiifree-ctl apply FILE.bin
         \\       tobiifree-ctl correction
         \\       tobiifree-ctl correction-set FILE.json
@@ -95,6 +97,10 @@ pub fn main() u8 {
             if (rest.len != 1) return usage();
             break :blk .{ .finish_calibration, &.{}, 180000 };
         }
+        if (std.mem.eql(u8, verb, "retrieve")) {
+            if (rest.len != 1) return usage();
+            break :blk .{ .retrieve_calibration, &.{}, 60000 };
+        }
         if (std.mem.eql(u8, verb, "apply")) {
             if (rest.len != 1) return usage();
             file_blob = std.fs.cwd().readFileAlloc(gpa, rest[0], 4 << 20) catch |err| {
@@ -149,7 +155,7 @@ pub fn main() u8 {
             });
             out("raw ({d} bytes): {x}\n", .{ s.raw.len, s.raw });
         },
-        .finish_calibration => {
+        .finish_calibration, .retrieve_calibration => {
             std.fs.cwd().writeFile(.{ .sub_path = rest[0], .data = reply.data }) catch |err| {
                 out("cannot write {s}: {}\n", .{ rest[0], err });
                 return 1;
