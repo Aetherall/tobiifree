@@ -67,7 +67,7 @@ fn unixAddr(path: []const u8) !posix.sockaddr.un {
 
 /// Exit status is 0 for every no-op: a key binding has nothing to do with
 /// an error, and the person travels without the tracker.
-fn client(verb: []const u8, dry: bool) u8 {
+fn client(verb: []const u8, dry: bool, min_deg: f64, timeout_ms: f64) u8 {
     const t0 = nowNs();
     var path_buf: [512]u8 = undefined;
     const path = controlPath(&path_buf) catch return 0;
@@ -81,8 +81,12 @@ fn client(verb: []const u8, dry: bool) u8 {
     // The server waits at most ~settle_ms for a fixation, then answers.
     const tv = posix.timeval{ .sec = 1, .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    var req: [64]u8 = undefined;
-    const line = std.fmt.bufPrint(&req, "{s} {d}{s}\n", .{ verb, t0, if (dry) " dry" else "" }) catch return 0;
+    var req: [96]u8 = undefined;
+    var minbuf: [32]u8 = undefined;
+    const min_tok = if (min_deg > 0) std.fmt.bufPrint(&minbuf, " min={d}", .{min_deg}) catch "" else "";
+    var tobuf: [32]u8 = undefined;
+    const to_tok = if (timeout_ms > 0) std.fmt.bufPrint(&tobuf, " timeout={d:.0}", .{timeout_ms}) catch "" else "";
+    const line = std.fmt.bufPrint(&req, "{s} {d}{s}{s}{s}\n", .{ verb, t0, if (dry) " dry" else "", min_tok, to_tok }) catch return 0;
     _ = posix.write(fd, line) catch return 0;
     var buf: [256]u8 = undefined;
     var n: usize = 0;
@@ -167,6 +171,10 @@ const Jump = struct {
     t_recv: i64,
     dry: bool,
     verb: []const u8 = "jump",
+    /// follow-start --min-distance-deg (0: plain follow).
+    min_deg: f64 = 0,
+    /// follow-start --timeout-ms (0: the server's --follow-timeout-ms).
+    timeout_ms: i64 = 0,
 };
 
 const Follow = struct {
@@ -184,6 +192,15 @@ const Follow = struct {
     updates: usize = 0,
     /// Next new fixation is the first: ease it in.
     first: bool = true,
+    /// MAGIC pointing: move only when the gaze is more than this far from
+    /// the cursor (degrees; 0 = always).
+    min_deg: f64 = 0,
+    /// Physical size of a logical pixel of the output (mm), for min_deg.
+    mm_per_px: [2]f64 = .{ 0, 0 },
+    /// Targets not followed: within min_deg of the cursor.
+    near: usize = 0,
+    /// Cursor found away from where we left it (moved by the person).
+    moved_by_user: usize = 0,
 };
 
 const Server = struct {
@@ -349,7 +366,13 @@ const Server = struct {
         const verb = it.next() orelse "";
         var j = Jump{ .fd = fd, .t_start = t_recv, .t_recv = t_recv, .dry = self.opts.dry_run };
         while (it.next()) |tok| {
-            if (std.mem.eql(u8, tok, "dry")) j.dry = true else if (std.fmt.parseInt(i64, tok, 10)) |t| {
+            if (std.mem.startsWith(u8, tok, "timeout=")) {
+                j.timeout_ms = std.fmt.parseInt(i64, tok[8..], 10) catch 0;
+                j.timeout_ms = std.math.clamp(j.timeout_ms, 0, 3600_000);
+            } else if (std.mem.startsWith(u8, tok, "min=")) {
+                j.min_deg = std.fmt.parseFloat(f64, tok[4..]) catch 0;
+                if (!(j.min_deg >= 0 and j.min_deg < 90)) j.min_deg = 0;
+            } else if (std.mem.eql(u8, tok, "dry")) j.dry = true else if (std.fmt.parseInt(i64, tok, 10)) |t| {
                 if (t <= t_recv and t_recv - t < 10 * std.time.ns_per_s) j.t_start = t;
             } else |_| {}
         }
@@ -498,9 +521,14 @@ const Server = struct {
             .mon = mon,
             .filter = follow.Filter.init(self.opts.filter, self.opts.params),
             .easer = follow.Easer.init(cur),
-            .session = .{ .started_ns = j.t_start, .timeout_ms = self.opts.follow_timeout_ms, .dry = j.dry },
+            .session = .{ .started_ns = j.t_start, .timeout_ms = if (j.timeout_ms > 0) j.timeout_ms else self.opts.follow_timeout_ms, .dry = j.dry },
             .last_step = nowNs(),
             .last_sent = cur,
+            .min_deg = j.min_deg,
+            .mm_per_px = blk: {
+                const ls = mon.logicalSize();
+                break :blk .{ self.opts.params.width_mm / ls[0], self.opts.params.height_mm / ls[1] };
+            },
         };
         // Seed from the current fixation, if any: the cursor sets off at once.
         const f = &self.follow.?;
@@ -509,14 +537,19 @@ const Server = struct {
             .ok => |pick| {
                 const c = f.filter.seed(&[_]select.Sample{.{ .t_ns = nowNs(), .x = pick.x, .y = pick.y }});
                 f.fixations += 1;
-                f.easer.setTarget(layout.mapNorm(mon, c[0], c[1]), self.opts.ease.first_tau_ms);
                 f.first = false;
-                seeded = true;
+                const px = layout.mapNorm(mon, c[0], c[1]);
+                if (follow.farEnough(cur, px, f.mm_per_px, 0, f.min_deg)) {
+                    f.easer.setTarget(px, self.opts.ease.first_tau_ms);
+                    seeded = true;
+                } else f.near += 1;
             },
             else => {},
         };
-        const msg = std.fmt.bufPrint(&msg_buf, "following on {s} from {d:.0},{d:.0}{s}{s}", .{
-            mon.name, cur[0], cur[1], if (seeded or self.opts.follow_filter == .device) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
+        var min_buf: [48]u8 = undefined;
+        const min_txt = if (j.min_deg > 0) std.fmt.bufPrint(&min_buf, ", only beyond {d:.1} deg", .{j.min_deg}) catch "" else "";
+        const msg = std.fmt.bufPrint(&msg_buf, "following on {s} from {d:.0},{d:.0}{s}{s}{s}", .{
+            mon.name, cur[0], cur[1], min_txt, if (seeded or self.opts.follow_filter == .device) "" else ", waiting for a fixation", if (j.dry) " [dry run]" else "",
         }) catch "following";
         self.finish(j, msg);
         if (seeded) self.followStep(null);
@@ -528,7 +561,9 @@ const Server = struct {
     fn followDevice(self: *Server, g: select.Sample) void {
         const f = if (self.follow) |*ff| ff else return;
         f.updates += 1; // valid samples followed
-        f.easer.setTarget(layout.mapNorm(f.mon, g.x, g.y), 0);
+        const px = layout.mapNorm(f.mon, g.x, g.y);
+        if (!self.followGate(f, px, g.view_mm)) return;
+        f.easer.setTarget(px, 0);
         self.followStep(g.t_ns);
     }
 
@@ -538,6 +573,7 @@ const Server = struct {
         const e = f.filter.update(g);
         const target = e.target orelse return;
         const px = layout.mapNorm(f.mon, target[0], target[1]);
+        if (e.kind != .held and !self.followGate(f, px, g.view_mm)) return;
         switch (e.kind) {
             .new_fixation => {
                 f.fixations += 1;
@@ -553,6 +589,31 @@ const Server = struct {
             .held => return,
         }
         self.followStep(g.t_ns);
+    }
+
+    /// --min-distance-deg: true when `px` is far enough from the cursor to
+    /// move. The cursor is re-read from the compositor (~0.1 ms) because
+    /// the person may move the pointer during a follow (that is the point
+    /// of MAGIC pointing: gaze for the coarse jump, trackpad for the last
+    /// degrees); comparing with where we left it would fight the trackpad.
+    /// In a dry run nothing moves, so the tracked position is used.
+    fn followGate(self: *Server, f: *Follow, px: [2]f64, view_mm: f64) bool {
+        if (!(f.min_deg > 0)) return true;
+        var cur = f.easer.pos;
+        if (!f.session.dry) {
+            if (self.backend.cursorPos()) |p| {
+                if (@abs(p[0] - f.last_sent[0]) > 1 or @abs(p[1] - f.last_sent[1]) > 1) {
+                    f.moved_by_user += 1;
+                    // Ease from where the cursor really is.
+                    f.easer = follow.Easer.init(p);
+                    f.last_sent = p;
+                }
+                cur = p;
+            } else |_| {}
+        }
+        if (follow.farEnough(cur, px, f.mm_per_px, view_mm, f.min_deg)) return true;
+        f.near += 1;
+        return false;
     }
 
     /// Advance the easing to now and send the cursor if its pixel changed.
@@ -585,9 +646,9 @@ const Server = struct {
         defer f.mons.deinit();
         const now = nowNs();
         const s = f.session;
-        var buf: [384]u8 = undefined;
+        var buf: [512]u8 = undefined;
         const first_ms = if (s.first_move_ns) |t| msSince(s.started_ns, t) else -1;
-        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {s} filter, {d} fixations, {d} updates, {d} moves{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
+        const msg = std.fmt.bufPrint(&buf, "stopped ({s}) after {d:.2} s at {d:.0},{d:.0}: {s} filter, {d} fixations, {d} updates, {d} moves, {d} within {d:.1} deg, {d} pointer moves by the person{s}; first move {d:.1} ms after start; move {d:.3} ms avg / {d:.3} max; sample→cursor {d:.2} ms avg", .{
             @tagName(why),
             msSince(s.started_ns, now) / 1000,
             f.last_sent[0],
@@ -596,6 +657,9 @@ const Server = struct {
             f.fixations,
             f.updates,
             s.moves,
+            f.near,
+            f.min_deg,
+            f.moved_by_user,
             if (s.dry) " (dry run)" else "",
             first_ms,
             if (s.moves > 0) @as(f64, @floatFromInt(s.move_ns_sum)) / @as(f64, @floatFromInt(s.moves)) / 1e6 else 0,
@@ -728,7 +792,11 @@ fn serve(gpa: std.mem.Allocator, opts_in: Opts) u8 {
 const usage =
     \\usage: tobiifree-warp [serve] [options]   run the server (default)
     \\       tobiifree-warp jump [--dry-run]    move the cursor to the gaze (bind to a key)
-    \\       tobiifree-warp follow-start [--dry-run]   cursor follows the gaze (key press)
+    \\       tobiifree-warp follow-start [--dry-run] [--min-distance-deg N] [--timeout-ms MS]
+    \\                                          cursor follows the gaze (key press); with
+    \\                                          N > 0 only when the gaze is more than N deg
+    \\                                          from the cursor (MAGIC pointing); --timeout-ms
+    \\                                          overrides the server's --follow-timeout-ms
     \\       tobiifree-warp follow-stop                ...until this (key release)
     \\
     \\server options:
@@ -795,6 +863,8 @@ pub fn main() u8 {
     _ = args.next();
     var opts = Opts{};
     var mode: enum { serve, jump, follow_start, follow_stop } = .serve;
+    var min_deg: f64 = 0;
+    var timeout_ms: f64 = 0;
     var first = true;
     while (args.next()) |a| {
         defer first = false;
@@ -806,6 +876,10 @@ pub fn main() u8 {
             mode = .follow_stop;
         } else if (first and std.mem.eql(u8, a, "serve")) {
             mode = .serve;
+        } else if (std.mem.eql(u8, a, "--timeout-ms") and mode == .follow_start) {
+            timeout_ms = parseF(&args, a) orelse return 2;
+        } else if (std.mem.eql(u8, a, "--min-distance-deg") and mode == .follow_start) {
+            min_deg = parseF0(&args, a) orelse return 2;
         } else if (std.mem.eql(u8, a, "--dry-run")) {
             opts.dry_run = true;
         } else if (std.mem.eql(u8, a, "--output") and mode == .serve) {
@@ -852,9 +926,9 @@ pub fn main() u8 {
         }
     }
     return switch (mode) {
-        .jump => client("jump", opts.dry_run),
-        .follow_start => client("follow-start", opts.dry_run),
-        .follow_stop => client("follow-stop", false),
+        .jump => client("jump", opts.dry_run, 0, 0),
+        .follow_start => client("follow-start", opts.dry_run, min_deg, timeout_ms),
+        .follow_stop => client("follow-stop", false, 0, 0),
         .serve => serve(std.heap.page_allocator, opts),
     };
 }

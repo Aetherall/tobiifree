@@ -47,6 +47,29 @@ hl.bind("G", function()
 end, { release = true, ignore_mods = true, non_consuming = true })
 ```
 
+### MAGIC pointing (gaze for the jump, pointer for the last degrees)
+
+`follow-start --min-distance-deg N` (N > 0): while following, the cursor
+moves to the gaze only when the gaze is more than N° (visual angle at the
+eye's distance, screen size from tobii.json) from where the cursor is; once
+moved it sits at the gaze, so gaze changes within N° leave it alone and a
+trackpad/mouse can do the fine positioning. The cursor position is read from
+Hyprland (`cursorpos`, ~0.1 ms) before every candidate move, not tracked
+from what we set: the person moves the pointer during the follow, and a
+stale position would make the gaze snap the cursor back. (In a dry run
+nothing moves, so the position we would have set is used.) Default 0: plain
+follow. `--timeout-ms MS` overrides the server's auto-stop for this follow
+(a finger may rest on the trackpad longer than 10 s). The stop summary
+counts the moves, the samples within N° and the pointer moves by the person.
+
+E.g. a key held while a finger is on a trackpad (F19 from the keyboard's
+firmware):
+
+```lua
+hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-start --min-distance-deg 5 --timeout-ms 600000"), { ignore_mods = true })
+hl.bind("F19", hl.dsp.exec_cmd("tobiifree-warp follow-stop"), { release = true, ignore_mods = true })
+```
+
 Safety: follow stops by itself after `--follow-timeout-ms` (10 s; a missed
 release), when tobiifreed goes away, or when a move fails. A new
 `follow-start` replaces a running follow.
@@ -158,7 +181,8 @@ nix build .#tobiifree-warp
 cd applications/tobiifree-warp && zig build test   # in `nix develop`
 ```
 
-Tests cover the follow gaze source (filtered point first, fallbacks), the
+Tests cover the MAGIC-pointing distance gate (5° at 650 mm on the BenQ ≈
+205 px, diagonal, viewing distance, 0 = always), the follow gaze source (filtered point first, fallbacks), the
 fixation filter (noisy fixation stays put and converges,
 deadband, saccade lands after one confirming sample, spike ignored, drift
 followed), the easing, the follow session timeout, the sample selection (window, stale data, saccade rejection,

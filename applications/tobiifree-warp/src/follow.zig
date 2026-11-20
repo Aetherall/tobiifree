@@ -181,6 +181,18 @@ pub const EaseParams = struct {
     tick_ms: i64 = 8,
 };
 
+/// MAGIC-pointing gate: is `target` more than `min_deg` of visual angle away
+/// from the cursor at `cur` (both global logical px)? `mm_per_px`: physical
+/// size of a logical pixel on the tracker's screen; `view_mm`: eye distance.
+/// `min_deg` <= 0: always (plain follow).
+pub fn farEnough(cur: [2]f64, target: [2]f64, mm_per_px: [2]f64, view_mm: f64, min_deg: f64) bool {
+    if (!(min_deg > 0)) return true;
+    const dx = (target[0] - cur[0]) * mm_per_px[0];
+    const dy = (target[1] - cur[1]) * mm_per_px[1];
+    const v = if (view_mm > 0) view_mm else 650;
+    return std.math.radiansToDegrees(std.math.atan2(@sqrt(dx * dx + dy * dy), v)) > min_deg;
+}
+
 pub const StopReason = enum { release, timeout, daemon_lost, move_failed, superseded, exiting };
 
 /// Follow session bookkeeping: the safety timeout for a missed release.
@@ -341,6 +353,22 @@ test "easer: exponential approach, instant with tau 0, snaps within half a pixel
     e.setTarget(.{ 500, 300 }, 0);
     try testing.expect(e.step(0));
     try testing.expectEqual([2]f64{ 500, 300 }, e.pixel());
+}
+
+test "farEnough: 5 deg at 650 mm on the BenQ (0.2766 mm/px) is ~205 px" {
+    const mmpp = [2]f64{ 531.1 / 1920.0, 298.7 / 1080.0 };
+    // tan(5°) * 650 = 56.87 mm = 205.6 px.
+    try testing.expect(!farEnough(.{ 1000, 500 }, .{ 1205, 500 }, mmpp, 650, 5));
+    try testing.expect(farEnough(.{ 1000, 500 }, .{ 1206, 500 }, mmpp, 650, 5));
+    // Diagonal: 150 px each way = 212 px > 205.6.
+    try testing.expect(farEnough(.{ 1000, 500 }, .{ 1150, 650 }, mmpp, 650, 5));
+    // Farther viewer: the same pixels are fewer degrees.
+    try testing.expect(!farEnough(.{ 1000, 500 }, .{ 1206, 500 }, mmpp, 800, 5));
+    // Unknown distance: 650 mm.
+    try testing.expect(farEnough(.{ 1000, 500 }, .{ 1206, 500 }, mmpp, 0, 5));
+    // 0 = plain follow: every change moves.
+    try testing.expect(farEnough(.{ 1000, 500 }, .{ 1000, 501 }, mmpp, 650, 0));
+    try testing.expect(farEnough(.{ 1000, 500 }, .{ 1000, 500 }, mmpp, 650, 0));
 }
 
 test "session timeout and stats" {
