@@ -356,8 +356,11 @@ pub export fn q42_encode(mm: f64) i64 {
 // 11-byte TTP response header). 4096 was far too small: cal_retrieve was
 // silently truncated by the @min() clamps below, and build_cal_apply wrote the
 // blob through an unchecked [*]u8 into session_out[512] — an out-of-bounds
-// write. Sized with headroom from a single constant.
-pub const CAL_BLOB_MAX: usize = 640 * 1024;
+// write. The device takes and returns larger profiles (784 KB seen), and the
+// protocol's length fields are u32, so the limit is the largest blob one TTP
+// response can carry through the reassembly buffer: ACC_CAP minus the
+// envelope, TTP header and 2-byte status prefix.
+pub const CAL_BLOB_MAX: usize = ACC_CAP - ENVELOPE_SIZE - TTP_HDR_SIZE - 2;
 
 /// Set if any response had to be clamped to a buffer size. Callers should check
 /// this after a calibration read; clamping used to pass silently, so a truncated
@@ -629,7 +632,7 @@ pub export fn build_cal_retrieve(seq: u32, out: [*]u8) usize {
 }
 
 // Build cal_apply (op 0x456). Sends the opaque calibration blob.
-// The blob can be up to ~4KB; out must be large enough.
+// The blob can be up to CAL_BLOB_MAX; out must be large enough.
 pub export fn build_cal_apply(seq: u32, blob: [*]const u8, blob_len: u32, out: [*]u8) usize {
     // Write payload: [00 00] [raw blob]
     const plen: u32 = 2 + blob_len;
@@ -1736,7 +1739,7 @@ var hs_state: HandshakeState = .idle;
 
 // Handshake response capture (reused across steps).
 var hs_resp_ready: bool = false;
-var hs_resp_buf: [CAL_BLOB_MAX]u8 = undefined;
+var hs_resp_buf: [CAL_BLOB_MAX + 2]u8 = undefined;
 var hs_resp_len: u32 = 0;
 
 // Realm state captured during handshake.
@@ -2215,6 +2218,7 @@ const CalApplyState = enum {
 
 var ca_state: CalApplyState = .idle;
 var ca_blob_len: u32 = 0;
+var ca_status: u32 = 0;
 var ca_prev_response_hook: HookFn_response = noop_response;
 
 fn caResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) void {
@@ -2230,8 +2234,15 @@ fn caResponseHook(request_id: u32, payload_ptr: [*]const u8, payload_len: u32) v
 pub export fn cal_apply_init(blob_len: u32) void {
     ca_state = .realm_unlock;
     ca_blob_len = blob_len;
+    ca_status = 0;
     // Start the realm unlock sub-machine.
     cal_start_init();
+}
+
+/// TTP status of the APPLY response (0 accepted, e.g. 0x20000502 rejected).
+/// cal_apply_poll returns .err when it is not 0, after closing the realm.
+pub export fn cal_apply_status() u32 {
+    return ca_status;
 }
 
 /// Drive the cal_apply sequence one step.
@@ -2271,6 +2282,7 @@ fn calApplyPollInner() HandshakeAction {
         },
         .await_apply => {
             if (hs_resp_ready) {
+                ca_status = last_response_status;
                 ca_state = .build_close_realm;
                 return calApplyPollInner();
             }
@@ -2285,7 +2297,7 @@ fn calApplyPollInner() HandshakeAction {
         },
         .await_close_realm => {
             if (hs_resp_ready) {
-                ca_state = .done;
+                ca_state = if (ca_status == 0) .done else .failed;
                 return calApplyPollInner();
             }
             return .recv;
@@ -2480,6 +2492,32 @@ test "set_display_area_corners is acked with status" {
     feed_usb_in(&buf, n2);
     try std.testing.expectEqual(req2, test_resp_id);
     try std.testing.expectEqual(@as(u32, 0), test_resp_status);
+}
+
+fn testApplyWithStatus(status: u32) !u8 {
+    resetTestState();
+    session_reset();
+    defer set_hooks(null, null, noop_response, null, null);
+    cal_apply_init(16);
+    ca_state = .build_apply;
+    ca_prev_response_hook = hook_response;
+    hook_response = caResponseHook;
+    try std.testing.expectEqual(@intFromEnum(HandshakeAction.send), cal_apply_poll());
+    var buf: [64]u8 = undefined;
+    const n = fakeInbound(&buf, TTP_MAGIC_RSP, getBe32(@ptrCast(&session_out[ENVELOPE_SIZE + 4])), TTP_OP_CAL_APPLY, &.{ 0, 0 });
+    putBe32(@ptrCast(&buf[ENVELOPE_SIZE + 16]), status);
+    feed_usb_in(&buf, n);
+    try std.testing.expectEqual(@intFromEnum(HandshakeAction.send), cal_apply_poll());
+    const n2 = fakeInbound(&buf, TTP_MAGIC_RSP, getBe32(@ptrCast(&session_out[ENVELOPE_SIZE + 4])), TTP_OP_CLOSE_REALM, &.{ 0, 0 });
+    feed_usb_in(&buf, n2);
+    return cal_apply_poll();
+}
+
+test "cal_apply fails with the device status when APPLY is rejected" {
+    try std.testing.expectEqual(@intFromEnum(HandshakeAction.err), try testApplyWithStatus(0x20000502));
+    try std.testing.expectEqual(@as(u32, 0x20000502), cal_apply_status());
+    try std.testing.expectEqual(@intFromEnum(HandshakeAction.done), try testApplyWithStatus(0));
+    try std.testing.expectEqual(@as(u32, 0), cal_apply_status());
 }
 
 test "decode_cal_stimulus on a captured ET5 reply" {

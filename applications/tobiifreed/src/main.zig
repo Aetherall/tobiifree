@@ -582,7 +582,9 @@ fn completeJob(j: Job, ok: bool, elapsed_ms: i64) void {
 
     switch (j.kind) {
         .start_cal, .cancel_cal, .apply => {
-            if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, proto.Err.failed);
+            const status = if (j.kind == .apply) core.cal_apply_status() else 0;
+            if (ok) sendReply(j.client, j.cmd_type, &.{}) else sendError(j.client, j.cmd_type, if (status != 0) status else proto.Err.failed);
+            if (status != 0) log.warn("cal_apply: device rejected the blob, status 0x{x}", .{status});
             // start clears the device's calibration; apply installs `blob`.
             if (ok and j.kind == .start_cal) setAppliedSha(null);
             if (ok and j.kind == .apply) setAppliedSha(corr_mod.sha256Hex(j.blob.?));
