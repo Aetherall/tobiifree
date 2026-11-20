@@ -12,9 +12,9 @@ const log = std.log.scoped(.server);
 const MAX_CLIENTS = 16;
 
 // Large enough to buffer a complete CMD_CAL_APPLY message (calibration blob
-// up to ~640 KB + 5-byte header). `Server` is a global variable in main.zig
+// up to CAL_BLOB_MAX + 5-byte header). `Server` is a global variable in main.zig
 // (not stack-allocated), so this size is safe.
-const CLIENT_BUF_SIZE = 700 * 1024;
+const CLIENT_BUF_SIZE = core.CAL_BLOB_MAX + proto.HEADER_SIZE;
 
 const Client = struct {
     fd: std.posix.fd_t,

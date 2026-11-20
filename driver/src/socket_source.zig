@@ -72,7 +72,7 @@ pub const Stimulus = struct {
 
 const MAX_INFLIGHT = 32;
 const INITIAL_BUF = 16 * 1024;
-const MAX_BUF = 2 * 1024 * 1024; // calibration blobs are ~400–640 KB
+const MAX_BUF = 2 * 1024 * 1024; // a calibration blob reply (up to core.CAL_BLOB_MAX) fits
 
 const Inflight = struct {
     seq: u64,

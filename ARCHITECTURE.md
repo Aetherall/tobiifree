@@ -122,8 +122,8 @@ order TL.xyz, TR.xyz, BL.xyz.
 | `set_display_area_corners` | 0x04 | 9×f64 corners | 9×f64 corners the device holds after the set |
 | `start_calibration` | 0x20 | — | empty |
 | `add_calibration_point` | 0x21 | 2×f64 (x,y) normalised display coords; eye_mask fixed at 3 (both eyes) | raw device reply |
-| `finish_calibration` | 0x22 | — | calibration blob (~400–640 KB; unix socket only) |
-| `cal_apply` | 0x23 | calibration blob | empty |
+| `finish_calibration` | 0x22 | — | calibration blob (~400–800 KB, up to `CAL_BLOB_MAX` ≈ 2 MiB; unix socket only) |
+| `cal_apply` | 0x23 | calibration blob | empty; error with the device status (e.g. 0x20000502) when it rejects the blob |
 | `get_calibration_stimulus` | 0x24 | — | points of the active calibration: u32 n, n×8 f64 (x, y, status_L, a_L, b_L, status_R, a_R, b_R), then the raw TTP payload of op 0x460 |
 | `cancel_calibration` | 0x25 | — | empty; ends a started session (CALIBRATE_STOP) without computing/applying |
 | `set_correction` | 0x30 | correction.json text | empty; `err` mismatch (0x0A) if made for another calibration blob / display area |
