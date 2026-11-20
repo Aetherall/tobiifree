@@ -5,7 +5,7 @@
 //   node --experimental-strip-types src/cli.ts <dataset.json> [options]
 //
 // Options:
-//   --features <set>     eye_origins | eye_origins_raw | trackbox | all_positions | kitchen_sink  (default: all_positions)
+//   --features <set>     eye_origins | eyeball_centres | trackbox | all_positions | kitchen_sink  (default: all_positions)
 //   --degree <n>         Polynomial degree 1-3  (default: 2)
 //   --lambda <n>         Ridge regularization   (default: 1)
 //   --test-split <n>     Test fraction 0-1      (default: 0.2)
@@ -27,7 +27,8 @@ function flag(name: string, def: string): string {
   return v ?? def;
 }
 
-const featureSet = flag('features', 'all_positions') as FeatureSet;
+const featureArg = flag('features', 'all_positions');
+const featureSet = (featureArg === 'eye_origins_raw' ? 'eyeball_centres' : featureArg) as FeatureSet;
 const degree = parseInt(flag('degree', '2'));
 const lambda = parseFloat(flag('lambda', '1'));
 const testSplit = parseFloat(flag('test-split', '0.2'));

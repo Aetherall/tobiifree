@@ -1098,7 +1098,7 @@ fn columnKind(col: u32) ?u32 {
         0x08, 0x09, 0x0a, // R: calibrated origin, gaze dir (eye-model coords), 3D hit
         0x17, 0x18,       // L/R: eyeball centre (origin − 4.6 mm · optical axis)
         0x22, 0x24,       // L/R: calibrated eye origin (display-space)
-        0x25, 0x27,       // L/R: gaze direction (display-space)
+        0x25, 0x27,       // L/R: user position guide
         => KIND_POINT3D,
         0x05, 0x0b,       // L/R: per-eye 2D projection
         0x1c,             // combined 2D filtered (final output)
@@ -1258,16 +1258,16 @@ pub const GAZE_BIT_GAZE_2D_L: u32            = 1 << 7;
 pub const GAZE_BIT_GAZE_2D_R: u32            = 1 << 8;
 pub const GAZE_BIT_EYE_ORIGIN_L: u32         = 1 << 9;
 pub const GAZE_BIT_EYE_ORIGIN_R: u32         = 1 << 10;
-pub const GAZE_BIT_GAZE_DIR_L: u32           = 1 << 11;
-pub const GAZE_BIT_GAZE_DIR_R: u32           = 1 << 12;
+pub const GAZE_BIT_TRACKBOX_EYE_POS_L: u32   = 1 << 11;
+pub const GAZE_BIT_TRACKBOX_EYE_POS_R: u32   = 1 << 12;
 pub const GAZE_BIT_GAZE_3D_L: u32            = 1 << 13;
 pub const GAZE_BIT_GAZE_3D_R: u32            = 1 << 14;
 pub const GAZE_BIT_EYE_ORIGIN_L_DISP: u32    = 1 << 15;
 pub const GAZE_BIT_EYE_ORIGIN_R_DISP: u32    = 1 << 16;
-pub const GAZE_BIT_TRACKBOX_L_DISP: u32      = 1 << 17;
-pub const GAZE_BIT_TRACKBOX_R_DISP: u32      = 1 << 18;
-pub const GAZE_BIT_EYE_ORIGIN_RAW_L: u32     = 1 << 19;
-pub const GAZE_BIT_EYE_ORIGIN_RAW_R: u32     = 1 << 20;
+pub const GAZE_BIT_POSITION_GUIDE_L: u32     = 1 << 17;
+pub const GAZE_BIT_POSITION_GUIDE_R: u32     = 1 << 18;
+pub const GAZE_BIT_EYEBALL_CENTRE_L: u32     = 1 << 19;
+pub const GAZE_BIT_EYEBALL_CENTRE_R: u32     = 1 << 20;
 pub const GAZE_BIT_GAZE_2D_UNFILTERED: u32   = 1 << 21;
 /// Set by tobiifreed when its correction map was applied to the 2D gaze
 /// fields (gaze_point_2d_norm, the per-eye 2D, gaze_point_2d_unfiltered).
@@ -1281,8 +1281,7 @@ pub const GAZE_BIT_CORRECTED: u32            = 1 << 22;
 ///   display-space: tracker-space shifted by display_area offset.
 ///   normalized 2D: ray→plane intersection on display_area, [0,1]².
 ///
-/// eye_origin_raw_* is the eyeball centre: eye_origin − 4.6 mm
-/// along the optical axis, not an uncalibrated origin.
+/// eyeball_centre_* is eye_origin − 4.6 mm along the optical axis.
 pub const GazeSample = extern struct {
     present_mask: u32,             // bitmask of GAZE_BIT_* flags
     frame_counter: u32,            // monotonic frame index
@@ -1302,10 +1301,10 @@ pub const GazeSample = extern struct {
     gaze_point_3d_R_mm: [3]f64,    // right ray–plane intersection (tracker-space)
     eye_origin_L_display_mm: [3]f64, // calibrated left eye position (display-space)
     eye_origin_R_display_mm: [3]f64, // calibrated right eye position (display-space)
-    trackbox_eye_pos_L_display: [3]f64, // normalized track-box position (display-space)
-    trackbox_eye_pos_R_display: [3]f64, // normalized track-box position (display-space)
-    eye_origin_raw_L_mm: [3]f64,       // left eyeball centre: eye_origin_L − 4.6 mm · optical axis
-    eye_origin_raw_R_mm: [3]f64,       // right eyeball centre: eye_origin_R − 4.6 mm · optical axis
+    position_guide_L: [3]f64,          // left user position guide
+    position_guide_R: [3]f64,          // right user position guide
+    eyeball_centre_L_mm: [3]f64,       // left eyeball centre: eye_origin_L − 4.6 mm · optical axis
+    eyeball_centre_R_mm: [3]f64,       // right eyeball centre: eye_origin_R − 4.6 mm · optical axis
     gaze_point_2d_unfiltered: [2]f64,  // combined 2D gaze before temporal smoothing
 };
 
@@ -1361,7 +1360,7 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
             0x03 => { // gaze_direction_L — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
                 gaze_sample.trackbox_eye_pos_L = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_L;
+                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_EYE_POS_L;
             },
             0x04 => { // gaze_point_3d_L — left ray–plane intersection (mm, tracker-space)
                 const v = r.readPoint3d() catch return true;
@@ -1389,7 +1388,7 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
             0x09 => { // gaze_direction_R — normalized track-box position (not a gaze direction)
                 const v = r.readPoint3d() catch return true;
                 gaze_sample.trackbox_eye_pos_R = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_GAZE_DIR_R;
+                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_EYE_POS_R;
             },
             0x0a => { // gaze_point_3d_R — right ray–plane intersection (mm, tracker-space)
                 const v = r.readPoint3d() catch return true;
@@ -1423,25 +1422,25 @@ fn decodeGazeSample(payload: [*]const u8, len: u32) bool {
                 gaze_sample.eye_origin_R_display_mm = .{ v[0], v[1], v[2] };
                 gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_R_DISP;
             },
-            0x25 => { // trackbox_eye_pos_L_display — normalized track-box position (display-space)
+            0x25 => { // position_guide_L — left user position guide
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.trackbox_eye_pos_L_display = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_L_DISP;
+                gaze_sample.position_guide_L = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_POSITION_GUIDE_L;
             },
-            0x27 => { // trackbox_eye_pos_R_display — normalized track-box position (display-space)
+            0x27 => { // position_guide_R — right user position guide
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.trackbox_eye_pos_R_display = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_TRACKBOX_R_DISP;
+                gaze_sample.position_guide_R = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_POSITION_GUIDE_R;
             },
-            0x17 => { // eye_origin_raw_L — left eyeball centre (tracker-space)
+            0x17 => { // eyeball_centre_L — left eyeball centre (tracker-space)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.eye_origin_raw_L_mm = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_L;
+                gaze_sample.eyeball_centre_L_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYEBALL_CENTRE_L;
             },
-            0x18 => { // eye_origin_raw_R — right eyeball centre (tracker-space)
+            0x18 => { // eyeball_centre_R — right eyeball centre (tracker-space)
                 const v = r.readPoint3d() catch return true;
-                gaze_sample.eye_origin_raw_R_mm = .{ v[0], v[1], v[2] };
-                gaze_sample.present_mask |= GAZE_BIT_EYE_ORIGIN_RAW_R;
+                gaze_sample.eyeball_centre_R_mm = .{ v[0], v[1], v[2] };
+                gaze_sample.present_mask |= GAZE_BIT_EYEBALL_CENTRE_R;
             },
             0x20 => { // gaze_point_2d_unfiltered — combined 2D gaze before temporal smoothing
                 const v = r.readPoint2d() catch return true;
