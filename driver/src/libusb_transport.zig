@@ -23,7 +23,9 @@ pub const LibusbTransport = struct {
     const LIBUSB_ERROR_NO_DEVICE: c_int = -4;
 
     const VID: u16 = 0x2104;
-    const PIDS = [_]u16{ 0x0313, 0x031e, 0x0127 };
+    // 0x0103: the runtime's built-in descriptor PID, kept when it boots without
+    // flash config (e.g. RAM-loaded through the 0x0101 CAI loader).
+    const PIDS = [_]u16{ 0x0313, 0x031e, 0x0127, 0x0103 };
     const EP_IN: u8 = 0x83;
     const EP_OUT: u8 = 0x05;
 
