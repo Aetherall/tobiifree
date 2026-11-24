@@ -99,7 +99,31 @@ pub const LibusbTransport = struct {
         return self;
     }
 
+    pub const InFn = *const fn (data: []const u8) void;
+
     pub fn send(self: *LibusbTransport, data: []const u8) bool {
+        return self.sendImpl(data, null);
+    }
+
+    /// send() for a caller that also owns the IN side: between the chunks of a
+    /// large frame, packets waiting on EP_IN are read and passed to `on_in`.
+    /// The ET5 runtime stops taking OUT while an IN packet (e.g. the first gaze
+    /// sample after a subscribe) waits for the host, so a long upload that
+    /// never reads IN stalls until the OUT timeout.
+    pub fn sendDraining(self: *LibusbTransport, data: []const u8, on_in: InFn) bool {
+        return self.sendImpl(data, on_in);
+    }
+
+    fn drainIn(self: *LibusbTransport, on_in: InFn) void {
+        var buf: [16384]u8 = undefined;
+        var i: u32 = 0;
+        while (i < 8) : (i += 1) {
+            const n = self.recvTimeout(&buf, 1) orelse return;
+            on_in(buf[0..n]);
+        }
+    }
+
+    fn sendImpl(self: *LibusbTransport, data: []const u8, on_in: ?InFn) bool {
         // All USB OUT transfers use the per-transfer envelope format:
         //   [00 00 00 00][data_len: u32 LE][data_len bytes]
         // where data_len = bytes in THIS transfer after the 8-byte header.
@@ -161,6 +185,7 @@ pub const LibusbTransport = struct {
         var cont_buf: [CHUNK]u8 = undefined;
         var offset: usize = CHUNK;
         while (offset < data.len) {
+            if (on_in) |f| self.drainIn(f);
             const data_end = @min(offset + CONT_DATA, data.len);
             const data_len = data_end - offset;
 
