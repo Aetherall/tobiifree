@@ -23,6 +23,9 @@ pub const Tracker = struct {
     send_fn: SendFn,
     recv_fn: RecvFn,
     try_recv_fn: RecvFn,
+    /// Optional send that reads IN between the chunks of a large frame (see
+    /// LibusbTransport.sendDraining); used where the tracker owns the reads.
+    send_drain_fn: ?SendDrainFn = null,
     connected: bool,
     gaze_cb: ?GazeFn,
     display: DisplayCorners,
@@ -44,6 +47,8 @@ pub const Tracker = struct {
 
     pub const SendFn = *const fn (data: []const u8) bool;
     pub const RecvFn = *const fn (buf: []u8) ?usize;
+    pub const InFn = *const fn (data: []const u8) void;
+    pub const SendDrainFn = *const fn (data: []const u8, on_in: InFn) bool;
     pub const GazeFn = *const fn (*const core.GazeSample) void;
 
     pub const UsbOwner = enum(u8) { idle, busy, calibrating };
@@ -78,6 +83,7 @@ pub const Tracker = struct {
         send_fn: SendFn,
         recv_fn: RecvFn,
         try_recv_fn: ?RecvFn = null,
+        send_drain_fn: ?SendDrainFn = null,
     };
 
     pub const Error = error{
@@ -104,6 +110,7 @@ pub const Tracker = struct {
             .send_fn = opts.send_fn,
             .recv_fn = opts.recv_fn,
             .try_recv_fn = opts.try_recv_fn orelse opts.recv_fn,
+            .send_drain_fn = opts.send_drain_fn,
             .connected = false,
             .gaze_cb = null,
             .display = .{},
@@ -162,7 +169,7 @@ pub const Tracker = struct {
         captured_payload = null;
         const out_len = core.session_out_len_();
         if (out_len == 0) return false;
-        if (!self.send_fn(core.session_out_ptr()[0..out_len])) return false;
+        if (!self.sendOwned(core.session_out_ptr()[0..out_len])) return false;
 
         // Wait for the 0x5a0 ack before reading back: a get sent right behind
         // the set is answered first, with the old area.
@@ -248,7 +255,7 @@ pub const Tracker = struct {
 
         const out_len = core.session_out_len_();
         if (out_len == 0) return null;
-        if (!self.send_fn(core.session_out_ptr()[0..out_len])) {
+        if (!self.sendOwned(core.session_out_ptr()[0..out_len])) {
             log.err("queryDisplayArea: send failed", .{});
             return null;
         }
@@ -374,7 +381,7 @@ pub const Tracker = struct {
             log.err("{s}: empty output", .{label});
             return false;
         }
-        if (!self.send_fn(core.session_out_ptr()[0..out_len])) {
+        if (!self.sendOwned(core.session_out_ptr()[0..out_len])) {
             log.err("{s}: send failed", .{label});
             return false;
         }
@@ -411,7 +418,7 @@ pub const Tracker = struct {
                     const len = core.session_out_len_();
                     log.debug("{s} step {d}: send {d} bytes", .{ label, steps, len });
                     if (len > 0) {
-                        if (!self.send_fn(core.session_out_ptr()[0..len])) {
+                        if (!self.sendOwned(core.session_out_ptr()[0..len])) {
                             log.err("{s}: send failed at step {d}", .{ label, steps });
                             return false;
                         }
@@ -435,6 +442,16 @@ pub const Tracker = struct {
         }
         log.err("{s} timed out after {}ms ({} steps)", .{label, timeout_ms, steps});
         return false;
+    }
+
+    /// Send from a context that reads the transport itself (drainReads after).
+    fn sendOwned(self: *Tracker, data: []const u8) bool {
+        if (self.send_drain_fn) |f| return f(data, feedIn);
+        return self.send_fn(data);
+    }
+
+    fn feedIn(data: []const u8) void {
+        core.feed_usb_in(data.ptr, data.len);
     }
 
     fn drainReads(self: *Tracker, max: u32) void {

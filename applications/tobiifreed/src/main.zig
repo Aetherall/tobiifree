@@ -51,7 +51,8 @@
 //     cal_apply's it *after* the sockets are up (~0.3 s for a 270 KB blob on
 //     an ET5): clients can connect at once, gaze starts flowing when the apply
 //     ends (or fails / times out after 120 s), and device commands sent
-//     meanwhile get Err.busy.
+//     meanwhile get Err.busy. A failed apply is retried once on a reopened
+//     session.
 //
 // Correction map: $XDG_STATE_HOME/tobiifree/correction.json (written through
 // set_correction by tobiifree-setup) describes a residual field measured
@@ -1092,7 +1093,20 @@ fn restoreCalibration() void {
     }
     log.info("applying stored calibration {s} ({} bytes); device commands answer busy until done", .{ path, blob.len });
     const t0 = std.time.milliTimestamp();
-    const ok = tracker.calApply(blob);
+    var ok = tracker.calApply(blob);
+    if (!ok and !quit and !transport.isLost()) {
+        // A frame cut off mid-upload leaves the device mid-transfer; start over
+        // on a fresh session, as a daemon restart would.
+        log.warn("stored calibration could not be applied; reopening the session and retrying once", .{});
+        // Read what waits on IN first: the device reboots itself when an IN
+        // packet stays unread for ~3 s.
+        var buf: [16384]u8 = undefined;
+        var k: u32 = 0;
+        while (k < 32 and transport.tryRecv(&buf) != null) : (k += 1) {}
+        transport.deinit();
+        ok = openSession() and tracker.calApply(blob);
+        if (transport.usb_handle == null) transport.lost.store(true, .release);
+    }
     const dt = std.time.milliTimestamp() - t0;
     setAppliedSha(if (ok) corr_mod.sha256Hex(blob) else null);
     if (ok) {
@@ -1102,9 +1116,9 @@ fn restoreCalibration() void {
     }
 }
 
-/// USB thread: open the tracker, handshake, restore area + calibration.
-/// Returns false if the device could not be brought up (caller retries).
-fn connectDevice() bool {
+/// USB thread: open the tracker, handshake, restore the display area.
+/// On failure the transport is closed (usb_handle null).
+fn openSession() bool {
     transport = LibusbTransport.open(true) catch return false;
     setState(.restoring);
     log.info("tracker found, connecting", .{});
@@ -1112,6 +1126,7 @@ fn connectDevice() bool {
         .send_fn = &transportSend,
         .recv_fn = &transportRecv,
         .try_recv_fn = &transportTryRecv,
+        .send_drain_fn = &transportSendDraining,
     }) catch |err| {
         log.err("handshake failed: {}", .{err});
         transport.deinit();
@@ -1121,6 +1136,13 @@ fn connectDevice() bool {
     applyStartupDisplayArea(config.loadDisplayArea(gpa), opt_keep_device_area);
     // The startup queries install their own capture hook; put ours back.
     core.set_hooks(onTtpFrame, null, onResponse, null, null);
+    return true;
+}
+
+/// USB thread: open the tracker, handshake, restore area + calibration.
+/// Returns false if the device could not be brought up (caller retries).
+fn connectDevice() bool {
+    if (!openSession()) return false;
     restoreCalibration();
     if (transport.isLost()) return false;
     return true;
@@ -1322,6 +1344,7 @@ pub fn main() void {
             .send_fn = &transportSend,
             .recv_fn = &transportRecv,
             .try_recv_fn = &transportTryRecv,
+            .send_drain_fn = &transportSendDraining,
         })) |tr| {
             tracker = tr;
             start_connected = true;
@@ -1339,6 +1362,7 @@ pub fn main() void {
             .send_fn = &transportSend,
             .recv_fn = &transportRecv,
             .try_recv_fn = &transportTryRecv,
+            .send_drain_fn = &transportSendDraining,
             .connected = false,
             .gaze_cb = null,
             .display = .{},
@@ -1535,6 +1559,10 @@ fn usbThreadFn() void {
 
 fn transportSend(data: []const u8) bool {
     return transport.send(data);
+}
+
+fn transportSendDraining(data: []const u8, on_in: Tracker.InFn) bool {
+    return transport.sendDraining(data, on_in);
 }
 
 fn transportRecv(buf: []u8) ?usize {
